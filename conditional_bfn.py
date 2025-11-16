@@ -18,9 +18,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from typing import Tuple, Optional, Union
+
 try:
     from torchtyping import TensorType as Tensor
 except ImportError:  # pragma: no cover - optional dependency
+
     class _TensorAlias:
         def __class_getitem__(cls, key):
             return t.Tensor
@@ -66,9 +68,7 @@ class ContinuousBFN(nn.Module):
 
         # Assert that the network has the right dimensions
         bs = 16
-        test_batch = t.randn(
-            (bs, *self.dim), device=self.device, dtype=self.dtype
-        )
+        test_batch = t.randn((bs, *self.dim), device=self.device, dtype=self.dtype)
         test_time = t.rand((bs,), device=self.device, dtype=self.dtype)
         # We use the presence of cond_dim as a way to identify conditional models
         if net.is_conditional_model:
@@ -77,7 +77,9 @@ class ContinuousBFN(nn.Module):
             else:
                 cond_dim = net.cond_dim
                 cond_shape = (cond_dim,) if isinstance(cond_dim, int) else cond_dim
-                classes = t.randn((bs, *cond_shape), device=self.device, dtype=self.dtype)
+                classes = t.randn(
+                    (bs, *cond_shape), device=self.device, dtype=self.dtype
+                )
         else:
             classes = None
         out = self.net(test_batch, test_time, classes)
@@ -289,9 +291,7 @@ class DiscreteBFN(nn.Module):
 
         # Assert that the network has the right dimensions
         bs = 16
-        test_batch = t.randn(
-            (bs, *self.dim, K), device=self.device, dtype=self.dtype
-        )
+        test_batch = t.randn((bs, *self.dim, K), device=self.device, dtype=self.dtype)
         test_time = t.rand((bs,), device=self.device, dtype=self.dtype)
         # We use the presence of cond_dim as a way to identify conditional models
         if net.is_conditional_model:

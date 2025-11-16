@@ -153,7 +153,9 @@ def build_loaders(cfg: Config, obs: np.ndarray, acts: np.ndarray):
         ds = TensorDataset(t.tensor(o), t.tensor(a))
         return DataLoader(ds, batch_size=cfg.data.batch_size, shuffle=shuffle)
 
-    return to_loader(obs[:split], acts[:split], True), to_loader(obs[split:], acts[split:], False)
+    return to_loader(obs[:split], acts[:split], True), to_loader(
+        obs[split:], acts[split:], False
+    )
 
 
 @hydra.main(config_name="guided_pusht", config_path="config", version_base=None)
@@ -180,16 +182,24 @@ def main(cfg: DictConfig):
         elif len(obs_shape) == 4:
             _, h, w, c = obs_shape
         else:
-            print(f"Unet mode requested but obs shape {obs_shape} is not image-like; falling back to MLP.")
+            print(
+                f"Unet mode requested but obs shape {obs_shape} is not image-like; falling back to MLP."
+            )
             use_unet = False
 
     if use_unet:
-        unet = Unet(dim=cfg.model.unet_dim, channels=c, out_dim=act_dim, num_classes=None).to(device)
-        opt = t.optim.Adam(unet.parameters(), lr=cfg.optim.lr, weight_decay=cfg.optim.weight_decay)
+        unet = Unet(
+            dim=cfg.model.unet_dim, channels=c, out_dim=act_dim, num_classes=None
+        ).to(device)
+        opt = t.optim.Adam(
+            unet.parameters(), lr=cfg.optim.lr, weight_decay=cfg.optim.weight_decay
+        )
         policy = None
     else:
         vision = VisionEncoderMLP(obs_dim, cfg.model.emb_dim).to(device)
-        backbone = BackboneMLP(act_dim, cfg.model.emb_dim, cfg.model.hidden_dim).to(device)
+        backbone = BackboneMLP(act_dim, cfg.model.emb_dim, cfg.model.hidden_dim).to(
+            device
+        )
         policy = GuidedBFNPolicy(
             backbone_transformer=backbone,
             vision_encoder=vision,
@@ -203,12 +213,18 @@ def main(cfg: DictConfig):
             grad_guidance_scale_alpha=cfg.model.grad_guidance_scale_alpha,
             device=device,
         ).to(device)
-        opt = t.optim.Adam(policy.network.parameters(), lr=cfg.optim.lr, weight_decay=cfg.optim.weight_decay)
+        opt = t.optim.Adam(
+            policy.network.parameters(),
+            lr=cfg.optim.lr,
+            weight_decay=cfg.optim.weight_decay,
+        )
 
     wandb_run = None
     if cfg.wandb.use_wandb:
         if wandb is None:
-            raise ImportError("wandb not installed; set wandb.use_wandb=false or install wandb.")
+            raise ImportError(
+                "wandb not installed; set wandb.use_wandb=false or install wandb."
+            )
         wandb_run = wandb.init(
             project=cfg.wandb.project,
             entity=cfg.wandb.entity,
@@ -270,9 +286,9 @@ def main(cfg: DictConfig):
                     logits = out.mean(dim=(-2, -1))
                 else:
                     obs_seq = obs.unsqueeze(1).repeat(1, cfg.model.T_o, 1)
-                    cond = vision(obs_seq.view(obs_seq.size(0) * cfg.model.T_o, -1)).view(
-                        obs_seq.size(0), cfg.model.T_o, -1
-                    )
+                    cond = vision(
+                        obs_seq.view(obs_seq.size(0) * cfg.model.T_o, -1)
+                    ).view(obs_seq.size(0), cfg.model.T_o, -1)
                     A_init = t.zeros(obs.size(0), cfg.model.T_p, act_dim, device=device)
                     t_tensor = t.zeros(obs.size(0), device=device)
                     pred = policy.network(A_init, t_tensor, cond)
@@ -282,7 +298,9 @@ def main(cfg: DictConfig):
         val_loss = val_loss / max(val_batches, 1)
 
         if epoch % cfg.train.log_interval == 0:
-            print(f"[{epoch}/{cfg.train.epochs}] loss={avg_loss:.4f} val_loss={val_loss:.4f}")
+            print(
+                f"[{epoch}/{cfg.train.epochs}] loss={avg_loss:.4f} val_loss={val_loss:.4f}"
+            )
             if wandb_run is not None:
                 wandb_run.log({"loss": avg_loss, "val_loss": val_loss, "epoch": epoch})
 

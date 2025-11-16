@@ -16,8 +16,12 @@ from environments import MazeEnv
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Visualize the MazeEnv.")
-    parser.add_argument("--episodes", type=int, default=1, help="Number of episodes to roll out.")
-    parser.add_argument("--max-steps", type=int, default=50, help="Maximum steps per episode.")
+    parser.add_argument(
+        "--episodes", type=int, default=1, help="Number of episodes to roll out."
+    )
+    parser.add_argument(
+        "--max-steps", type=int, default=50, help="Maximum steps per episode."
+    )
     parser.add_argument(
         "--render-mode",
         type=str,
@@ -25,14 +29,20 @@ def parse_args() -> argparse.Namespace:
         choices=["human", "ansi", "rgb_array"],
         help="Render mode to use.",
     )
-    parser.add_argument("--sleep", type=float, default=0.25, help="Delay between rendered frames.")
+    parser.add_argument(
+        "--sleep", type=float, default=0.25, help="Delay between rendered frames."
+    )
     parser.add_argument("--seed", type=int, default=None, help="Optional RNG seed.")
     return parser.parse_args()
 
 
-def render_text(env: MazeEnv, step: int, reward: float, terminated: bool, truncated: bool):
+def render_text(
+    env: MazeEnv, step: int, reward: float, terminated: bool, truncated: bool
+):
     text = env.render()
-    print(f"\nStep {step} | reward={reward:.3f} | done={terminated} | truncated={truncated}")
+    print(
+        f"\nStep {step} | reward={reward:.3f} | done={terminated} | truncated={truncated}"
+    )
     print(text)
 
 
@@ -47,10 +57,14 @@ def render_rgb(env: MazeEnv, title: str, ax) -> None:
 
 def main():
     args = parse_args()
-    env = MazeEnv(max_steps=args.max_steps, seed=args.seed, render_mode=args.render_mode)
+    env = MazeEnv(
+        max_steps=args.max_steps, seed=args.seed, render_mode=args.render_mode
+    )
 
     if args.render_mode == "rgb_array" and plt is None:
-        raise ImportError("matplotlib is required for rgb_array rendering. Try --render-mode ansi.")
+        raise ImportError(
+            "matplotlib is required for rgb_array rendering. Try --render-mode ansi."
+        )
 
     for ep in range(args.episodes):
         obs, info = env.reset()

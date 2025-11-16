@@ -31,9 +31,11 @@ from typing import Any, Callable, Optional, Tuple, Union
 from functools import partial
 from packaging import version
 from collections import namedtuple
+
 try:
     from torchtyping import TensorType as Tensor
 except ImportError:  # pragma: no cover - optional dependency
+
     class _TensorAlias:
         def __class_getitem__(cls, key):
             return t.Tensor
@@ -118,9 +120,7 @@ class ResnetBlock(nn.Module):
         self.block1 = Block(in_dim, out_dim, groups=groups)
         self.block2 = Block(out_dim, out_dim, groups=groups)
         self.res_conv = (
-            nn.Conv2d(in_dim, out_dim, 1)
-            if in_dim != out_dim
-            else nn.Identity()
+            nn.Conv2d(in_dim, out_dim, 1) if in_dim != out_dim else nn.Identity()
         )
 
     def forward(
@@ -176,9 +176,7 @@ class Attend(nn.Module):
         device_properties = t.cuda.get_device_properties(t.device("cuda"))
 
         if device_properties.major == 8 and device_properties.minor == 0:
-            print_once(
-                "A100 detected; using flash attention if input is on CUDA"
-            )
+            print_once("A100 detected; using flash attention if input is on CUDA")
             self.cuda_config = AttentionConfig(True, False, False)
         else:
             print_once(
@@ -253,16 +251,12 @@ class LinearAttention(nn.Module):
 
         context = t.einsum("b h d n, b h e n -> b h d e", k, v)
         out = t.einsum("b h d e, b h d n -> b h e n", context, q)
-        out = rearrange(
-            out, "b h c (x y) -> b (h c) x y", h=self.heads, x=h, y=w
-        )
+        out = rearrange(out, "b h c (x y) -> b (h c) x y", h=self.heads, x=h, y=w)
         return self.to_out(out)
 
 
 class Attention(nn.Module):
-    def __init__(
-        self, dim: int, heads: int = 4, dim_head=32, flash: bool = False
-    ):
+    def __init__(self, dim: int, heads: int = 4, dim_head=32, flash: bool = False):
         super().__init__()
         self.heads = heads
         hidden_dim = dim_head * heads
@@ -422,9 +416,7 @@ class Unet(BFNetwork):
             attn_heads_i,
             attn_dim_head_i,
         ) in enumerate(
-            zip(
-                *(map(reversed, (in_out, full_attn, attn_heads, attn_dim_head)))
-            )
+            zip(*(map(reversed, (in_out, full_attn, attn_heads, attn_dim_head))))
         ):
             is_last = i == (len(in_out) - 1)
             attn_class = FullAttention if full_attn_i else LinearAttention
@@ -464,7 +456,6 @@ class Unet(BFNetwork):
         # Handle conditoning information
 
         if self.is_conditional_model:
-
             if not exists(classes):
                 classes = t.randint(0, self.cond_dim, (batch,), device=device)
                 cond_drop_prob = 1.0
@@ -482,13 +473,9 @@ class Unet(BFNetwork):
             classes_emb = self.class_emb(classes)
 
             if cond_drop_prob > 0.0:
-                keep_mask = t.rand((batch,), device=device) < (
-                    1 - cond_drop_prob
-                )
+                keep_mask = t.rand((batch,), device=device) < (1 - cond_drop_prob)
                 null_classes_emb = self.null_classes_emb.expand(batch, -1)
-                classes_emb = t.where(
-                    keep_mask[:, None], classes_emb, null_classes_emb
-                )
+                classes_emb = t.where(keep_mask[:, None], classes_emb, null_classes_emb)
 
             c = self.classes_mlp(classes_emb)
         else:

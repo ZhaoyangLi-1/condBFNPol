@@ -107,7 +107,9 @@ def set_seed(seed: int):
         t.cuda.manual_seed_all(seed)
 
 
-def bfs_shortest_action(grid: np.ndarray, start: Tuple[int, int], goal: Tuple[int, int]) -> Action:
+def bfs_shortest_action(
+    grid: np.ndarray, start: Tuple[int, int], goal: Tuple[int, int]
+) -> Action:
     """Return first action along a shortest path from start to goal using BFS."""
     h, w = grid.shape
     q = [(start, [])]
@@ -165,7 +167,9 @@ def build_dataloaders(cfg: Config, obs: np.ndarray, acts: np.ndarray):
     return to_loader(train_obs, train_acts, True), to_loader(val_obs, val_acts, False)
 
 
-def evaluate(policy: ConditionalBFNPolicy, loader: DataLoader, device: t.device) -> float:
+def evaluate(
+    policy: ConditionalBFNPolicy, loader: DataLoader, device: t.device
+) -> float:
     policy.eval()
     correct = 0
     total = 0
@@ -189,12 +193,18 @@ def build_optimizer(policy: ConditionalBFNPolicy, cfg: Config):
     opt_type = opt_cfg.type.lower()
 
     if opt_type == "adam":
-        opt = t.optim.Adam(policy.parameters(), lr=lr, weight_decay=wd, betas=opt_cfg.betas)
+        opt = t.optim.Adam(
+            policy.parameters(), lr=lr, weight_decay=wd, betas=opt_cfg.betas
+        )
     elif opt_type == "adamw":
-        opt = t.optim.AdamW(policy.parameters(), lr=lr, weight_decay=wd, betas=opt_cfg.betas)
+        opt = t.optim.AdamW(
+            policy.parameters(), lr=lr, weight_decay=wd, betas=opt_cfg.betas
+        )
     elif opt_type == "sgd":
         momentum = opt_cfg.momentum if opt_cfg.momentum is not None else 0.0
-        opt = t.optim.SGD(policy.parameters(), lr=lr, weight_decay=wd, momentum=momentum)
+        opt = t.optim.SGD(
+            policy.parameters(), lr=lr, weight_decay=wd, momentum=momentum
+        )
     else:
         raise ValueError(f"Unsupported optimizer type: {opt_cfg.type}")
 
@@ -203,9 +213,13 @@ def build_optimizer(policy: ConditionalBFNPolicy, cfg: Config):
     if sched_cfg.type:
         stype = sched_cfg.type.lower()
         if stype == "step":
-            scheduler = t.optim.lr_scheduler.StepLR(opt, step_size=sched_cfg.step_size, gamma=sched_cfg.gamma)
+            scheduler = t.optim.lr_scheduler.StepLR(
+                opt, step_size=sched_cfg.step_size, gamma=sched_cfg.gamma
+            )
         elif stype == "cosine":
-            scheduler = t.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=sched_cfg.T_max)
+            scheduler = t.optim.lr_scheduler.CosineAnnealingLR(
+                opt, T_max=sched_cfg.T_max
+            )
         else:
             raise ValueError(f"Unsupported scheduler type: {sched_cfg.type}")
 
@@ -286,7 +300,14 @@ def main(cfg: DictConfig):
             log_msg = f"[{epoch}/{train_cfg.epochs}] loss={avg_loss:.4f} val_acc={val_acc:.3f} lr={current_lr:.2e}"
             print(log_msg)
             if wandb_cfg.use_wandb:
-                wandb.log({"loss": avg_loss, "val_acc": val_acc, "lr": current_lr, "epoch": epoch})
+                wandb.log(
+                    {
+                        "loss": avg_loss,
+                        "val_acc": val_acc,
+                        "lr": current_lr,
+                        "epoch": epoch,
+                    }
+                )
 
     if train_cfg.ckpt_path:
         dirpath = os.path.dirname(train_cfg.ckpt_path)

@@ -20,19 +20,38 @@ from policies import ConditionalBFNPolicy
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Visualize a trained BFN policy on MazeEnv.")
-    p.add_argument("--ckpt", type=str, required=False, help="Path to policy checkpoint (.pt).")
-    p.add_argument("--episodes", type=int, default=3, help="Number of episodes to roll out.")
+    p = argparse.ArgumentParser(
+        description="Visualize a trained BFN policy on MazeEnv."
+    )
+    p.add_argument(
+        "--ckpt", type=str, required=False, help="Path to policy checkpoint (.pt)."
+    )
+    p.add_argument(
+        "--episodes", type=int, default=3, help="Number of episodes to roll out."
+    )
     p.add_argument("--max-steps", type=int, default=50, help="Max steps per episode.")
-    p.add_argument("--render-mode", type=str, default="ansi", choices=["ansi", "human", "rgb_array"])
-    p.add_argument("--sleep", type=float, default=0.1, help="Delay between frames (seconds).")
-    p.add_argument("--device", type=str, default="cpu", help="Torch device to run the policy on.")
+    p.add_argument(
+        "--render-mode",
+        type=str,
+        default="ansi",
+        choices=["ansi", "human", "rgb_array"],
+    )
+    p.add_argument(
+        "--sleep", type=float, default=0.1, help="Delay between frames (seconds)."
+    )
+    p.add_argument(
+        "--device", type=str, default="cpu", help="Torch device to run the policy on."
+    )
     return p.parse_args()
 
 
-def render_text(env: MazeEnv, step: int, reward: float, terminated: bool, truncated: bool):
+def render_text(
+    env: MazeEnv, step: int, reward: float, terminated: bool, truncated: bool
+):
     text = env.render()
-    print(f"\nStep {step} | reward={reward:.3f} | done={terminated} | truncated={truncated}")
+    print(
+        f"\nStep {step} | reward={reward:.3f} | done={terminated} | truncated={truncated}"
+    )
     print(text)
 
 
@@ -75,7 +94,9 @@ def main():
     policy = load_policy(args.device, args.ckpt, env)
 
     if args.render_mode == "rgb_array" and plt is None:
-        raise ImportError("matplotlib is required for rgb_array rendering. Try --render-mode ansi.")
+        raise ImportError(
+            "matplotlib is required for rgb_array rendering. Try --render-mode ansi."
+        )
 
     for ep in range(args.episodes):
         obs, _ = env.reset()

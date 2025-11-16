@@ -134,7 +134,9 @@ def set_seed(seed: int):
         t.cuda.manual_seed_all(seed)
 
 
-def bfs_shortest_action(grid: np.ndarray, start: Tuple[int, int], goal: Tuple[int, int]) -> int:
+def bfs_shortest_action(
+    grid: np.ndarray, start: Tuple[int, int], goal: Tuple[int, int]
+) -> int:
     h, w = grid.shape
     q = [(start, [])]
     visited = {start}
@@ -183,7 +185,9 @@ def build_loaders(cfg: Config, obs: np.ndarray, acts: np.ndarray):
         ds = TensorDataset(t.tensor(o), t.tensor(a))
         return DataLoader(ds, batch_size=cfg.data.batch_size, shuffle=shuffle)
 
-    return to_loader(obs[:split], acts[:split], True), to_loader(obs[split:], acts[split:], False)
+    return to_loader(obs[:split], acts[:split], True), to_loader(
+        obs[split:], acts[split:], False
+    )
 
 
 # --------------- Training ----------------- #
@@ -200,7 +204,9 @@ def main(cfg: DictConfig):
     train_loader, val_loader = build_loaders(cfg, obs_np, acts_np)
 
     vision = VisionEncoderMLP(cfg.model.obs_dim, cfg.model.emb_dim).to(device)
-    backbone = BackboneMLP(cfg.model.action_dim, cfg.model.emb_dim, cfg.model.hidden_dim).to(device)
+    backbone = BackboneMLP(
+        cfg.model.action_dim, cfg.model.emb_dim, cfg.model.hidden_dim
+    ).to(device)
 
     policy = GuidedBFNPolicy(
         backbone_transformer=backbone,
@@ -217,12 +223,18 @@ def main(cfg: DictConfig):
     )
     policy.to(device)
 
-    opt = t.optim.Adam(policy.network.parameters(), lr=cfg.optim.lr, weight_decay=cfg.optim.weight_decay)
+    opt = t.optim.Adam(
+        policy.network.parameters(),
+        lr=cfg.optim.lr,
+        weight_decay=cfg.optim.weight_decay,
+    )
 
     wandb_run = None
     if cfg.wandb.use_wandb:
         if wandb is None:
-            raise ImportError("wandb not installed; set wandb.use_wandb=false or install wandb.")
+            raise ImportError(
+                "wandb not installed; set wandb.use_wandb=false or install wandb."
+            )
         wandb_run = wandb.init(
             project=cfg.wandb.project,
             entity=cfg.wandb.entity,
@@ -243,7 +255,9 @@ def main(cfg: DictConfig):
             cond = vision(obs_seq.view(obs_seq.size(0) * cfg.model.T_o, -1)).view(
                 obs_seq.size(0), cfg.model.T_o, -1
             )
-            A_init = t.zeros(obs.size(0), cfg.model.T_p, cfg.model.action_dim, device=device)
+            A_init = t.zeros(
+                obs.size(0), cfg.model.T_p, cfg.model.action_dim, device=device
+            )
             t_tensor = t.zeros(obs.size(0), device=device)
             pred = policy.network(A_init, t_tensor, cond)  # [B, T_p, action_dim]
             logits = pred[:, 0, :]  # use first step
@@ -269,7 +283,9 @@ def main(cfg: DictConfig):
                 cond = vision(obs_seq.view(obs_seq.size(0) * cfg.model.T_o, -1)).view(
                     obs_seq.size(0), cfg.model.T_o, -1
                 )
-                A_init = t.zeros(obs.size(0), cfg.model.T_p, cfg.model.action_dim, device=device)
+                A_init = t.zeros(
+                    obs.size(0), cfg.model.T_p, cfg.model.action_dim, device=device
+                )
                 t_tensor = t.zeros(obs.size(0), device=device)
                 pred = policy.network(A_init, t_tensor, cond)
                 logits = pred[:, 0, :]
@@ -280,7 +296,9 @@ def main(cfg: DictConfig):
         val_acc = correct / max(total, 1)
 
         if epoch % cfg.train.log_interval == 0:
-            print(f"[{epoch}/{cfg.train.epochs}] loss={avg_loss:.4f} val_acc={val_acc:.3f}")
+            print(
+                f"[{epoch}/{cfg.train.epochs}] loss={avg_loss:.4f} val_acc={val_acc:.3f}"
+            )
             if wandb_run is not None:
                 wandb_run.log({"loss": avg_loss, "val_acc": val_acc, "epoch": epoch})
 

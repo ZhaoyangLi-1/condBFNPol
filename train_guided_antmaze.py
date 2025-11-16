@@ -136,7 +136,9 @@ def collect_dataset(cfg: Config, env: AntMazeEnv, obs_dim: int, act_dim: int):
         done = truncated = False
         steps = 0
         while not (done or truncated) and steps < cfg.data.max_steps:
-            action = env.action_space.sample()  # random policy; replace with expert if available
+            action = (
+                env.action_space.sample()
+            )  # random policy; replace with expert if available
             obs_buf.append(flatten_obs(obs).astype(np.float32))
             act_buf.append(np.array(action, dtype=np.float32).ravel())
             obs, reward, done, truncated, _ = env.step(action)
@@ -152,7 +154,9 @@ def build_loaders(cfg: Config, obs: np.ndarray, acts: np.ndarray):
         ds = TensorDataset(t.tensor(o), t.tensor(a))
         return DataLoader(ds, batch_size=cfg.data.batch_size, shuffle=shuffle)
 
-    return to_loader(obs[:split], acts[:split], True), to_loader(obs[split:], acts[split:], False)
+    return to_loader(obs[:split], acts[:split], True), to_loader(
+        obs[split:], acts[split:], False
+    )
 
 
 @hydra.main(config_name="guided_antmaze", config_path="config", version_base=None)
@@ -191,12 +195,18 @@ def main(cfg: DictConfig):
         device=device,
     ).to(device)
 
-    opt = t.optim.Adam(policy.network.parameters(), lr=cfg.optim.lr, weight_decay=cfg.optim.weight_decay)
+    opt = t.optim.Adam(
+        policy.network.parameters(),
+        lr=cfg.optim.lr,
+        weight_decay=cfg.optim.weight_decay,
+    )
 
     wandb_run = None
     if cfg.wandb.use_wandb:
         if wandb is None:
-            raise ImportError("wandb not installed; set wandb.use_wandb=false or install wandb.")
+            raise ImportError(
+                "wandb not installed; set wandb.use_wandb=false or install wandb."
+            )
         wandb_run = wandb.init(
             project=cfg.wandb.project,
             entity=cfg.wandb.entity,
@@ -252,7 +262,9 @@ def main(cfg: DictConfig):
         val_loss = val_loss / max(val_batches, 1)
 
         if epoch % cfg.train.log_interval == 0:
-            print(f"[{epoch}/{cfg.train.epochs}] loss={avg_loss:.4f} val_loss={val_loss:.4f}")
+            print(
+                f"[{epoch}/{cfg.train.epochs}] loss={avg_loss:.4f} val_loss={val_loss:.4f}"
+            )
             if wandb_run is not None:
                 wandb_run.log({"loss": avg_loss, "val_loss": val_loss, "epoch": epoch})
 
