@@ -1,0 +1,48 @@
+# Default Hydra config for training conditional BFN on MazeEnv
+
+data:
+  episodes: 200        # number of expert episodes to collect
+  max_steps: 50        # max steps per episode in MazeEnv
+  batch_size: 64
+  val_split: 0.1
+
+model:
+  hidden_dims: [256, 256]
+  time_emb_dim: 64
+  sigma_1: 0.001
+  n_timesteps: 20
+  cond_scale: null
+  rescaled_phi: null
+
+train:
+  epochs: 200
+  seed: 42
+  device: cpu
+  log_interval: 1
+  ckpt_path: checkpoints/maze_bfn.pt   # path to save final checkpoint
+
+optimizer:
+  type: adam           # adam, adamw, sgd
+  lr: 0.001
+  weight_decay: 0.0
+  momentum: null       # only for sgd
+  betas: [0.9, 0.999]  # for adam/adamw
+
+scheduler:
+  type: null           # step, cosine, or null
+  step_size: 50
+  gamma: 0.5
+  T_max: 100
+
+wandb:
+  use_wandb: true
+  project: maze
+  resume: false
+  mode: online
+  entity: aleyna-research
+  run_name: null          # e.g. "${now:%Y.%m.%d-%H.%M.%S}_maze_bfn"
+  tags: []                # optional list of strings
+  id: null
+  group: null
+
+maze_seed: null

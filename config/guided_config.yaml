@@ -1,0 +1,39 @@
+# Config for training GuidedBFNPolicy on MazeEnv with simple MLP encoder/backbone
+
+data:
+  episodes: 200
+  max_steps: 50
+  batch_size: 64
+  val_split: 0.1
+
+model:
+  obs_dim: 2
+  action_dim: 4
+  emb_dim: 32
+  hidden_dim: 128
+  bfn_timesteps: 50
+  T_o: 2
+  T_p: 4
+  T_a: 1
+  cfg_uncond_prob: 0.1
+  cfg_guidance_scale_w: 3.0
+  grad_guidance_scale_alpha: 0.0
+
+optim:
+  lr: 0.001
+  weight_decay: 0.0
+
+train:
+  epochs: 50
+  seed: 42
+  device: cpu
+  log_interval: 1
+  ckpt_path: checkpoints/guided_maze_bfn.pt
+
+wandb:
+  use_wandb: false
+  project: guided-maze-bfn
+  entity: null
+  run_name: null
+
+maze_seed: null

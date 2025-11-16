@@ -1,0 +1,39 @@
+# Config for training GuidedBFNPolicy on PushT via behavior cloning (random rollouts)
+
+env_name: gym_pusht/PushT-v0
+
+data:
+  episodes: 50
+  max_steps: 200
+  batch_size: 128
+  val_split: 0.1
+
+model:
+  emb_dim: 128
+  hidden_dim: 256
+  bfn_timesteps: 50
+  T_o: 2
+  T_p: 4
+  T_a: 1
+  cfg_uncond_prob: 0.1
+  cfg_guidance_scale_w: 3.0
+  grad_guidance_scale_alpha: 0.0
+  use_unet: false
+  unet_dim: 64
+
+optim:
+  lr: 0.001
+  weight_decay: 0.0
+
+train:
+  epochs: 300
+  seed: 42
+  device: cpu
+  log_interval: 1
+  ckpt_path: checkpoints/guided_pusht_bfn.pt
+
+wandb:
+  use_wandb: false
+  project: guided-pusht-bfn
+  entity: null
+  run_name: null
