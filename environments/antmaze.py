@@ -15,7 +15,7 @@ try:  # Prefer gymnasium for robotics
     gym.register_envs(gymnasium_robotics)
 except ImportError as e:  # pragma: no cover - fail fast
     raise ImportError(
-        "gymnasium[robotics] is required for AntMaze. Install with `pip install \"gymnasium[robotics]\"`."
+        'gymnasium[robotics] is required for AntMaze. Install with `pip install "gymnasium[robotics]"`.'
     ) from e
 
 from environments.base import BaseEnv
@@ -33,7 +33,9 @@ class AntMazeEnv(BaseEnv):
         action_space: The action space of the environment.
     """
 
-    def __init__(self, env_name: str = "AntMaze_UMaze-v5", render_mode: str | None = None):
+    def __init__(
+        self, env_name: str = "AntMaze_UMaze-v5", render_mode: str | None = None
+    ):
         """Initializes a new AntMazeEnv environment.
 
         Args:

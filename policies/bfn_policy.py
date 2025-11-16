@@ -45,7 +45,9 @@ class ConditionalBFNBackbone(BFNetwork):
         )
 
         # Observation encoder.
-        hidden_dims = tuple(hidden_dims) if isinstance(hidden_dims, Iterable) else (hidden_dims,)
+        hidden_dims = (
+            tuple(hidden_dims) if isinstance(hidden_dims, Iterable) else (hidden_dims,)
+        )
         obs_layers = []
         last_dim = obs_dim
         for dim in hidden_dims:
@@ -114,7 +116,10 @@ class ConditionalBFNPolicy(BasePolicy):
         clip_actions: bool = True,
     ):
         super().__init__(
-            action_space=action_space, device=device, dtype=dtype, clip_actions=clip_actions
+            action_space=action_space,
+            device=device,
+            dtype=dtype,
+            clip_actions=clip_actions,
         )
         self.obs_dim = obs_dim
         self.action_dim = action_dim
@@ -180,4 +185,6 @@ class ConditionalBFNPolicy(BasePolicy):
                     cond, cond_scale=cond_scale, rescaled_phi=rescaled_phi
                 )
 
-        return self._sample_actions(cond, cond_scale=cond_scale, rescaled_phi=rescaled_phi)
+        return self._sample_actions(
+            cond, cond_scale=cond_scale, rescaled_phi=rescaled_phi
+        )

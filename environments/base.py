@@ -38,7 +38,9 @@ class BaseEnv(gym.Env, abc.ABC):
         raise NotImplementedError
 
     @abc.abstractmethod
-    def step(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
+    def step(
+        self, action: np.ndarray
+    ) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
         """Takes a step in the environment.
 
         Args:

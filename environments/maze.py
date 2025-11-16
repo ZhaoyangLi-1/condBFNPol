@@ -79,7 +79,10 @@ class MazeEnv(BaseEnv):
         self.max_steps = max_steps
         self.render_mode = render_mode
 
-        if self.render_mode is not None and self.render_mode not in self.metadata["render_modes"]:
+        if (
+            self.render_mode is not None
+            and self.render_mode not in self.metadata["render_modes"]
+        ):
             raise ValueError(
                 f"Invalid render_mode {self.render_mode}. Supported: {self.metadata['render_modes']}"
             )
@@ -144,7 +147,9 @@ class MazeEnv(BaseEnv):
         self._steps = 0
         return self._obs(), {}
 
-    def step(self, action: np.ndarray | int) -> Tuple[np.ndarray, float, bool, bool, dict]:
+    def step(
+        self, action: np.ndarray | int
+    ) -> Tuple[np.ndarray, float, bool, bool, dict]:
         """Takes a step in the environment.
 
         Args:
@@ -212,7 +217,9 @@ class MazeEnv(BaseEnv):
             img = np.zeros((self.height, self.width, 3), dtype=np.uint8)
             for y in range(self.height):
                 for x in range(self.width):
-                    img[y, x] = color_map.get(grid[y, x], np.array([255, 0, 0], dtype=np.uint8))
+                    img[y, x] = color_map.get(
+                        grid[y, x], np.array([255, 0, 0], dtype=np.uint8)
+                    )
             return img
 
         raise ValueError(f"Unsupported render_mode {self.render_mode}")

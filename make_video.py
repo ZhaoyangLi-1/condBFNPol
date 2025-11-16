@@ -17,20 +17,46 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Create rollout video for MazeEnv policy.")
     p.add_argument("--ckpt", type=str, required=True, help="Path to checkpoint (.pt).")
     p.add_argument(
-        "--out", type=str, default="maze_rollout.gif", help="Output video file (gif recommended)."
+        "--out",
+        type=str,
+        default="maze_rollout.gif",
+        help="Output video file (gif recommended).",
     )
-    p.add_argument("--episodes", type=int, default=1, help="Number of episodes to record.")
+    p.add_argument(
+        "--episodes", type=int, default=1, help="Number of episodes to record."
+    )
     p.add_argument("--max-steps", type=int, default=50, help="Max steps per episode.")
-    p.add_argument("--fps", type=int, default=4, help="Frames per second for the video.")
-    p.add_argument("--device", type=str, default="cpu", help="Torch device to run policy.")
-    p.add_argument("--guided", action="store_true", help="Load a GuidedBFNPolicy checkpoint.")
-    p.add_argument("--antmaze", action="store_true", help="Use AntMaze environment instead of grid Maze.")
-    p.add_argument("--pusht", action="store_true", help="Use PushT environment instead of grid Maze.")
-    p.add_argument("--env-name", type=str, default=None, help="Environment name if using AntMaze/PushT.")
+    p.add_argument(
+        "--fps", type=int, default=4, help="Frames per second for the video."
+    )
+    p.add_argument(
+        "--device", type=str, default="cpu", help="Torch device to run policy."
+    )
+    p.add_argument(
+        "--guided", action="store_true", help="Load a GuidedBFNPolicy checkpoint."
+    )
+    p.add_argument(
+        "--antmaze",
+        action="store_true",
+        help="Use AntMaze environment instead of grid Maze.",
+    )
+    p.add_argument(
+        "--pusht",
+        action="store_true",
+        help="Use PushT environment instead of grid Maze.",
+    )
+    p.add_argument(
+        "--env-name",
+        type=str,
+        default=None,
+        help="Environment name if using AntMaze/PushT.",
+    )
     return p.parse_args()
 
 
-def load_conditional_policy(device: str, ckpt: str, env: MazeEnv) -> ConditionalBFNPolicy:
+def load_conditional_policy(
+    device: str, ckpt: str, env: MazeEnv
+) -> ConditionalBFNPolicy:
     policy = ConditionalBFNPolicy(
         action_space=env.action_space,
         obs_dim=env.observation_space.shape[0],
@@ -118,7 +144,9 @@ def main():
 
     if args.antmaze or args.pusht:
         if not args.guided:
-            raise ValueError("AntMaze/PushT playback currently supported only for guided checkpoints; pass --guided.")
+            raise ValueError(
+                "AntMaze/PushT playback currently supported only for guided checkpoints; pass --guided."
+            )
         if args.antmaze:
             env_name = args.env_name or "AntMaze_UMaze-v4"
             env = AntMazeEnv(env_name=env_name, render_mode="rgb_array")
@@ -147,9 +175,15 @@ def main():
                 if args.guided:
                     obs_arr = obs
                     if isinstance(obs_arr, dict):
-                        parts = [np.array(obs_arr[k]).ravel() for k in sorted(obs_arr.keys())]
+                        parts = [
+                            np.array(obs_arr[k]).ravel() for k in sorted(obs_arr.keys())
+                        ]
                         obs_arr = np.concatenate(parts, axis=0)
-                    obs_seq = t.tensor(obs_arr, device=policy.device, dtype=t.float32).unsqueeze(0).unsqueeze(1)
+                    obs_seq = (
+                        t.tensor(obs_arr, device=policy.device, dtype=t.float32)
+                        .unsqueeze(0)
+                        .unsqueeze(1)
+                    )
                     obs_seq = obs_seq.repeat(1, policy.T_o, 1)
                     goal = t.zeros(1, policy.action_dim, device=policy.device)
                     traj = policy.predict_action_sequence(obs_seq, goal)
@@ -159,7 +193,9 @@ def main():
                         logits = traj[:, 0, :]
                         action = int(t.argmax(logits, dim=-1).item())
                 else:
-                    obs_t = t.tensor(obs, device=policy.device, dtype=t.float32).unsqueeze(0)
+                    obs_t = t.tensor(
+                        obs, device=policy.device, dtype=t.float32
+                    ).unsqueeze(0)
                     logits = policy(obs_t, deterministic=True)
                     action = int(t.argmax(logits, dim=-1).item())
                 obs, reward, done, truncated, _ = env.step(action)

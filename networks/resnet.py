@@ -19,9 +19,11 @@ import torch as t
 import torch.nn as nn
 
 from typing import Optional
+
 try:
     from torchtyping import TensorType as Tensor
 except ImportError:  # pragma: no cover - optional dependency
+
     class _TensorAlias:
         def __class_getitem__(cls, key):
             return t.Tensor
@@ -191,13 +193,9 @@ class LinearNetwork(BFNetwork):
             cond_emb = self.cond_emb(cond)
 
             if cond_drop_prob > 0.0:
-                keep_mask = t.rand((batch,), device=device) < (
-                    1 - cond_drop_prob
-                )
+                keep_mask = t.rand((batch,), device=device) < (1 - cond_drop_prob)
                 null_classes_emb = self.null_classes_emb.expand(batch, -1)
-                cond_emb = t.where(
-                    keep_mask[:, None], cond_emb, null_classes_emb
-                )
+                cond_emb = t.where(keep_mask[:, None], cond_emb, null_classes_emb)
             c = self.cond_mlp(cond_emb)
         else:
             c = None
@@ -255,8 +253,4 @@ class DiscreteLinearNet(LinearNetwork):
         cond: Optional[Tensor["B", "C"]] = None,
         cond_drop_prob: Optional[float] = None,
     ) -> Tensor["B", "D", "K"]:
-        return (
-            super()
-            .forward(x.flatten(1), time, cond, cond_drop_prob)
-            .view(x.shape)
-        )   
+        return super().forward(x.flatten(1), time, cond, cond_drop_prob).view(x.shape)

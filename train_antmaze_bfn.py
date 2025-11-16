@@ -96,7 +96,9 @@ def collect_dataset(cfg: Config, env: AntMazeEnv):
         done = truncated = False
         steps = 0
         while not (done or truncated) and steps < cfg.data.max_steps:
-            action = env.action_space.sample()  # placeholder policy; replace with expert data if available
+            action = (
+                env.action_space.sample()
+            )  # placeholder policy; replace with expert data if available
             obs_buf.append(flatten_obs(obs).astype(np.float32))
             act_buf.append(np.array(action, dtype=np.float32).ravel())
             obs, reward, done, truncated, _ = env.step(action)
@@ -112,7 +114,9 @@ def build_loaders(cfg: Config, obs: np.ndarray, acts: np.ndarray):
         ds = TensorDataset(t.tensor(o), t.tensor(a))
         return DataLoader(ds, batch_size=cfg.data.batch_size, shuffle=shuffle)
 
-    return to_loader(obs[:split], acts[:split], True), to_loader(obs[split:], acts[split:], False)
+    return to_loader(obs[:split], acts[:split], True), to_loader(
+        obs[split:], acts[split:], False
+    )
 
 
 @hydra.main(config_name="antmaze_bfn", config_path="config", version_base=None)
@@ -142,12 +146,16 @@ def main(cfg: DictConfig):
         dtype="float32",
     ).to(device)
 
-    opt = t.optim.Adam(policy.parameters(), lr=cfg.optim.lr, weight_decay=cfg.optim.weight_decay)
+    opt = t.optim.Adam(
+        policy.parameters(), lr=cfg.optim.lr, weight_decay=cfg.optim.weight_decay
+    )
 
     wandb_run = None
     if cfg.wandb.use_wandb:
         if wandb is None:
-            raise ImportError("wandb not installed; set wandb.use_wandb=false or install wandb.")
+            raise ImportError(
+                "wandb not installed; set wandb.use_wandb=false or install wandb."
+            )
         wandb_run = wandb.init(
             project=cfg.wandb.project,
             entity=cfg.wandb.entity,
@@ -165,7 +173,9 @@ def main(cfg: DictConfig):
             # Use backbone directly for supervised regression
             x_init = t.zeros(obs.size(0), act_dim, device=device)
             time = t.zeros(obs.size(0), device=device)
-            pred = policy.backbone(x_init, time, obs)  # predict action from obs conditioning
+            pred = policy.backbone(
+                x_init, time, obs
+            )  # predict action from obs conditioning
             loss = t.nn.functional.mse_loss(pred, act)
             opt.zero_grad()
             loss.backward()
@@ -190,7 +200,9 @@ def main(cfg: DictConfig):
         val_loss = val_loss / max(val_batches, 1)
 
         if epoch % cfg.train.log_interval == 0:
-            print(f"[{epoch}/{cfg.train.epochs}] loss={avg_loss:.4f} val_loss={val_loss:.4f}")
+            print(
+                f"[{epoch}/{cfg.train.epochs}] loss={avg_loss:.4f} val_loss={val_loss:.4f}"
+            )
             if wandb_run is not None:
                 wandb_run.log({"loss": avg_loss, "val_loss": val_loss, "epoch": epoch})
 

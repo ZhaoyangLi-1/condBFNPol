@@ -64,7 +64,7 @@ class GuidedBFNPolicy:
 
     def bfn_get_sender_receiver(self, x: t.Tensor, t_frac: t.Tensor):
         """Returns noisy sender sample and loss weight (simplified schedule)."""
-        sigma_t = 0.01 ** t_frac
+        sigma_t = 0.01**t_frac
         noise = t.randn_like(x)
         y_noisy = x * sigma_t + noise * (1 - sigma_t**2).sqrt()
         loss_weight = 1.0 / (0.01 ** (2 * t_frac))
@@ -74,7 +74,9 @@ class GuidedBFNPolicy:
         """Simple Euler update toward guided prediction."""
         return A_t_plus_dt + (A_guided - A_t_plus_dt) * dt
 
-    def compute_trajectory_cost(self, action_sequence: t.Tensor, goal_state: t.Tensor) -> t.Tensor:
+    def compute_trajectory_cost(
+        self, action_sequence: t.Tensor, goal_state: t.Tensor
+    ) -> t.Tensor:
         """Differentiable cost over an action sequence (L2 to goal on final action)."""
         predicted_final_action = action_sequence[:, -1, :]
         return t.linalg.norm(predicted_final_action - goal_state)
@@ -89,7 +91,9 @@ class GuidedBFNPolicy:
         # Pad if buffer not full
         while len(obs_list) < self.T_o:
             obs_list.insert(0, obs_list[0])
-        obs_batch = t.stack(obs_list, dim=0).unsqueeze(0).to(self.device)  # [1, T_o, ...]
+        obs_batch = (
+            t.stack(obs_list, dim=0).unsqueeze(0).to(self.device)
+        )  # [1, T_o, ...]
         # Flatten batch/time for encoder, then reshape back if encoder expects batch
         # Assumes encoder operates on (B*T_o, C, H, W) or (B*T_o, D)
         b, t_h = obs_batch.shape[0], obs_batch.shape[1]
@@ -98,13 +102,17 @@ class GuidedBFNPolicy:
         feats = feats.view(b, t_h, -1)
         return feats
 
-    def _guided_prediction(self, A: t.Tensor, cond: Optional[t.Tensor], t_frac: float) -> t.Tensor:
+    def _guided_prediction(
+        self, A: t.Tensor, cond: Optional[t.Tensor], t_frac: float
+    ) -> t.Tensor:
         """Forward through the network with optional classifier-free and gradient guidance."""
         t_tensor = t.full((A.size(0),), t_frac, device=A.device, dtype=A.dtype)
 
         # Conditional forward
         if hasattr(self.network, "forward_with_cond_scale") and cond is not None:
-            pred = self.network.forward_with_cond_scale(A, t_tensor, cond, cond_scale=self.w)
+            pred = self.network.forward_with_cond_scale(
+                A, t_tensor, cond, cond_scale=self.w
+            )
         else:
             pred = self.network(A, t_tensor, cond)
 
@@ -234,7 +242,9 @@ class GuidedBFNPolicy:
             if self.alpha > 0.0:
                 with t.enable_grad():
                     A_pred_grad = A_pred_cfg.clone().requires_grad_(True)
-                    cost = self.compute_trajectory_cost(A_pred_grad, goal_state.to(c_cond.device))
+                    cost = self.compute_trajectory_cost(
+                        A_pred_grad, goal_state.to(c_cond.device)
+                    )
                     grad_cost = t.autograd.grad(cost, A_pred_grad, allow_unused=True)[0]
                 if grad_cost is None:
                     grad_cost = 0.0

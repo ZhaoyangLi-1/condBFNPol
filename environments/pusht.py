@@ -30,7 +30,9 @@ class PushTEnv(BaseEnv):
         action_space: The action space of the environment.
     """
 
-    def __init__(self, env_name: str = "gym_pusht/PushT-v0", render_mode: str | None = None):
+    def __init__(
+        self, env_name: str = "gym_pusht/PushT-v0", render_mode: str | None = None
+    ):
         """Initializes a new PushTEnv environment.
 
         Args:

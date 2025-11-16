@@ -21,9 +21,11 @@ import torch.nn as nn
 from abc import abstractmethod
 from typing import Optional
 from functools import partial
+
 try:
     from torchtyping import TensorType as Tensor
 except ImportError:  # pragma: no cover - optional dependency
+
     class _TensorAlias:
         def __class_getitem__(cls, key):
             return t.Tensor
@@ -89,15 +91,9 @@ class BFNetwork(nn.Module):
         if rescaled_phi == 0.0:
             return scaled_logits
 
-        std_fn = partial(
-            t.std, dim=tuple(range(1, scaled_logits.ndim)), keepdim=True
-        )
-        rescaled_logits = scaled_logits * (
-            std_fn(logits) / std_fn(scaled_logits)
-        )
-        return rescaled_logits * rescaled_phi + scaled_logits * (
-            1.0 - rescaled_phi
-        )
+        std_fn = partial(t.std, dim=tuple(range(1, scaled_logits.ndim)), keepdim=True)
+        rescaled_logits = scaled_logits * (std_fn(logits) / std_fn(scaled_logits))
+        return rescaled_logits * rescaled_phi + scaled_logits * (1.0 - rescaled_phi)
 
 
 class DiscreteBFNetwork(BFNetwork):
@@ -141,9 +137,7 @@ class RandomOrLearnedSinusoidalPosEmb(nn.Module):
         super().__init__()
         assert dim % 2 == 0, "Sinusoidal positional embedding dim must be even"
         half_dim = dim // 2
-        self.weights = nn.Parameter(
-            t.randn(half_dim), requires_grad=not is_random
-        )
+        self.weights = nn.Parameter(t.randn(half_dim), requires_grad=not is_random)
 
     def forward(self, x: Tensor["B", 1]) -> Tensor["B", "dim+1"]:
         freqs = x * self.weights[None, :] * 2 * math.pi

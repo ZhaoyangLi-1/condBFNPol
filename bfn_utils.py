@@ -25,6 +25,7 @@ from functools import wraps
 try:
     from torchtyping import TensorType as Tensor
 except ImportError:  # pragma: no cover - optional dependency
+
     class _TensorAlias:
         def __class_getitem__(cls, key):
             return t.Tensor
@@ -38,9 +39,7 @@ def copy_mod(mod: nn.Module) -> nn.Module:
     new_mod = copy.copy(mod)
     new_mod._parameters = copy.copy(mod._parameters)
     new_mod._buffers = copy.copy(mod._buffers)
-    new_mod._modules = {
-        name: copy_mod(child) for (name, child) in mod._modules.items()
-    }
+    new_mod._modules = {name: copy_mod(child) for (name, child) in mod._modules.items()}
     return new_mod
 
 
@@ -125,9 +124,7 @@ def norm_denorm(
 
 
 def eye_like(x: Tensor["B", "D", "D"]) -> Tensor["B", "D", "D"]:
-    assert (
-        x.shape[-1] == x.shape[-2]
-    ), f"x is not square in the last 2 dims: {x.shape}"
+    assert x.shape[-1] == x.shape[-2], f"x is not square in the last 2 dims: {x.shape}"
 
     return t.eye(x.shape[-1], dtype=x.dtype, device=x.device).expand(
         x.shape[:-2] + (-1, -1)
