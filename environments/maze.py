@@ -1,10 +1,16 @@
-"""A tiny grid-world maze environment for policy learning (Gym-friendly)."""
+"""A tiny grid-world maze environment for policy learning.
+
+This module provides a simple grid-world maze environment that is compatible
+with the Gymnasium API. The environment is defined by a grid of characters,
+where 'S' is the start, 'G' is the goal, '#' is a wall, and '.' is a free
+space.
+"""
 
 from __future__ import annotations
 
-import numpy as np
 from typing import Iterable, Tuple
 
+import numpy as np
 from environments.base import BaseEnv
 
 try:  # Prefer gymnasium if available, else fallback to gym
@@ -16,9 +22,15 @@ spaces = gym.spaces
 
 
 class MazeEnv(BaseEnv):
-    metadata = {"render_modes": ["human", "ansi", "rgb_array"], "render_fps": 4}
+    """A classic grid-world maze with walls, a goal, and a per-step penalty.
 
-    """A classic grid-world maze with walls, goal and per-step penalty."""
+    Attributes:
+        metadata (dict): Metadata for the environment, including render modes and FPS.
+        action_space (gym.spaces.Discrete): The action space for the environment.
+        observation_space (gym.spaces.Box): The observation space for the environment.
+    """
+
+    metadata = {"render_modes": ["human", "ansi", "rgb_array"], "render_fps": 4}
 
     def __init__(
         self,
@@ -30,14 +42,22 @@ class MazeEnv(BaseEnv):
         seed: int | None = None,
         render_mode: str | None = None,
     ):
-        """
+        """Initializes a new MazeEnv environment.
+
         Args:
-            grid: an iterable of strings, each cell: "." free, "#" wall, "S" start, "G" goal.
-                  If None, a default 5x5 maze is used.
-            max_steps: episode length limit.
-            step_cost: reward per time step (usually negative).
-            goal_reward: reward when reaching the goal.
-            seed: optional RNG seed for reproducibility.
+            grid: An iterable of strings representing the maze layout. Each
+                character in the string can be one of the following:
+                - ".": A free space.
+                - "#": A wall.
+                - "S": The starting position.
+                - "G": The goal position.
+                If None, a default 5x5 maze is used.
+            max_steps: The maximum number of steps per episode.
+            step_cost: The cost incurred at each step.
+            goal_reward: The reward for reaching the goal.
+            seed: The seed for the random number generator.
+            render_mode: The rendering mode to use. Can be one of "human",
+                "ansi", or "rgb_array".
         """
         self.rng = np.random.default_rng(seed)
         grid_rows = (
@@ -80,25 +100,61 @@ class MazeEnv(BaseEnv):
         self._steps = 0
 
     def _find(self, char: str) -> Tuple[int, int] | None:
+        """Finds the coordinates of a character in the grid.
+
+        Args:
+            char: The character to find.
+
+        Returns:
+            A tuple of (y, x) coordinates, or None if the character is not found.
+        """
         coords = np.argwhere(self.grid == char)
         return tuple(coords[0]) if coords.size > 0 else None
 
     def _valid(self, pos: Tuple[int, int]) -> bool:
+        """Checks if a position is valid.
+
+        Args:
+            pos: The position to check.
+
+        Returns:
+            True if the position is valid, False otherwise.
+        """
         y, x = pos
         if y < 0 or y >= self.height or x < 0 or x >= self.width:
             return False
         return self.grid[y, x] != "#"
 
     def _obs(self) -> np.ndarray:
+        """Gets the current observation.
+
+        Returns:
+            The current observation.
+        """
         y, x = self._pos
         return np.array([y / (self.height - 1), x / (self.width - 1)], dtype=np.float32)
 
     def reset(self) -> Tuple[np.ndarray, dict]:
+        """Resets the environment to its initial state.
+
+        Returns:
+            A tuple containing the initial observation and an empty info dict.
+        """
         self._pos = tuple(self.start_pos)
         self._steps = 0
         return self._obs(), {}
 
     def step(self, action: np.ndarray | int) -> Tuple[np.ndarray, float, bool, bool, dict]:
+        """Takes a step in the environment.
+
+        Args:
+            action: The action to take.
+
+        Returns:
+            A tuple containing the next observation, the reward, a boolean
+            indicating whether the episode has terminated, a boolean indicating
+            whether the episode has been truncated, and an info dict.
+        """
         self._steps += 1
         act = int(np.squeeze(action))
         dy, dx = {
@@ -120,12 +176,22 @@ class MazeEnv(BaseEnv):
         return self._obs(), reward, terminated, truncated, info
 
     def _grid_with_agent(self) -> np.ndarray:
+        """Returns a copy of the grid with the agent's position marked.
+
+        Returns:
+            A copy of the grid with the agent's position marked.
+        """
         grid = self.grid.copy()
         y, x = self._pos
         grid[y, x] = "A"
         return grid
 
     def render(self):
+        """Renders the environment.
+
+        Returns:
+            The rendered environment, or None if the render mode is "human".
+        """
         grid = self._grid_with_agent()
 
         if self.render_mode in (None, "human", "ansi"):
