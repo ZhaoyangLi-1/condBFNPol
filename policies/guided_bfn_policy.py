@@ -351,7 +351,15 @@ class GuidedBFNPolicy(BasePolicy):
                 for k, v in obs.items()
             }
             if self.obs_encoder:
-                return self.obs_encoder(obs)
+                enc = self.obs_encoder(obs)
+                # If encoder flattened time into batch (e.g., images with shape [B, T, ...]),
+                # reshape back and pool over time so cond matches batch dim.
+                if "image" in obs and isinstance(obs["image"], torch.Tensor):
+                    batch_size = obs["image"].shape[0]
+                    if enc.shape[0] % batch_size == 0 and enc.shape[0] != batch_size:
+                        t = enc.shape[0] // batch_size
+                        enc = enc.view(batch_size, t, -1).mean(dim=1)
+                return enc
             return torch.cat([v.flatten(start_dim=1) for v in obs.values()], dim=1)
 
         obs = obs.to(self.device, dtype=self.dtype)
@@ -451,7 +459,36 @@ class GuidedBFNPolicy(BasePolicy):
         # Use try-except to catch "Not initialized" error from library normalizer
         try:
             if len(self.normalizer.params_dict) > 0:
-                batch = self.normalizer.normalize(batch)
+                # Handle nested obs dicts by normalizing only the keys we have stats for.
+                if (
+                    isinstance(batch, dict)
+                    and "obs" in batch
+                    and isinstance(batch["obs"], dict)
+                ):
+                    obs_dict = batch["obs"]
+                    if (
+                        "agent_pos" in obs_dict
+                        and "agent_pos" in self.normalizer.params_dict
+                    ):
+                        obs_dict["agent_pos"] = self.normalizer["agent_pos"].normalize(
+                            obs_dict["agent_pos"]
+                        )
+                    batch["obs"] = obs_dict
+
+                    if "action" in batch and "action" in self.normalizer.params_dict:
+                        batch["action"] = self.normalizer["action"].normalize(
+                            batch["action"]
+                        )
+                else:
+                    try:
+                        batch = self.normalizer.normalize(batch)
+                    except KeyError:
+                        # Missing fields (e.g., nested obs dict). Skip normalization gracefully.
+                        if not getattr(self, "_warned", False):
+                            log.warning(
+                                "GuidedBFNPolicy: Normalizer missing keys for given batch. Skipping normalization."
+                            )
+                            self._warned = True
             else:
                 if not getattr(self, "_warned", False):
                     log.warning(
