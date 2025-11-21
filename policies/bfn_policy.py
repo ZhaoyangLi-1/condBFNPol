@@ -1,116 +1,69 @@
-"""Conditional BFN-backed policy implementations."""
+"""Conditional Bayesian Flow Network (BFN) policy implementation.
+
+This module provides a policy wrapper for Continuous Bayesian Flow Networks.
+It handles the interface between the environment (observations) and the
+generative model (BFN), managing conditioning, sampling, and training loops.
+"""
 
 from __future__ import annotations
 
-import torch as t
-import torch.nn as nn
-
-from typing import Any, Iterable, Optional, Sequence
+import logging
 import contextlib
+from typing import Any, Callable, Dict, NamedTuple, Optional, Union
 
-from bfn_utils import default, exists
-from conditional_bfn import ContinuousBFN
-from networks.base import BFNetwork, RandomOrLearnedSinusoidalPosEmb
+import torch
+import torch.nn as nn
+import einops
+
 from policies.base import BasePolicy
+from networks.conditional_bfn import ContinuousBFN
+from networks.base import BFNetwork
+from utils.bfn_utils import default
 
-__all__ = ["ConditionalBFNBackbone", "ConditionalBFNPolicy"]
+# Try importing from local utils first, fallback to diffusion_policy
+try:
+    from utils.normalizer import LinearNormalizer
+except ImportError:
+    from diffusion_policy.model.common.normalizer import LinearNormalizer
 
+log = logging.getLogger(__name__)
 
-class ConditionalBFNBackbone(BFNetwork):
-    """Lightweight MLP backbone that conditions on observations."""
-
-    def __init__(
-        self,
-        *,
-        action_dim: int,
-        obs_dim: int,
-        hidden_dims: Sequence[int] = (256, 256),
-        time_emb_dim: int = 64,
-        cond_drop_prob: float = 0.1,
-        random_time_emb: bool = False,
-    ):
-        super().__init__(is_conditional_model=True)
-        self.action_dim = action_dim
-        self.obs_dim = obs_dim
-        self.cond_dim = obs_dim  # used for validation in ContinuousBFN
-        self.cond_is_discrete = False
-        self.cond_drop_prob = cond_drop_prob
-
-        # Time embeddings mirror the style used in network modules.
-        self.time_mlp = nn.Sequential(
-            RandomOrLearnedSinusoidalPosEmb(time_emb_dim, random_time_emb),
-            nn.Linear(time_emb_dim + 1, time_emb_dim),
-            nn.GELU(),
-            nn.Linear(time_emb_dim, time_emb_dim),
-        )
-
-        # Observation encoder.
-        hidden_dims = (
-            tuple(hidden_dims) if isinstance(hidden_dims, Iterable) else (hidden_dims,)
-        )
-        obs_layers = []
-        last_dim = obs_dim
-        for dim in hidden_dims:
-            obs_layers.extend([nn.Linear(last_dim, dim), nn.GELU()])
-            last_dim = dim
-        self.cond_proj = nn.Sequential(*obs_layers)
-        self._cond_dim = last_dim
-
-        # Core predictor.
-        core_layers = []
-        core_in = action_dim + time_emb_dim + self._cond_dim
-        for dim in hidden_dims:
-            core_layers.extend([nn.Linear(core_in, dim), nn.GELU()])
-            core_in = dim
-        core_layers.append(nn.Linear(core_in, action_dim))
-        self.core = nn.Sequential(*core_layers)
-
-    def forward(
-        self,
-        x: t.Tensor,
-        time: t.Tensor,
-        cond: Optional[t.Tensor],
-        cond_drop_prob: Optional[float] = None,
-    ) -> t.Tensor:
-        batch = x.shape[0]
-        if time.shape == (1,):
-            time = time.expand(batch)
-
-        time_emb = self.time_mlp(time[:, None])
-        cond_drop_prob = default(cond_drop_prob, self.cond_drop_prob)
-
-        if exists(cond):
-            cond_flat = cond.view(batch, -1).to(dtype=x.dtype, device=x.device)
-            cond_emb = self.cond_proj(cond_flat)
-            if cond_drop_prob > 0.0:
-                keep_mask = t.rand((batch,), device=x.device) < (1 - cond_drop_prob)
-                cond_emb = cond_emb * keep_mask[:, None]
-        else:
-            cond_emb = t.zeros((batch, self._cond_dim), device=x.device, dtype=x.dtype)
-
-        h = t.cat((x.view(batch, -1), time_emb, cond_emb), dim=-1)
-        out = self.core(h)
-        return out.view_as(x)
+__all__ = ["BFNPolicy", "BFNConfig"]
 
 
-class ConditionalBFNPolicy(BasePolicy):
-    """Policy that samples actions via a conditional ContinuousBFN."""
+class BFNConfig(NamedTuple):
+    """Configuration for Bayesian Flow Network hyperparameters."""
+
+    sigma_1: float = 0.001
+    n_timesteps: int = 20
+    cond_scale: Optional[float] = None
+    rescaled_phi: Optional[float] = None
+    deterministic_seed: int = 42
+
+
+class BFNPolicy(BasePolicy):
+    """Policy wrapper for Continuous Bayesian Flow Networks with Action Chunking."""
 
     def __init__(
         self,
         *,
         action_space: Any,
-        obs_dim: int,
-        action_dim: int,
-        backbone: Optional[BFNetwork] = None,
-        hidden_dims: Sequence[int] = (256, 256),
-        time_emb_dim: int = 64,
+        bfn: Optional[ContinuousBFN] = None,
+        network: Optional[BFNetwork] = None,
+        action_dim: Optional[int] = None,
+        n_action_steps: int = 1,
+        obs_encoder: Optional[
+            Callable[[Union[torch.Tensor, Dict]], torch.Tensor]
+        ] = None,
+        cond_from_obs: Optional[
+            Callable[[Union[torch.Tensor, Dict]], torch.Tensor]
+        ] = None,
+        config: Optional[BFNConfig] = None,
         sigma_1: float = 0.001,
         n_timesteps: int = 20,
         cond_scale: Optional[float] = None,
         rescaled_phi: Optional[float] = None,
-        deterministic_seed: int = 0,
-        random_time_emb: bool = False,
+        deterministic_seed: int = 42,
         device: str = "cpu",
         dtype: str = "float32",
         clip_actions: bool = True,
@@ -121,70 +74,178 @@ class ConditionalBFNPolicy(BasePolicy):
             dtype=dtype,
             clip_actions=clip_actions,
         )
-        self.obs_dim = obs_dim
+
+        self.config = config or BFNConfig(
+            sigma_1=sigma_1,
+            n_timesteps=n_timesteps,
+            cond_scale=cond_scale,
+            rescaled_phi=rescaled_phi,
+            deterministic_seed=deterministic_seed,
+        )
+
         self.action_dim = action_dim
-        self.sigma_1 = sigma_1
-        self.n_timesteps = n_timesteps
-        self.cond_scale = cond_scale
-        self.rescaled_phi = rescaled_phi
-        self.deterministic_seed = deterministic_seed
+        self.n_action_steps = n_action_steps
+        self.flat_dim = action_dim * n_action_steps
 
-        self.backbone = backbone or ConditionalBFNBackbone(
-            action_dim=action_dim,
-            obs_dim=obs_dim,
-            hidden_dims=hidden_dims,
-            time_emb_dim=time_emb_dim,
-            random_time_emb=random_time_emb,
-        )
-        self.bfn = ContinuousBFN(
-            dim=action_dim, net=self.backbone, device_str=device, dtype_str=dtype
-        )
+        self.normalizer = LinearNormalizer()
 
-    def _flatten_obs(self, obs: t.Tensor) -> t.Tensor:
-        obs = obs.to(device=self.device, dtype=self.dtype)
+        if bfn is None:
+            if network is None:
+                raise ValueError("Must provide either `ContinuousBFN` or `network`.")
+            if action_dim is None:
+                raise ValueError("`action_dim` is required.")
+
+            bfn = ContinuousBFN(
+                dim=self.flat_dim, net=network, device_str=device, dtype_str=dtype
+            )
+
+        self.bfn = bfn
+        self.obs_encoder = obs_encoder or cond_from_obs
+
+    def _encode_obs(self, obs: Union[torch.Tensor, Dict[str, Any]]) -> torch.Tensor:
+        if isinstance(obs, dict):
+            obs = {
+                k: v.to(device=self.device, dtype=self.dtype)
+                if isinstance(v, torch.Tensor)
+                else v
+                for k, v in obs.items()
+            }
+        else:
+            obs = obs.to(device=self.device, dtype=self.dtype)
+
+        if self.obs_encoder is not None:
+            return self.obs_encoder(obs)
+
+        if isinstance(obs, dict):
+            raise ValueError("Cannot flatten dict obs. Provide obs_encoder.")
         return obs.view(obs.size(0), -1)
 
-    def _sample_actions(
-        self,
-        cond: t.Tensor,
-        *,
-        cond_scale: Optional[float],
-        rescaled_phi: Optional[float],
-    ) -> t.Tensor:
-        actions = self.bfn.sample(
+    def _sample_actions(self, cond, *, cond_scale, rescaled_phi) -> torch.Tensor:
+        actions_flat = self.bfn.sample(
             n_samples=1,
-            sigma_1=self.sigma_1,
-            n_timesteps=self.n_timesteps,
+            sigma_1=self.config.sigma_1,
+            n_timesteps=self.config.n_timesteps,
             cond=cond,
             cond_scale=cond_scale,
             rescaled_phi=rescaled_phi,
         )
-        return actions.squeeze(1)
+        return actions_flat.squeeze(1)
+
+    def set_normalizer(self, normalizer: LinearNormalizer) -> None:
+        """Loads normalizer statistics from a fitted instance."""
+        self.normalizer.load_state_dict(normalizer.state_dict())
+        log.info(
+            f"BFNPolicy normalizer loaded. Params: {len(self.normalizer.params_dict)}"
+        )
 
     def forward(
         self,
-        obs: t.Tensor,
+        obs: Union[torch.Tensor, Dict[str, Any]],
         *,
         deterministic: bool = False,
         cond_scale: Optional[float] = None,
         rescaled_phi: Optional[float] = None,
-    ) -> t.Tensor:
-        cond = self._flatten_obs(obs)
-        cond_scale = default(cond_scale, self.cond_scale)
-        rescaled_phi = default(rescaled_phi, self.rescaled_phi)
+    ) -> torch.Tensor:
+        # 1. Normalize (Handling both Dict and Tensor inputs)
+        if len(self.normalizer.params_dict) > 0:
+            if isinstance(obs, dict):
+                obs = self.normalizer["obs"].normalize(obs)
+            else:
+                # Try normalizing assuming 'obs' key exists, else fallback to default
+                try:
+                    obs = self.normalizer["obs"].normalize(obs)
+                except (KeyError, AttributeError):
+                    # If normalizer has no 'obs' key, it might be a single-field normalizer
+                    obs = self.normalizer.normalize(obs)
 
+        cond = self._encode_obs(obs)
+        c_scale = default(cond_scale, self.config.cond_scale)
+        r_phi = default(rescaled_phi, self.config.rescaled_phi)
+
+        rng_context = contextlib.nullcontext()
         if deterministic:
-            ctx = (
-                t.random.fork_rng(devices=[self.device])
-                if isinstance(self.device, t.device) and self.device.type == "cuda"
-                else contextlib.nullcontext()
-            )
-            with ctx:
-                t.manual_seed(self.deterministic_seed)
-                return self._sample_actions(
-                    cond, cond_scale=cond_scale, rescaled_phi=rescaled_phi
-                )
+            if self.device.type == "cuda":
+                rng_context = torch.random.fork_rng(devices=[self.device])
+            else:
+                rng_context = torch.random.fork_rng()
 
-        return self._sample_actions(
-            cond, cond_scale=cond_scale, rescaled_phi=rescaled_phi
+        with rng_context:
+            if deterministic:
+                torch.manual_seed(self.config.deterministic_seed)
+            actions_flat = self._sample_actions(
+                cond, cond_scale=c_scale, rescaled_phi=r_phi
+            )
+
+        B = actions_flat.shape[0]
+        actions = actions_flat.view(B, self.n_action_steps, self.action_dim)
+
+        # Unnormalize
+        if len(self.normalizer.params_dict) > 0:
+            actions = self.normalizer["action"].unnormalize(actions)
+
+        return actions
+
+    def compute_loss(self, batch: Any) -> torch.Tensor:
+        # 1. Unpack Batch into Dict
+        # This is the critical fix: Convert list/tuple to dict BEFORE normalizing
+        if isinstance(batch, (list, tuple)):
+            data = {"obs": batch[0], "action": batch[1]}
+        elif isinstance(batch, dict):
+            data = batch
+        else:
+            raise TypeError(f"Unsupported batch type: {type(batch)}")
+
+        # 2. Normalize
+        if len(self.normalizer.params_dict) > 0:
+            data = self.normalizer.normalize(data)
+        else:
+            # Only log once to avoid spamming
+            if not getattr(self, "_warned_norm", False):
+                log.warning(
+                    "BFNPolicy normalizer is empty! Training on raw data (unstable)."
+                )
+                self._warned_norm = True
+
+        # 3. Extract normalized tensors
+        obs_t = self._to_tensor(data["obs"])
+        actions_t = self._to_tensor(data["action"])
+
+        # Flatten [B, T, D] -> [B, T*D] for BFN ingestion
+        if actions_t.ndim == 3:
+            B, T, D = actions_t.shape
+            actions_t = actions_t.reshape(B, -1)
+
+        cond = self._encode_obs(obs_t)
+
+        # 4. Compute Loss
+        loss = self.bfn.loss(
+            actions_t,
+            cond=cond,
+            sigma_1=self.config.sigma_1,
+            cond_scale=self.config.cond_scale,
+            rescaled_phi=self.config.rescaled_phi,
         )
+
+        if loss.dim() > 0:
+            loss = loss.mean()
+
+        return loss
+
+    def to(self, *args, **kwargs):
+        """Moves policy components to the specified device."""
+        if isinstance(self.bfn, nn.Module):
+            self.bfn.to(*args, **kwargs)
+        elif hasattr(self.bfn, "net") and isinstance(self.bfn.net, nn.Module):
+            self.bfn.net.to(*args, **kwargs)
+        if self.obs_encoder and isinstance(self.obs_encoder, nn.Module):
+            self.obs_encoder.to(*args, **kwargs)
+
+        device = kwargs.get("device", None)
+        for arg in args:
+            if isinstance(arg, (torch.device, str)):
+                device = arg
+                break
+        if device is not None:
+            self._device = torch.device(device)
+
+        return self

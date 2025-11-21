@@ -7,7 +7,7 @@ with the Gymnasium API.
 from __future__ import annotations
 
 import abc
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Tuple, Optional
 
 import numpy as np
 
@@ -29,13 +29,23 @@ class BaseEnv(gym.Env, abc.ABC):
     action_space: Any
 
     @abc.abstractmethod
-    def reset(self) -> Tuple[np.ndarray, Dict[str, Any]]:
+    def reset(
+        self, seed: Optional[int] = None, options: Optional[Dict[str, Any]] = None
+    ) -> Tuple[np.ndarray, Dict[str, Any]]:
         """Resets the environment to its initial state.
+
+        Args:
+            seed: The seed that is used to initialize the environment's PRNG.
+            options: Additional information to specify how the environment is reset.
 
         Returns:
             A tuple containing the initial observation and an info dict.
         """
-        raise NotImplementedError
+        # Call the parent gym.Env reset to handle seeding the internal np_random
+        super().reset(seed=seed, options=options)
+        # We don't return anything useful here because the subclass must implement
+        # the actual logic to generate the observation.
+        return np.array([]), {}
 
     @abc.abstractmethod
     def step(

@@ -1,0 +1,107 @@
+defaults:
+  - _self_
+
+action_dim: 2
+obs_dim: 2
+chunk_size: 16  # Horizon
+
+# =============================================================================
+# LIGHTNING MODULE (Task)
+# =============================================================================
+task:
+  _target_: tasks.policy_training.PolicyTraining
+  _recursive_: false
+  
+  optimizer:
+    _target_: torch.optim.AdamW
+    lr: 1.0e-4
+    weight_decay: 1.0e-6
+  
+  lr_scheduler:
+    _target_: torch.optim.lr_scheduler.CosineAnnealingLR
+    T_max: 200
+    eta_min: 1.0e-6
+    interval: epoch
+    frequency: 1
+  
+  policy:
+    _target_: policies.diffusion_policy.DiffusionPolicy
+    
+    action_space:
+      _target_: gymnasium.spaces.Box
+      low: -1.0
+      high: 1.0
+      shape: 
+        - ${action_dim}
+      dtype: float32
+      
+    action_dim: ${action_dim}
+    obs_dim: ${obs_dim}
+    
+    # Dimensions
+    horizon: ${chunk_size}
+    n_action_steps: ${chunk_size}
+    n_obs_steps: 1
+    
+    # Inference
+    num_inference_steps: 100
+    condition_mode: global 
+    
+    # Model (1D U-Net)
+    model:
+      _target_: networks.unet.Unet
+      input_dim: ${action_dim}
+      global_cond_dim: ${obs_dim}
+      diffusion_step_embed_dim: 128
+      down_dims: [256, 512, 1024]
+      kernel_size: 5
+      n_groups: 8
+      
+    # Scheduler
+    noise_scheduler:
+      _target_: diffusers.schedulers.scheduling_ddpm.DDPMScheduler
+      num_train_timesteps: 100
+      beta_start: 0.0001
+      beta_end: 0.02
+      beta_schedule: squaredcos_cap_v2
+      variance_type: fixed_small 
+      clip_sample: True
+      prediction_type: epsilon
+      
+    device: cpu # Use cpu/mps for Mac
+
+# =============================================================================
+# DATA MODULE
+# =============================================================================
+datamodule:
+  _target_: tasks.point_maze_datamodule.PointMazeDataModule
+  n_episodes: 1000
+  chunk_size: ${chunk_size}
+  batch_size: 256
+  max_steps: 200
+  seed: 42
+  num_workers: 0
+
+# =============================================================================
+# TRAINER
+# =============================================================================
+trainer:
+  _target_: lightning.pytorch.Trainer
+  accelerator: auto
+  devices: 1
+  max_epochs: 200
+  gradient_clip_val: 1.0
+  log_every_n_steps: 10
+  enable_checkpointing: true
+
+# =============================================================================
+# LOGGING
+# =============================================================================
+logging:
+  wandb:
+    project: mazii-diffusion
+    resume: True
+    mode: online
+    entity: aleyna-research
+    id: null
+    group: null

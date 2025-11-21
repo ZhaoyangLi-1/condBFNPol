@@ -1,525 +1,429 @@
-# Copyright (C) 2023 Maxime Robeyns <dev@maximerobeyns.com>
-# Copyright (C) 2020 Phil Wang <github.com/lucidrains>
-# Copyright (C) 2020 Jonathan Ho <github.com/hojonathanho>
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-"""Unets, usually used with image data [C, W, H].
+"""Conditional 1D U-Net for Trajectory Diffusion/BFN.
 
-References:
-https://github.com/hojonathanho/diffusion
-https://github.com/lucidrains/denoising-diffusion-pytorch
+This module implements a 1D U-Net backbone that operates on temporal sequences
+(Batch, Horizon, Dim). It supports FiLM-based conditioning for global 
+contexts (observations, class labels, etc.).
+
+Adapted from diffusion_policy structure to be standalone and backward compatible.
 """
 
-import torch as t
+import logging
+import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-from torch import einsum
-from einops import rearrange
+import einops
 from einops.layers.torch import Rearrange
-from typing import Any, Callable, Optional, Tuple, Union
-from functools import partial
-from packaging import version
-from collections import namedtuple
+from typing import Union, List, Optional, Tuple
 
-try:
-    from torchtyping import TensorType as Tensor
-except ImportError:  # pragma: no cover - optional dependency
+from networks.base import BFNetwork, SinusoidalPosEmb
+from utils.bfn_utils import default
 
-    class _TensorAlias:
-        def __class_getitem__(cls, key):
-            return t.Tensor
-
-    Tensor = _TensorAlias
-
-from bfn_utils import default, exists, cast_tuple, print_once
-from networks.base import (
-    BFNetwork,
-    RandomOrLearnedSinusoidalPosEmb,
-    SinusoidalPosEmb,
-)
+logger = logging.getLogger(__name__)
 
 __all__ = ["Unet"]
 
 
-class Residual(nn.Module):
-    def __init__(self, fn: Callable[[Tensor["D":...], Any], Tensor["D":...]]):
+# --- Components ---
+
+
+class Conv1dBlock(nn.Module):
+    """Conv1d --> GroupNorm --> Mish"""
+
+    def __init__(self, in_channels, out_channels, kernel_size, n_groups=8):
         super().__init__()
-        self.fn = fn
-
-    def forward(self, x: Tensor["D":...], *args, **kwargs) -> Tensor["D":...]:
-        return self.fn(x, *args, **kwargs) + x
-
-
-def upsample(dim: int, out_dim: Optional[int] = None) -> nn.Module:
-    return nn.Sequential(
-        nn.Upsample(scale_factor=2, mode="nearest"),
-        nn.Conv2d(dim, default(out_dim, dim), 3, padding=1),
-    )
-
-
-def downsample(dim: int, out_dim: Optional[int] = None) -> nn.Module:
-    return nn.Sequential(
-        Rearrange("b c (h p1) (w p2) -> b (c p1 p2) h w", p1=2, p2=2),
-        nn.Conv2d(dim * 4, default(out_dim, dim), 1),
-    )
-
-
-class Block(nn.Module):
-    def __init__(self, in_dim: int, out_dim: int, groups: int = 8):
-        super().__init__()
-        # assert (
-        #     out_dim % groups == 0
-        # ), f"groups ({groups}) does not divide out dim ({out_dim}) in Block"
-        groups = 1 if out_dim % groups != 0 else groups
-        self.proj = nn.Conv2d(in_dim, out_dim, kernel_size=3, padding=1)
-        self.norm = nn.GroupNorm(groups, out_dim)
-        self.act = nn.SiLU()
-
-    def forward(
-        self, x: t.Tensor, scale_shift: Optional[Tuple[float, float]] = None
-    ) -> t.Tensor:
-        x = self.proj(x)
-        x = self.norm(x)
-
-        if exists(scale_shift):
-            scale, shift = scale_shift
-            x = x * (scale + 1) + shift
-
-        x = self.act(x)
-        return x
-
-
-class ResnetBlock(nn.Module):
-    def __init__(
-        self,
-        in_dim: int,
-        out_dim: int,
-        *,
-        time_emb_dim: Optional[int] = None,
-        class_emb_dim: Optional[int] = None,
-        groups: int = 8,
-    ):
-        super().__init__()
-        mlp_dim = default(time_emb_dim, 0) + default(class_emb_dim, 0)
-        self.mlp = (
-            nn.Sequential(nn.SiLU(), nn.Linear(mlp_dim, out_dim * 2))
-            if exists(time_emb_dim) or exists(class_emb_dim)
-            else None
+        self.block = nn.Sequential(
+            nn.Conv1d(in_channels, out_channels, kernel_size, padding=kernel_size // 2),
+            nn.GroupNorm(n_groups, out_channels),
+            nn.Mish(),
         )
-        self.block1 = Block(in_dim, out_dim, groups=groups)
-        self.block2 = Block(out_dim, out_dim, groups=groups)
-        self.res_conv = (
-            nn.Conv2d(in_dim, out_dim, 1) if in_dim != out_dim else nn.Identity()
-        )
-
-    def forward(
-        self,
-        x: Tensor["B", "in_dim"],
-        time_emb: Optional[Tensor["B", "time_emb_dim"]] = None,
-        class_emb: Optional[Tensor["B", "class_emb_dim"]] = None,
-    ) -> Tensor["B", "out_dim"]:
-        scale_shift = None
-        if exists(self.mlp) and (exists(time_emb) or exists(class_emb)):
-            emb = tuple(filter(exists, (time_emb, class_emb)))
-            emb = self.mlp(t.cat(emb, -1))[..., None, None]
-            scale_shift = emb.chunk(2, dim=1)
-
-        h = self.block1(x, scale_shift=scale_shift)
-        h = self.block2(h)
-        return h + self.res_conv(x)
-
-
-class RMSNorm(nn.Module):
-    """RMSNorm, for image-shaped data"""
-
-    def __init__(self, dim: int):
-        super().__init__()
-        self.g = nn.Parameter(t.ones(1, dim, 1, 1))
 
     def forward(self, x):
-        return F.normalize(x, dim=1) * self.g * (x.shape[1] ** 0.5)
+        return self.block(x)
 
 
-AttentionConfig = namedtuple(
-    "AttentionConfig", ["enable_flash", "enable_math", "enable_mem_efficient"]
-)
-
-
-class Attend(nn.Module):
-    def __init__(self, dropout: float = 0.0, flash: bool = False):
+class Downsample1d(nn.Module):
+    def __init__(self, dim):
         super().__init__()
-        self.dropout = dropout
-        self.attn_dropout = nn.Dropout(dropout)
+        self.conv = nn.Conv1d(dim, dim, 3, 2, 1)
 
-        self.flash = flash
-        assert not (
-            flash and version.parse(t.__version__) < version.parse("2.0.0")
-        ), "Flash Attention requires torch>=2.0"
+    def forward(self, x):
+        return self.conv(x)
 
-        self.cpu_config = AttentionConfig(True, True, True)
-        self.cuda_config = None
 
-        if not t.cuda.is_available() or not flash:
-            return
+class Upsample1d(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.conv = nn.ConvTranspose1d(dim, dim, 4, 2, 1)
 
-        device_properties = t.cuda.get_device_properties(t.device("cuda"))
+    def forward(self, x):
+        return self.conv(x)
 
-        if device_properties.major == 8 and device_properties.minor == 0:
-            print_once("A100 detected; using flash attention if input is on CUDA")
-            self.cuda_config = AttentionConfig(True, False, False)
+
+class ConditionalResidualBlock1D(nn.Module):
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        cond_dim,
+        kernel_size=3,
+        n_groups=8,
+        cond_predict_scale=False,
+    ):
+        super().__init__()
+
+        self.blocks = nn.ModuleList(
+            [
+                Conv1dBlock(in_channels, out_channels, kernel_size, n_groups=n_groups),
+                Conv1dBlock(out_channels, out_channels, kernel_size, n_groups=n_groups),
+            ]
+        )
+
+        # FiLM modulation https://arxiv.org/abs/1709.07871
+        # predicts per-channel scale and bias
+        cond_channels = out_channels
+        if cond_predict_scale:
+            cond_channels = out_channels * 2
+        self.cond_predict_scale = cond_predict_scale
+        self.out_channels = out_channels
+
+        self.cond_encoder = nn.Sequential(
+            nn.Mish(),
+            nn.Linear(cond_dim, cond_channels),
+            Rearrange("batch t -> batch t 1"),
+        )
+
+        # make sure dimensions compatible
+        self.residual_conv = (
+            nn.Conv1d(in_channels, out_channels, 1)
+            if in_channels != out_channels
+            else nn.Identity()
+        )
+
+    def forward(self, x, cond):
+        """
+        x : [ batch_size x in_channels x horizon ]
+        cond : [ batch_size x cond_dim]
+
+        returns:
+        out : [ batch_size x out_channels x horizon ]
+        """
+        out = self.blocks[0](x)
+        embed = self.cond_encoder(cond)
+
+        if self.cond_predict_scale:
+            embed = embed.reshape(embed.shape[0], 2, self.out_channels, 1)
+            scale = embed[:, 0, ...]
+            bias = embed[:, 1, ...]
+            out = scale * out + bias
         else:
-            print_once(
-                "No A100 GPU detected; using math / mem efficient attention if input on CUDA"
-            )
-            self.cuda_config = AttentionConfig(False, True, True)
+            out = out + embed
 
-    def flash_attn(self, q: t.Tensor, k: t.Tensor, v: t.Tensor) -> t.Tensor:
-        q, k, v = map(lambda a: a.contiguous(), (q, k, v))
-
-        # Check if there is a compatible device for flash attention
-        config = self.cuda_config if q.is_cuda else self.cpu_config
-        with t.backends.cuda.sdp_kernel(**config._asdict()):
-            out = F.scaled_dot_product_attention(
-                q, k, v, dropout_p=self.dropout if self.training else 0.0
-            )
-        return out
-
-    def forward(self, q: t.Tensor, k: t.Tensor, v: t.Tensor) -> t.Tensor:
-        # Note on einsum notation:
-        # b = batch
-        # h = heads
-        # n, i, j = seq lengths (base, source, target)
-        # d = feature dimension
-
-        if self.flash:
-            return self.flash_attn(q, k, v)
-
-        scale = q.shape[-1] ** -0.5
-
-        # Similarity
-        sim = einsum("b h i d, b h j d -> b h i j", q, k) * scale
-
-        # Attention
-        attn = sim.softmax(dim=-1)
-        attn = self.attn_dropout(attn)
-
-        # Aggregate values
-        out = einsum("b h i j, b h j d -> b h i d", attn, v)
-
+        out = self.blocks[1](out)
+        out = out + self.residual_conv(x)
         return out
 
 
-class LinearAttention(nn.Module):
-    def __init__(self, dim: int, heads: int = 4, dim_head: int = 32):
-        super().__init__()
-        self.scale = dim_head**-0.5
-        self.heads = heads
-        hidden_dim = dim_head * heads
-
-        self.norm = RMSNorm(dim)
-        self.to_qkv = nn.Conv2d(dim, hidden_dim * 3, kernel_size=1, bias=False)
-
-        self.to_out = nn.Sequential(
-            nn.Conv2d(hidden_dim, dim, kernel_size=1), RMSNorm(dim)
-        )
-
-    def forward(self, x: t.Tensor) -> t.Tensor:
-        b, c, h, w = x.shape
-
-        x = self.norm(x)
-
-        qkv = self.to_qkv(x).chunk(3, dim=1)
-        q, k, v = map(
-            lambda t: rearrange(t, "b (h c) x y -> b h c (x y)", h=self.heads),
-            qkv,
-        )
-        q = q.softmax(dim=-2)
-        k = k.softmax(dim=-1)
-
-        q = q * self.scale
-
-        context = t.einsum("b h d n, b h e n -> b h d e", k, v)
-        out = t.einsum("b h d e, b h d n -> b h e n", context, q)
-        out = rearrange(out, "b h c (x y) -> b (h c) x y", h=self.heads, x=h, y=w)
-        return self.to_out(out)
-
-
-class Attention(nn.Module):
-    def __init__(self, dim: int, heads: int = 4, dim_head=32, flash: bool = False):
-        super().__init__()
-        self.heads = heads
-        hidden_dim = dim_head * heads
-
-        self.norm = RMSNorm(dim)
-        self.attend = Attend(flash=flash)
-        self.to_qkv = nn.Conv2d(dim, hidden_dim * 3, 1, bias=False)
-        self.to_out = nn.Conv2d(hidden_dim, dim, 1)
-
-    def forward(self, x: t.Tensor) -> t.Tensor:
-        b, c, h, w = x.shape
-
-        x = self.norm(x)
-
-        qkv = self.to_qkv(x).chunk(3, dim=1)
-        q, k, v = map(
-            lambda a: rearrange(a, "b (h c) x y -> b h (x y) c", h=self.heads),
-            qkv,
-        )
-
-        out = self.attend(q, k, v)
-
-        out = rearrange(out, "b h (x y) d -> b (h d) x y", x=h, y=w)
-        return self.to_out(out)
+# --- Main Model ---
 
 
 class Unet(BFNetwork):
+    """Conditional 1D U-Net compatible with BFN/Diffusion Policy."""
+
     def __init__(
         self,
-        dim: int,
-        dim_mults: list[int] = [1, 2, 2],
-        channels: int = 3,
-        init_dim: Optional[int] = None,
-        out_dim: Optional[int] = None,
-        num_classes: Optional[int] = None,
-        cond_drop_prob: float = 0.5,
-        resnet_block_groups: int = 8,
-        learned_sinusoidal_cond: bool = False,
-        learned_sinusoidal_dim: int = 16,
-        random_fourier_features: bool = False,
-        full_attn: Union[Tuple[bool, ...], bool] = (False, False, True),
-        attn_heads: Union[Tuple[int, ...], int] = 4,
-        attn_dim_head: Union[Tuple[int, ...], int] = 32,
-        flash_attn: bool = False,
+        input_dim: Optional[int] = None,  # New name
+        channels: Optional[int] = None,  # Legacy name for input_dim
+        dim: Optional[int] = None,  # Legacy name for base hidden dim
+        cond_dim: Optional[int] = 0,  # Changed hint to Optional
+        local_cond_dim: Optional[int] = None,
+        global_cond_dim: Optional[int] = None,
+        # Architecture args
+        diffusion_step_embed_dim: int = 256,
+        down_dims: Optional[List[int]] = None,
+        dim_mults: Optional[List[int]] = None,  # Legacy for calculating down_dims
+        kernel_size: int = 5,
+        n_groups: int = 8,
+        cond_predict_scale: bool = False,
+        # Catch-all for other legacy args (e.g. flash_attn) to prevent crashes
+        **kwargs,
     ):
-        super().__init__(exists(num_classes))
+        super().__init__(is_conditional_model=True)
 
-        # Set up dimensions
-        self.channels = channels
-        self.init_dim = default(init_dim, dim)
-        self.out_dim = default(out_dim, channels)
-        self.init_conv = nn.Conv2d(channels, self.init_dim, 7, padding=3)
-
-        dims = [self.init_dim, *map(lambda m: dim * m, dim_mults)]
-        in_out = list(zip(dims[:-1], dims[1:]))
-
-        # time embeddings
-        time_dim = dim * 4
-
-        self.random_or_learned_sinusoidal_cond = (
-            learned_sinusoidal_cond or random_fourier_features
-        )
-        if self.random_or_learned_sinusoidal_cond:
-            sinu_pos_emb = RandomOrLearnedSinusoidalPosEmb(
-                learned_sinusoidal_dim, random_fourier_features
+        # --- Compatibility Logic ---
+        # 1. Resolve Input Dimension
+        self.input_dim = input_dim or channels
+        if self.input_dim is None:
+            raise ValueError(
+                "Unet requires `input_dim` (or `channels` in legacy configs)."
             )
-            fourier_dim = learned_sinusoidal_dim + 1
-        else:
-            sinu_pos_emb = SinusoidalPosEmb(dim)
-            fourier_dim = dim
 
-        self.time_mlp = nn.Sequential(
-            sinu_pos_emb,
-            nn.Linear(fourier_dim, time_dim),
-            nn.GELU(),
-            nn.Linear(time_dim, time_dim),
+        # --- FIX: Alias input_dim to 'dim' and 'action_dim' for BFN validation ---
+        self.dim = self.input_dim
+        self.action_dim = self.input_dim
+
+        # 2. Resolve Hidden Dimensions
+        # If down_dims is not provided, try to construct it from dim + dim_mults
+        if down_dims is None:
+            if dim is not None:
+                mults = dim_mults or [1, 2, 4]
+                down_dims = [dim * m for m in mults]
+            else:
+                # Default fallback
+                down_dims = [256, 512, 1024]
+
+        # --- Safely handle None types from Hydra config ---
+        if cond_dim is None:
+            cond_dim = 0
+
+        # 3. Resolve Conditioning Dimension
+        if global_cond_dim is None and cond_dim > 0:
+            global_cond_dim = cond_dim
+
+        # Expose BFN-specific attributes
+        self.cond_dim = global_cond_dim if global_cond_dim is not None else 0
+        self.cond_is_discrete = False  # Explicitly mark as continuous
+
+        # ---------------------------
+
+        all_dims = [self.input_dim] + list(down_dims)
+        start_dim = down_dims[0]
+
+        dsed = diffusion_step_embed_dim
+        self.diffusion_step_encoder = nn.Sequential(
+            SinusoidalPosEmb(dsed),
+            nn.Linear(dsed, dsed * 4),
+            nn.Mish(),
+            nn.Linear(dsed * 4, dsed),
         )
 
-        # Class embeddings
-        if self.is_conditional_model:
-            self.cond_dim = num_classes
-            self.cond_drop_prob = cond_drop_prob
-            self.class_emb = nn.Embedding(self.cond_dim, dim)
-            self.null_classes_emb = nn.Parameter(t.randn(dim))
+        # Total conditioning dimension for FiLM layers
+        # Time embedding + Global Conditioning
+        fiLm_cond_dim = dsed
+        if self.cond_dim > 0:
+            fiLm_cond_dim += self.cond_dim
 
-            classes_dim = dim * 4
+        in_out = list(zip(all_dims[:-1], all_dims[1:]))
 
-            self.classes_mlp = nn.Sequential(
-                nn.Linear(dim, classes_dim),
-                nn.GELU(),
-                nn.Linear(classes_dim, classes_dim),
+        # Local Conditioning (e.g. sequence of observations)
+        self.local_cond_encoder = None
+        if local_cond_dim is not None:
+            _, dim_out = in_out[0]
+            dim_in = local_cond_dim
+            self.local_cond_encoder = nn.ModuleList(
+                [
+                    # down encoder
+                    ConditionalResidualBlock1D(
+                        dim_in,
+                        dim_out,
+                        cond_dim=fiLm_cond_dim,
+                        kernel_size=kernel_size,
+                        n_groups=n_groups,
+                        cond_predict_scale=cond_predict_scale,
+                    ),
+                    # up encoder
+                    ConditionalResidualBlock1D(
+                        dim_in,
+                        dim_out,
+                        cond_dim=fiLm_cond_dim,
+                        kernel_size=kernel_size,
+                        n_groups=n_groups,
+                        cond_predict_scale=cond_predict_scale,
+                    ),
+                ]
             )
-        else:
-            classes_dim = None
-            self.class_emb = None
-            self.cond_drop_prob = 1.0
 
-        # Attention
-        num_stages = len(dim_mults)
-        full_attn = cast_tuple(full_attn, num_stages)
-        attn_heads = cast_tuple(attn_heads, num_stages)
-        attn_dim_head = cast_tuple(attn_dim_head, num_stages)
-
-        assert len(full_attn) == len(dim_mults)
-
-        FullAttention = partial(Attention, flash=flash_attn)
-
-        # Layers
-        self.downs = nn.ModuleList([])
-        self.ups = nn.ModuleList([])
-        num_resolutions = len(in_out)
-
-        block_class = partial(
-            ResnetBlock,
-            groups=resnet_block_groups,
-            time_emb_dim=time_dim,
-            class_emb_dim=classes_dim,
+        # Mid Blocks
+        mid_dim = all_dims[-1]
+        self.mid_modules = nn.ModuleList(
+            [
+                ConditionalResidualBlock1D(
+                    mid_dim,
+                    mid_dim,
+                    cond_dim=fiLm_cond_dim,
+                    kernel_size=kernel_size,
+                    n_groups=n_groups,
+                    cond_predict_scale=cond_predict_scale,
+                ),
+                ConditionalResidualBlock1D(
+                    mid_dim,
+                    mid_dim,
+                    cond_dim=fiLm_cond_dim,
+                    kernel_size=kernel_size,
+                    n_groups=n_groups,
+                    cond_predict_scale=cond_predict_scale,
+                ),
+            ]
         )
 
-        for i, (
-            (in_dim, out_dim),
-            full_attn_i,
-            attn_heads_i,
-            attn_dim_head_i,
-        ) in enumerate(zip(in_out, full_attn, attn_heads, attn_dim_head)):
-            is_last = i >= (num_resolutions - 1)
-
-            attn_class = FullAttention if full_attn_i else LinearAttention
-
-            self.downs.append(
+        # Down Blocks
+        self.down_modules = nn.ModuleList([])
+        for ind, (dim_in, dim_out) in enumerate(in_out):
+            is_last = ind >= (len(in_out) - 1)
+            self.down_modules.append(
                 nn.ModuleList(
                     [
-                        block_class(in_dim, in_dim),
-                        block_class(in_dim, in_dim),
-                        attn_class(
-                            in_dim,
-                            dim_head=attn_dim_head_i,
-                            heads=attn_heads_i,
+                        ConditionalResidualBlock1D(
+                            dim_in,
+                            dim_out,
+                            cond_dim=fiLm_cond_dim,
+                            kernel_size=kernel_size,
+                            n_groups=n_groups,
+                            cond_predict_scale=cond_predict_scale,
                         ),
-                        downsample(in_dim, out_dim)
-                        if not is_last
-                        else nn.Conv2d(in_dim, out_dim, 3, padding=1),
+                        ConditionalResidualBlock1D(
+                            dim_out,
+                            dim_out,
+                            cond_dim=fiLm_cond_dim,
+                            kernel_size=kernel_size,
+                            n_groups=n_groups,
+                            cond_predict_scale=cond_predict_scale,
+                        ),
+                        Downsample1d(dim_out) if not is_last else nn.Identity(),
                     ]
                 )
             )
 
-        mid_dim = dims[-1]
-        self.mid_block1 = block_class(mid_dim, mid_dim)
-        self.mid_attn = FullAttention(
-            mid_dim, heads=attn_heads[-1], dim_head=attn_dim_head[-1]
-        )
-        self.mid_block2 = block_class(mid_dim, mid_dim)
-
-        for i, (
-            (in_dim, out_dim),
-            full_attn_i,
-            attn_heads_i,
-            attn_dim_head_i,
-        ) in enumerate(
-            zip(*(map(reversed, (in_out, full_attn, attn_heads, attn_dim_head))))
-        ):
-            is_last = i == (len(in_out) - 1)
-            attn_class = FullAttention if full_attn_i else LinearAttention
-            self.ups.append(
+        # Up Blocks
+        self.up_modules = nn.ModuleList([])
+        for ind, (dim_in, dim_out) in enumerate(reversed(in_out[1:])):
+            is_last = ind >= (len(in_out) - 1)
+            self.up_modules.append(
                 nn.ModuleList(
                     [
-                        block_class(out_dim + in_dim, out_dim),
-                        block_class(out_dim + in_dim, out_dim),
-                        attn_class(
-                            out_dim,
-                            dim_head=attn_dim_head_i,
-                            heads=attn_heads_i,
+                        ConditionalResidualBlock1D(
+                            dim_out * 2,
+                            dim_in,
+                            cond_dim=fiLm_cond_dim,
+                            kernel_size=kernel_size,
+                            n_groups=n_groups,
+                            cond_predict_scale=cond_predict_scale,
                         ),
-                        upsample(out_dim, in_dim)
-                        if not is_last
-                        else nn.Conv2d(out_dim, in_dim, 3, padding=1),
+                        ConditionalResidualBlock1D(
+                            dim_in,
+                            dim_in,
+                            cond_dim=fiLm_cond_dim,
+                            kernel_size=kernel_size,
+                            n_groups=n_groups,
+                            cond_predict_scale=cond_predict_scale,
+                        ),
+                        Upsample1d(dim_in) if not is_last else nn.Identity(),
                     ]
                 )
             )
 
-        self.final_res_block = block_class(dim * 2, dim)
-        self.final_conv = nn.Conv2d(dim, self.out_dim, 1)
+        self.final_conv = nn.Sequential(
+            Conv1dBlock(start_dim, start_dim, kernel_size=kernel_size),
+            nn.Conv1d(start_dim, self.input_dim, 1),
+        )
 
-    @property
-    def downsample_factor(self) -> int:
-        return 2 ** (len(self.downs) - 1)
+        logger.info(
+            f"Initialized Unet with input_dim={self.input_dim}, down_dims={down_dims}"
+        )
 
     def forward(
         self,
-        x: Tensor["B", "D"],
-        time: Tensor["B"],
-        classes: Optional[Tensor["B", 1]] = None,
-        cond_drop_prob: Optional[float] = None,
-    ) -> Tensor["B", "D"]:
-        batch, device = x.shape[0], x.device
+        x: torch.Tensor,
+        time: torch.Tensor,
+        cond: Optional[torch.Tensor] = None,
+        local_cond: Optional[torch.Tensor] = None,
+        **kwargs,
+    ):
+        """
+        Args:
+            x: Input sample (B, T, input_dim) or (B, input_dim)
+            time: Diffusion/Flow step (B,) or int
+            cond: Global conditioning (B, global_cond_dim)
+            local_cond: Local conditioning sequence (B, T, local_cond_dim)
+        """
+        # 1. Shape Normalization
+        # Check if input is 2D (B, D) which implies Horizon=1
+        is_flat_input = x.ndim == 2
+        if is_flat_input:
+            x = x.unsqueeze(1)
 
-        # Handle conditoning information
+        # Rearrange for 1D Conv: (B, T, D) -> (B, D, T)
+        x = einops.rearrange(x, "b t d -> b d t")
 
-        if self.is_conditional_model:
-            if not exists(classes):
-                classes = t.randint(0, self.cond_dim, (batch,), device=device)
-                cond_drop_prob = 1.0
+        # Capture original T for final resizing
+        original_t = x.shape[-1]
 
-            # Recover from class of shape [B, 1] instead of [B]
-            if classes.ndim > 1:
-                if classes.ndim == 2 and classes.size(-1) == 1:
-                    classes = classes.squeeze(-1)
-                else:
-                    raise ValueError(
-                        f"Class shape should be ({batch},), not {classes.shape}"
-                    )
-
-            cond_drop_prob = default(cond_drop_prob, self.cond_drop_prob)
-            classes_emb = self.class_emb(classes)
-
-            if cond_drop_prob > 0.0:
-                keep_mask = t.rand((batch,), device=device) < (1 - cond_drop_prob)
-                null_classes_emb = self.null_classes_emb.expand(batch, -1)
-                classes_emb = t.where(keep_mask[:, None], classes_emb, null_classes_emb)
-
-            c = self.classes_mlp(classes_emb)
+        # 2. Time Embedding
+        if not torch.is_tensor(time):
+            time = torch.tensor([time], dtype=torch.long, device=x.device)
         else:
-            c = None
+            # FIX: Ensure time is on the same device as input
+            time = time.to(x.device)
 
-        # main unet
+        if time.ndim == 0:
+            time = time.unsqueeze(0)
+        if time.shape[0] != x.shape[0]:
+            time = time.expand(x.shape[0])
 
-        assert all(
-            [d % self.downsample_factor == 0 for d in x.shape[-2:]]
-        ), f"input dim {x.shape[-2:]} must be divisible by {self.downsample_factor} for Unet"
+        global_feature = self.diffusion_step_encoder(time)
 
-        x = self.init_conv(x)
-        r = x.clone()
+        # 3. Global Conditioning (e.g. Observations)
+        if cond is not None:
+            # Ensure cond is on same device
+            cond = cond.to(x.device)
+            global_feature = torch.cat([global_feature, cond], dim=-1)
 
-        if time.shape == (1,):
-            time = time.expand(batch)
-        time = self.time_mlp(time)
+        # 4. Local Conditioning Encoder
+        h_local = list()
+        if local_cond is not None and self.local_cond_encoder is not None:
+            # Ensure local_cond is on same device
+            local_cond = local_cond.to(x.device)
+            # (B, T, D) -> (B, D, T)
+            local_cond = einops.rearrange(local_cond, "b t d -> b d t")
+            resnet, resnet2 = self.local_cond_encoder
+            lc = resnet(local_cond, global_feature)
+            h_local.append(lc)
+            lc = resnet2(local_cond, global_feature)
+            h_local.append(lc)
 
+        # 5. U-Net Backbone
         h = []
 
-        for block1, block2, attn, downsample in self.downs:
-            x = block1(x, time, c)
-            h.append(x)
+        # Down
+        for idx, (resnet, resnet2, downsample) in enumerate(self.down_modules):
+            x = resnet(x, global_feature)
 
-            x = block2(x, time, c)
-            x = attn(x) + x
-            h.append(x)
+            # Inject local cond at start
+            if idx == 0 and len(h_local) > 0:
+                x = x + h_local[0]
 
+            x = resnet2(x, global_feature)
+            h.append(x)
             x = downsample(x)
 
-        x = self.mid_block1(x, time, c)
-        x = self.mid_attn(x) + x
-        x = self.mid_block2(x, time, c)
+        # Mid
+        for mid_module in self.mid_modules:
+            x = mid_module(x, global_feature)
 
-        for block1, block2, attn, upsample in self.ups:
-            x = t.cat((x, h.pop()), 1)
-            x = block1(x, time, c)
+        # Up
+        for idx, (resnet, resnet2, upsample) in enumerate(self.up_modules):
+            # Shape Mismatch Handling
+            skip = h.pop()
+            if x.shape[-1] != skip.shape[-1]:
+                x = F.interpolate(x, size=skip.shape[-1], mode="nearest")
 
-            x = t.cat((x, h.pop()), 1)
-            x = block2(x, time, c)
-            x = attn(x) + x
+            x = torch.cat((x, skip), dim=1)
 
+            x = resnet(x, global_feature)
+            x = resnet2(x, global_feature)
             x = upsample(x)
 
-        x = t.cat((x, r), dim=1)
-        x = self.final_res_block(x, time, c)
-        return self.final_conv(x)
+        # Final
+        x = self.final_conv(x)
+
+        # Final Resize to Original Horizon
+        if x.shape[-1] != original_t:
+            x = F.interpolate(x, size=original_t, mode="nearest")
+
+        # (B, D, T) -> (B, T, D)
+        x = einops.rearrange(x, "b d t -> b t d")
+
+        # --- FIX: Restore flat shape if input was flat ---
+        if is_flat_input:
+            x = x.squeeze(1)
+
+        return x

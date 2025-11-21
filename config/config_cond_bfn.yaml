@@ -1,0 +1,76 @@
+defaults:
+  - _self_
+
+action_dim: 2
+obs_dim: 2
+chunk_size: 16 
+
+task:
+  _target_: tasks.policy_training.PolicyTraining
+  _recursive_: false
+  
+  optimizer:
+    _target_: torch.optim.AdamW
+    lr: 1.0e-4
+    weight_decay: 1.0e-4
+  
+  lr_scheduler:
+    _target_: torch.optim.lr_scheduler.CosineAnnealingLR
+    T_max: 200
+    eta_min: 1.0e-6
+    interval: epoch
+    frequency: 1
+  
+  policy:
+    _target_: policies.conditional_bfn_policy.ConditionalBFNPolicy
+    
+    action_space:
+      _target_: gymnasium.spaces.Box
+      low: -1.0
+      high: 1.0
+      shape: 
+        - ${action_dim}
+      dtype: float32
+      
+    action_dim: ${action_dim}
+    obs_dim: ${obs_dim}
+    
+    # Chunking
+    n_action_steps: ${chunk_size}
+    
+    # Configure Internal Backbone (Integrated ResNet/MLP)
+    backbone_config:
+      _target_: policies.conditional_bfn_policy.BackboneConfig
+      hidden_dim: 512
+      depth: 4
+      time_emb_dim: 128
+      dropout: 0.0
+      
+    # Configure BFN Sampling
+    bfn_config:
+      _target_: policies.conditional_bfn_policy.BFNConfig
+      sigma_1: 0.005
+      n_timesteps: 20
+      cond_scale: null
+      deterministic_seed: 42
+    
+    device: cpu # Set to 'cuda' or 'mps' if available
+
+# DataModule
+datamodule:
+  _target_: tasks.point_maze_datamodule.PointMazeDataModule
+  n_episodes: 1000
+  chunk_size: ${chunk_size}
+  batch_size: 512
+  max_steps: 200
+  seed: 42
+  num_workers: 0
+
+trainer:
+  _target_: lightning.pytorch.Trainer
+  accelerator: auto
+  devices: 1
+  max_epochs: 200
+  gradient_clip_val: 1.0
+  log_every_n_steps: 10
+  enable_checkpointing: true
