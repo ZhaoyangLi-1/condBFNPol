@@ -25,6 +25,7 @@ from environments.pusht import PushTEnv
 from policies.guided_bfn_policy import GuidedBFNPolicy, GuidanceConfig, HorizonConfig
 from networks.unet import Unet
 from networks.multi_image_obs_encoder import MultiImageObsEncoder
+
 from diffusion_policy.model.common.normalizer import LinearNormalizer
 from diffusion_policy.dataset.pusht_image_dataset import PushTImageDataset
 
@@ -183,7 +184,7 @@ def main():
         print(f"Epoch {epoch+1} | Loss: {avg:.4f}")
 
         # Eval every 10 epochs
-        if (epoch + 1) % 5 == 0:
+        if (epoch + 1) % 1 == 0:
             evaluate_pusht(policy, epoch + 1)
 
             # Save Checkpoint
@@ -219,6 +220,10 @@ def evaluate_pusht(policy, epoch):
 
     with torch.no_grad():
         while not done and len(images) < 300:
+            if not isinstance(obs, dict) or "image" not in obs:
+                print(f"Skipping eval (unexpected observation format): {type(obs)}")
+                return
+
             # Prepare Image Obs
             # env.reset returns {'image': [1, C, H, W], 'agent_pos': ...} (tensors from our wrapper)
             # or numpy dict depending on wrapper version.
