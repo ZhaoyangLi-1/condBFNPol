@@ -1,11 +1,9 @@
-"""Standalone training script for GuidedBFNPolicy on PointMaze (Robust).
+"""Standalone training script for GuidedBFNPolicy on PointMaze (Stabilized).
 
-This script implements a high-capacity training loop for Flow Matching.
-It includes explicit normalization checks and improved hyperparameters
-to prevent mode collapse.
-
-Usage:
-    python scripts/train_guided_bfn.py
+Changes:
+1. Saves 'best' checkpoint based on eval success.
+2. Increases data diversity (random starts).
+3. Tuned hyperparameters for stability.
 """
 
 import argparse
@@ -58,11 +56,11 @@ def create_chunked_dataset(obs_list, act_list, chunk_size=8):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--epochs", type=int, default=300)  # Increased epochs
-    parser.add_argument("--batch_size", type=int, default=1024)  # Larger batch size
+    parser.add_argument("--epochs", type=int, default=200)
+    parser.add_argument("--batch_size", type=int, default=512)
     parser.add_argument("--chunk", type=int, default=16)
-    parser.add_argument("--width", type=int, default=512)  # Increased width
-    parser.add_argument("--depth", type=int, default=6)  # Increased depth
+    parser.add_argument("--width", type=int, default=512)
+    parser.add_argument("--depth", type=int, default=4)
     parser.add_argument("--steps", type=int, default=20)
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
@@ -76,23 +74,27 @@ def main():
     print(f"--- Training Guided BFN (Flow Matching) on {DEVICE} ---")
 
     # --- 1. Data Collection ---
-    # Increase step size slightly to make trajectories cleaner
+    # Use a separate env for data collection to allow randomization
     env = PointMazeEnv(max_steps=300, step_size=0.2, render_mode="rgb_array")
 
-    print("Collecting Expert Data...")
+    print("Collecting Expert Data (Randomized Starts)...")
     all_ep_obs, all_ep_acts = [], []
 
-    # Collect 2000 episodes for dense coverage
+    # Collect 2000 episodes with randomized seeds for diversity
+    rng = np.random.default_rng(args.seed)
     for _ in tqdm(range(2000), desc="Collecting"):
-        obs, _ = env.reset()
+        ep_seed = int(rng.integers(0, 100000))
+        obs, _ = env.reset(seed=ep_seed)  # Random start
         done = False
         ep_obs, ep_acts = [], []
+
         while not done:
             action = env.get_expert_action()
             ep_obs.append(obs)
             ep_acts.append(action)
             obs, _, term, trunc, _ = env.step(action)
             done = term or trunc
+
         if len(ep_obs) > 0:
             all_ep_obs.append(np.stack(ep_obs))
             all_ep_acts.append(np.stack(ep_acts))
@@ -107,32 +109,22 @@ def main():
         normalizer_type="linear",
         obs_encoder_type="identity",
         horizons=HorizonConfig(obs_history=1, prediction=args.chunk, execution=8),
-        guidance=GuidanceConfig(steps=args.steps, cfg_scale=1.0, grad_scale=0.0),
+        guidance=GuidanceConfig(steps=args.steps),
         backbone_config=BackboneConfig(
             hidden_dim=args.width,
             depth=args.depth,
             time_emb_dim=128,
             conditioning_type="film",
-            dropout=0.0,
+            dropout=0.1,  # Add dropout for regularization
         ),
         device=DEVICE,
     ).to(DEVICE)
 
-    # --- 3. Fit Normalizer & Verify ---
+    # --- 3. Fit Normalizer ---
     print("Fitting Normalizer...")
     policy.normalizer.fit({"obs": obs_data, "action": act_data})
-    # Normalizer parameters are created on CPU during fit; align with policy device.
-    policy._ensure_normalizer_device()
-
-    # Verify normalization quality
-    norm_acts = policy.normalizer["action"].normalize(act_data)
-    print(f"Action Stats: Mean={act_data.mean():.3f}, Std={act_data.std():.3f}")
-    print(f"Norm Stats:   Mean={norm_acts.mean():.3f}, Std={norm_acts.std():.3f}")
-    if norm_acts.abs().max() > 1.1:
-        print("[WARNING] Normalization bounds exceed [-1, 1]. Check data distribution.")
 
     train_ds = TensorDataset(obs_data, act_data)
-    # Use multiple workers and pinned memory for speed
     train_loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,
@@ -141,15 +133,14 @@ def main():
         pin_memory=True,
     )
 
-    # Use 3e-4 LR, which is standard for Flow Matching
-    optimizer = torch.optim.AdamW(policy.parameters(), lr=3e-4, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=args.epochs, eta_min=1e-6
-    )
+    # Lower LR and higher weight decay for stability
+    optimizer = torch.optim.AdamW(policy.parameters(), lr=1e-4, weight_decay=1e-3)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
 
     # --- 4. Training Loop ---
     loss_history = []
     os.makedirs("results/guided", exist_ok=True)
+    best_success_rate = -1.0
 
     for epoch in range(args.epochs):
         policy.train()
@@ -164,7 +155,6 @@ def main():
 
             optimizer.zero_grad()
             loss.backward()
-            # Gradient Clipping is crucial for Flow Matching stability
             torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
             optimizer.step()
 
@@ -176,11 +166,25 @@ def main():
         loss_history.append(avg)
         print(f"Epoch {epoch+1} | Loss: {avg:.4f}")
 
-        # Eval every 20 epochs
-        if (epoch + 1) % 5 == 0:
-            evaluate(policy, env, epoch + 1, args)
+        # Eval every 10 epochs
+        if (epoch + 1) % 10 == 0:
+            success_rate = evaluate(policy, env, epoch + 1, args)
 
-    # Save Final Artifacts
+            # Save Best Checkpoint
+            if success_rate >= best_success_rate:
+                best_success_rate = success_rate
+                torch.save(
+                    {"state_dict": policy.state_dict(), "config": args},
+                    f"results/guided/ckpt_best.pt",
+                )
+                print(f"New Best Model Saved! (Success Rate: {success_rate:.2f})")
+
+    # Save Final
+    torch.save(
+        {"state_dict": policy.state_dict(), "config": args},
+        f"results/guided/ckpt_final.pt",
+    )
+
     plt.figure()
     plt.plot(loss_history)
     plt.title("Guided BFN Loss")
@@ -188,30 +192,21 @@ def main():
     plt.savefig("results/guided/loss_history.png")
     plt.close()
 
-    torch.save(
-        {"state_dict": policy.state_dict(), "config": args},
-        f"results/guided/ckpt_final.pt",
-    )
-    print(f"Training complete. Results in results/guided/")
-
 
 def evaluate(policy, env, epoch, args):
     policy.eval()
-    # Check multiple seeds to ensure robustness
-    seeds = [100, 200, 300]
+    seeds = [100, 200, 300, 400, 500]  # 5 evaluation episodes
+    successes = 0
 
     for seed in seeds:
         obs, _ = env.reset(seed=seed)
         traj = [env.pos.copy()]
         done = False
         steps = 0
-        success = False
 
         with torch.no_grad():
             while not done and steps < 300:
                 obs_t = torch.from_numpy(obs).float().unsqueeze(0).to(policy.device)
-
-                # Forward -> Plan (ODE) -> Unnormalize
                 action_chunk = policy(obs_t, deterministic=True)
                 action = action_chunk[0, 0].cpu().numpy()
 
@@ -220,24 +215,23 @@ def evaluate(policy, env, epoch, args):
                 done = term or trunc
                 steps += 1
                 if term:
-                    success = True
+                    successes += 1
 
-        # Plot one representative trajectory
+        # Plot the first seed only
         if seed == seeds[0]:
             traj = np.array(traj)
             plt.figure()
             img = env.render()
             if img is not None:
                 plt.imshow(img)
-            plt.plot(
-                traj[:, 1] * 10, traj[:, 0] * 10, "c-", linewidth=2, label="Guided Flow"
-            )
-            plt.scatter(traj[0, 1] * 10, traj[0, 0] * 10, c="g", marker="o")
-            plt.scatter(traj[-1, 1] * 10, traj[-1, 0] * 10, c="r", marker="x")
-            plt.legend()
-            plt.title(f"Eval Epoch {epoch} - {'Success' if success else 'Fail'}")
+            plt.plot(traj[:, 1] * 10, traj[:, 0] * 10, "c-", linewidth=2)
+            plt.title(f"Eval Epoch {epoch}")
             plt.savefig(f"results/guided/eval_ep{epoch}.png")
             plt.close()
+
+    rate = successes / len(seeds)
+    print(f"Eval Success Rate: {rate:.2f}")
+    return rate
 
 
 if __name__ == "__main__":
