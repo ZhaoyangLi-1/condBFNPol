@@ -274,6 +274,10 @@ class DiffusionPolicy(BasePolicy):
         # Ensure tensor
         if isinstance(input_obs["obs"], torch.Tensor):
             input_obs["obs"] = input_obs["obs"].to(self.device, self.dtype)
+        else:
+            input_obs["obs"] = torch.as_tensor(
+                input_obs["obs"], device=self.device, dtype=self.dtype
+            )
 
         result = self.predict_action(input_obs)
         action = result["action"]
@@ -292,8 +296,16 @@ class DiffusionPolicy(BasePolicy):
         else:
             nbatch = batch
 
+        # Move to policy device/dtype after normalization
+        def _to_dev(x: torch.Tensor) -> torch.Tensor:
+            return x.to(device=self.device, dtype=self.dtype)
+
         obs = nbatch["obs"]
         action = nbatch["action"]
+        if isinstance(obs, torch.Tensor):
+            obs = _to_dev(obs)
+        if isinstance(action, torch.Tensor):
+            action = _to_dev(action)
 
         # Fix Obs shape [B, D] -> [B, 1, D]
         if obs.ndim == 2:

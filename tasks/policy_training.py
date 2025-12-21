@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import logging
 import traceback  # Added
 from typing import Any, Dict, Optional, Tuple, Union
@@ -11,6 +12,8 @@ import torch
 import torchmetrics as tm
 from hydra.utils import instantiate
 from omegaconf import DictConfig, OmegaConf
+
+from utils.ema import EMAModel
 
 log = logging.getLogger(__name__)
 
@@ -29,6 +32,7 @@ class PolicyTraining(pl.LightningModule):
         lr_scheduler: DictConfig | None = None,
         compile: bool = False,
         datamodule: Any | None = None,
+        ema: DictConfig | None = None,
         **kwargs: Any,
     ):
         super().__init__()
@@ -37,6 +41,7 @@ class PolicyTraining(pl.LightningModule):
         self.policy = instantiate(policy)
         self.optimizer_cfg = optimizer
         self.lr_scheduler_cfg = lr_scheduler
+        self.ema_cfg = ema
 
         # Metrics
         self.train_loss_metric = tm.MeanMetric()
@@ -45,6 +50,13 @@ class PolicyTraining(pl.LightningModule):
 
         if compile:
             self.policy = torch.compile(self.policy)
+
+        # Optional EMA model
+        self.ema_model: EMAModel | None = None
+        self._ema_backup_state: Dict[str, torch.Tensor] | None = None
+        if self.ema_cfg is not None:
+            ema_cfg_dict = OmegaConf.to_container(self.ema_cfg, resolve=True)
+            self.ema_model = EMAModel(self.policy, **ema_cfg_dict)
 
     def setup(self, stage: str) -> None:
         """Called at the beginning of fit (after init, before train).
@@ -222,3 +234,67 @@ class PolicyTraining(pl.LightningModule):
 
     def configure_callbacks(self):
         return []
+
+    # ---------------- EMA Utilities ---------------- #
+    def _maybe_update_ema(self):
+        if self.ema_model is not None:
+            self.ema_model.step(self.policy)
+
+    def _swap_in_ema_weights(self):
+        if self.ema_model is None:
+            return
+        self._ema_backup_state = copy.deepcopy(self.policy.state_dict())
+        self.policy.load_state_dict(
+            self.ema_model.averaged_model.state_dict(), strict=False
+        )
+
+    def _restore_policy_weights(self):
+        if self.ema_model is None or self._ema_backup_state is None:
+            return
+        self.policy.load_state_dict(self._ema_backup_state, strict=False)
+        self._ema_backup_state = None
+
+    def on_validation_epoch_start(self):
+        self._swap_in_ema_weights()
+
+    def on_validation_epoch_end(self):
+        self._restore_policy_weights()
+
+    def on_test_epoch_start(self):
+        self._swap_in_ema_weights()
+
+    def on_test_epoch_end(self):
+        self._restore_policy_weights()
+
+    def optimizer_step(
+        self,
+        epoch,
+        batch_idx,
+        optimizer,
+        optimizer_closure,
+        on_tpu: bool = False,
+        using_native_amp: bool = False,
+        using_lbfgs: bool = False,
+    ):
+        super().optimizer_step(
+            epoch,
+            batch_idx,
+            optimizer,
+            optimizer_closure,
+            on_tpu=on_tpu,
+            using_native_amp=using_native_amp,
+            using_lbfgs=using_lbfgs,
+        )
+        self._maybe_update_ema()
+
+    def on_save_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
+        if self.ema_model is not None:
+            checkpoint["ema_state"] = self.ema_model.state_dict()
+
+    def on_load_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
+        ema_state = checkpoint.get("ema_state")
+        if ema_state is not None:
+            if self.ema_model is None:
+                # Recreate with defaults if config is absent
+                self.ema_model = EMAModel(self.policy)
+            self.ema_model.load_state_dict(ema_state)

@@ -48,6 +48,7 @@ def main():
     BATCH_SIZE = 64
     EPOCHS = 100
     LR = 1e-4
+    # Match diffusion config path (pusht_image)
     ZARR_PATH = "data/pusht_cchi_v7_replay.zarr"
 
     print(f"--- Training Guided BFN (PushT) on {DEVICE} ---")
@@ -125,7 +126,8 @@ def main():
         input_dim=2 * CHUNK_SIZE,
         global_cond_dim=obs_dim,
         diffusion_step_embed_dim=128,
-        down_dims=[256, 512, 1024],
+        # Match diffusion config: larger capacity
+        down_dims=[512, 1024, 2048],
         kernel_size=5,
         n_groups=8,
     )

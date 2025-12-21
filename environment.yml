@@ -1,0 +1,9 @@
+name: bfn-pol
+channels:
+  - defaults
+dependencies:
+  - python=3.11
+  - cmake
+  - lightning
+  - conda-forge::numba
+prefix: /Users/aleynakara/miniconda3/envs/bfn-pol

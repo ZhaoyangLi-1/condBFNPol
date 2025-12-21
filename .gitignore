@@ -6,3 +6,6 @@ checkpoints
 *.gif
 results
 data
+diffusion_policy
+checkpoints*
+.DS_Store
