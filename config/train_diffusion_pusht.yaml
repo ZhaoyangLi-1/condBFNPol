@@ -1,5 +1,5 @@
 dataset: data/pusht/pusht_cchi_v7_replay.zarr
-epochs: 100
+epochs: 3050
 batch_size: 64
 num_workers: 8
 checkpoint_every: 1
