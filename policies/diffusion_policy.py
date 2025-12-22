@@ -259,7 +259,9 @@ class DiffusionPolicy(BasePolicy):
         if self.inference.pred_action_steps_only:
             action = action_pred
         else:
-            start = self.horizons.obs_history
+            # Original diffusion policy uses (n_obs_steps - 1) as start index
+            # This is because the action at time t is predicted at observation index t-1
+            start = self.horizons.obs_history - 1
             if self.inference.oa_step_convention:
                 start = max(0, start - 1)
             end = start + self.horizons.action_prediction
@@ -287,6 +289,18 @@ class DiffusionPolicy(BasePolicy):
         return action
 
     def compute_loss(self, batch: Any) -> torch.Tensor:
+        """Compute training loss following the original diffusion policy implementation.
+        
+        For obs_as_global_cond=True (global condition mode):
+        - Observations are encoded and passed as global conditioning
+        - Actions are the trajectory to denoise
+        - Loss is computed on all action dimensions (no masking needed)
+        
+        For inpaint mode:
+        - Observations are concatenated with actions in the trajectory
+        - Conditioning mask marks observation positions
+        - Loss is computed only on action positions
+        """
         # 1. Unpack & Normalize
         if isinstance(batch, (list, tuple)):
             batch = {"obs": batch[0], "action": batch[1]}
@@ -301,56 +315,88 @@ class DiffusionPolicy(BasePolicy):
             return x.to(device=self.device, dtype=self.dtype)
 
         obs = nbatch["obs"]
-        action = nbatch["action"]
+        nactions = nbatch["action"]
         if isinstance(obs, torch.Tensor):
             obs = _to_dev(obs)
-        if isinstance(action, torch.Tensor):
-            action = _to_dev(action)
+        if isinstance(nactions, torch.Tensor):
+            nactions = _to_dev(nactions)
+
+        batch_size = nactions.shape[0]
+        
+        # Fix Action shape [B, T*D] -> [B, T, D] (from DataModule chunking)
+        if nactions.ndim == 2:
+            horizon = self.horizons.planning_horizon
+            nactions = nactions.view(batch_size, horizon, self.action_dim)
+        
+        horizon = nactions.shape[1]
 
         # Fix Obs shape [B, D] -> [B, 1, D]
         if obs.ndim == 2:
             obs = obs.unsqueeze(1)
-
-        # Fix Action shape [B, T*D] -> [B, T, D] (from DataModule chunking)
-        if action.ndim == 2:
-            B = action.shape[0]
-            T = self.horizons.planning_horizon
-            action = action.view(B, T, self.action_dim)
-
+        
         obs = obs[:, : self.horizons.obs_history]
 
-        cond_parts = self._build_condition(obs)
-        trajectory = cond_parts["cond_data"].clone()
-
-        # Fill trajectory with ground truth actions
-        T_action = min(action.shape[1], trajectory.shape[1])
-        trajectory[:, :T_action, : self.action_dim] = action[:, :T_action]
-
-        if self.inference.pred_action_steps_only:
-            loss_mask = torch.ones_like(trajectory, dtype=torch.bool)
+        # Build conditioning based on mode
+        if self.inference.condition_mode == "global":
+            # Global conditioning: obs as context, trajectory = actions only
+            global_cond = obs.reshape(batch_size, -1)  # [B, T_obs * D_obs]
+            local_cond = None
+            trajectory = nactions
+            cond_data = trajectory
+        elif self.inference.condition_mode == "local":
+            # Local conditioning: obs passed per-timestep
+            local_cond = obs.clone()
+            global_cond = None
+            trajectory = nactions
+            cond_data = trajectory
         else:
-            loss_mask = ~cond_parts["cond_mask"]
+            # Inpaint mode: obs concatenated with actions
+            D_obs = obs.shape[-1]
+            cond_data = torch.zeros(
+                (batch_size, horizon, self.action_dim + D_obs),
+                device=nactions.device,
+                dtype=nactions.dtype
+            )
+            cond_data[:, :, :self.action_dim] = nactions
+            T_obs = obs.shape[1]
+            cond_data[:, :T_obs, self.action_dim:] = obs
+            trajectory = cond_data.detach()
+            global_cond = None
+            local_cond = None
 
-        noise = torch.randn(
-            trajectory.shape, device=trajectory.device, dtype=trajectory.dtype
-        )
+        # Generate inpainting mask
+        condition_mask = self.mask_generator(trajectory.shape)
+
+        # Sample noise
+        noise = torch.randn(trajectory.shape, device=trajectory.device, dtype=trajectory.dtype)
+        
+        # Sample random timesteps
         timesteps = torch.randint(
             0,
             self.noise_scheduler.config.num_train_timesteps,
-            (trajectory.shape[0],),
+            (batch_size,),
             device=trajectory.device,
         ).long()
 
-        noisy_traj = self.noise_scheduler.add_noise(trajectory, noise, timesteps)
+        # Add noise (forward diffusion process)
+        noisy_trajectory = self.noise_scheduler.add_noise(trajectory, noise, timesteps)
 
+        # Compute loss mask (predict where NOT conditioned)
+        loss_mask = ~condition_mask
+
+        # Apply conditioning to noisy trajectory
+        noisy_trajectory[condition_mask] = cond_data[condition_mask]
+
+        # Predict noise
         pred = self.model(
-            noisy_traj,
+            noisy_trajectory,
             timesteps,
-            local_cond=cond_parts["local_cond"],
-            global_cond=cond_parts["global_cond"],
-            cond=cond_parts["global_cond"],  # Alias for unified Unet
+            local_cond=local_cond,
+            global_cond=global_cond,
+            cond=global_cond,  # Alias for unified Unet
         )
 
+        # Compute target based on prediction type
         pred_type = self.noise_scheduler.config.prediction_type
         if pred_type == "epsilon":
             target = noise
@@ -361,6 +407,7 @@ class DiffusionPolicy(BasePolicy):
         else:
             raise ValueError(f"Unsupported prediction type: {pred_type}")
 
+        # MSE loss with masking
         loss = F.mse_loss(pred, target, reduction="none")
         loss = loss * loss_mask.type(loss.dtype)
         loss = loss.flatten(1).mean(dim=1).mean()
