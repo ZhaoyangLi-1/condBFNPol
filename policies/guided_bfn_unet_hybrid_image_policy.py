@@ -88,27 +88,22 @@ class UnetFlowWrapper(BFNetwork):
         """Forward pass through the U-Net to predict velocity.
         
         Args:
-            x: Current state [B, horizon * action_dim] or [B, horizon, action_dim]
+            x: Current state [B, horizon * action_dim]
             t: Time values [B] or scalar, values in [0, 1]
             cond: Global conditioning [B, cond_dim]
             
         Returns:
-            Velocity prediction [B, horizon * action_dim] or same shape as input
+            Velocity prediction [B, horizon * action_dim]
         """
-        # Handle input shape
-        original_shape = x.shape
-        if x.dim() == 2:
-            # [B, horizon * action_dim] -> [B, action_dim, horizon]
-            B = x.shape[0]
-            x = x.view(B, self.horizon, self.action_dim)
-            x = x.permute(0, 2, 1)
-        elif x.dim() == 3:
-            # [B, horizon, action_dim] -> [B, action_dim, horizon]
-            x = x.permute(0, 2, 1)
+        B = x.shape[0]
+        
+        # Reshape from [B, horizon * action_dim] to [B, action_dim, horizon]
+        x = x.view(B, self.horizon, self.action_dim)  # [B, horizon, action_dim]
+        x = x.permute(0, 2, 1).contiguous()  # [B, action_dim, horizon]
         
         # Convert flow time to integer timesteps for U-Net
         if t.dim() == 0:
-            t = t.expand(x.shape[0])
+            t = t.expand(B)
         
         # Scale t from [0, 1] to integer timesteps
         timesteps = (t * 999).long().clamp(0, 999)
@@ -120,10 +115,9 @@ class UnetFlowWrapper(BFNetwork):
             global_cond=cond,
         )
         
-        # Convert back to original shape
-        out = out.permute(0, 2, 1)  # [B, horizon, action_dim]
-        if len(original_shape) == 2:
-            out = out.reshape(original_shape[0], -1)
+        # Convert back to [B, horizon * action_dim]
+        out = out.permute(0, 2, 1).contiguous()  # [B, horizon, action_dim]
+        out = out.view(B, -1)  # [B, horizon * action_dim]
         
         return out
 
