@@ -9,3 +9,4 @@ data
 diffusion_policy
 checkpoints*
 .DS_Store
+logs

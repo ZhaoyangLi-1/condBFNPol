@@ -4,6 +4,9 @@ from policies.conditional_bfn_policy import ConditionalBFNPolicy
 from policies.guided_bfn_policy import GuidedBFNPolicy
 from policies.diffusion_policy import DiffusionPolicy, HorizonConfig, InferenceConfig
 from policies.diffusion_unet_hybrid_image_policy import DiffusionUnetHybridImagePolicy
+from policies.bfn_unet_hybrid_image_policy import BFNUnetHybridImagePolicy
+from policies.conditional_bfn_unet_hybrid_image_policy import ConditionalBFNUnetHybridImagePolicy
+from policies.guided_bfn_unet_hybrid_image_policy import GuidedBFNUnetHybridImagePolicy
 
 __all__ = [
     "BasePolicy",
@@ -14,4 +17,7 @@ __all__ = [
     "HorizonConfig",
     "InferenceConfig",
     "DiffusionUnetHybridImagePolicy",
+    "BFNUnetHybridImagePolicy",
+    "ConditionalBFNUnetHybridImagePolicy",
+    "GuidedBFNUnetHybridImagePolicy",
 ]
