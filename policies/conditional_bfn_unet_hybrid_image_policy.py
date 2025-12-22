@@ -269,7 +269,7 @@ class ConditionalBFNUnetHybridImagePolicy(BasePolicy):
         obs_encoder_group_norm: bool,
         eval_fixed_crop: bool,
     ) -> nn.Module:
-        """Build observation encoder using robomimic."""
+        """Build observation encoder using robomimic via algo_factory."""
         config = get_robomimic_config(
             algo_name='bc_rnn',
             hdf5_type='image',
@@ -278,26 +278,30 @@ class ConditionalBFNUnetHybridImagePolicy(BasePolicy):
         )
         
         with config.unlocked():
-            config.observation.modalities.obs.low_dim = obs_config['low_dim']
-            config.observation.modalities.obs.rgb = obs_config['rgb']
-            config.observation.encoder.rgb.core_class = "VisualCore"
-            config.observation.encoder.rgb.core_kwargs.feature_dimension = 64
-            config.observation.encoder.rgb.core_kwargs.backbone_class = 'ResNet18Conv'
-            config.observation.encoder.rgb.core_kwargs.backbone_kwargs.pretrained = False
-            config.observation.encoder.rgb.core_kwargs.backbone_kwargs.input_coord_conv = False
-            config.observation.encoder.rgb.core_kwargs.pool_class = "SpatialSoftmax"
-            config.observation.encoder.rgb.core_kwargs.pool_kwargs.num_kp = 32
-            config.observation.encoder.rgb.obs_randomizer_class = "CropRandomizer"
-            config.observation.encoder.rgb.obs_randomizer_kwargs.crop_height = crop_shape[0]
-            config.observation.encoder.rgb.obs_randomizer_kwargs.crop_width = crop_shape[1]
-            config.observation.encoder.rgb.obs_randomizer_kwargs.num_crops = 1
-            config.observation.encoder.rgb.obs_randomizer_kwargs.pos_enc = False
+            config.observation.modalities.obs = obs_config
+            
+            if crop_shape is None:
+                for key, modality in config.observation.encoder.items():
+                    if modality.obs_randomizer_class == 'CropRandomizer':
+                        modality['obs_randomizer_class'] = None
+            else:
+                ch, cw = crop_shape
+                for key, modality in config.observation.encoder.items():
+                    if modality.obs_randomizer_class == 'CropRandomizer':
+                        modality.obs_randomizer_kwargs.crop_height = ch
+                        modality.obs_randomizer_kwargs.crop_width = cw
         
         ObsUtils.initialize_obs_utils_with_config(config)
         
-        obs_encoder = ObsUtils.obs_encoder_factory(
-            obs_shapes=obs_key_shapes,
+        policy: PolicyAlgo = algo_factory(
+            algo_name=config.algo_name,
+            config=config,
+            obs_key_shapes=obs_key_shapes,
+            ac_dim=action_dim,
+            device='cpu',
         )
+        
+        obs_encoder = policy.nets['policy'].nets['encoder'].nets['obs']
         
         if obs_encoder_group_norm:
             replace_submodules(
@@ -309,22 +313,10 @@ class ConditionalBFNUnetHybridImagePolicy(BasePolicy):
                 )
             )
         
-        obs_encoder = replace_submodules(
-            root_module=obs_encoder,
-            predicate=lambda x: isinstance(x, rmbn.CropRandomizer),
-            func=lambda x: dmvc.CropRandomizer(
-                input_shape=x.input_shape,
-                crop_height=x.crop_height,
-                crop_width=x.crop_width,
-                num_crops=x.num_crops,
-                pos_enc=x.pos_enc
-            )
-        )
-        
         if eval_fixed_crop:
             replace_submodules(
                 root_module=obs_encoder,
-                predicate=lambda x: isinstance(x, dmvc.CropRandomizer),
+                predicate=lambda x: isinstance(x, rmbn.CropRandomizer),
                 func=lambda x: dmvc.CropRandomizer(
                     input_shape=x.input_shape,
                     crop_height=x.crop_height,
