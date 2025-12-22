@@ -62,11 +62,15 @@ class UnetBFNWrapper(BFNetwork):
         model: ConditionalUnet1D,
         horizon: int,
         action_dim: int,
+        cond_dim: int,
     ):
         super().__init__(is_conditional_model=True)
         self.model = model
         self.horizon = horizon
         self.action_dim = action_dim
+        # Required by ContinuousBFN for conditional models
+        self.cond_dim = cond_dim
+        self.cond_is_discrete = False  # We use continuous conditioning
     
     def forward(
         self,
@@ -232,6 +236,7 @@ class ConditionalBFNUnetHybridImagePolicy(BasePolicy):
             model=unet_model,
             horizon=horizon,
             action_dim=action_dim,
+            cond_dim=global_cond_dim,
         )
         
         # Create BFN
