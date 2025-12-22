@@ -360,6 +360,32 @@ class GuidedBFNUnetHybridImagePolicy(BasePolicy):
         """Set the normalizer for inputs/outputs."""
         self.normalizer.load_state_dict(normalizer.state_dict())
     
+    # ==================== Forward (required by BasePolicy) ====================
+    
+    def forward(
+        self,
+        obs: Union[torch.Tensor, Dict[str, torch.Tensor]],
+        *,
+        deterministic: bool = False,
+        **kwargs,
+    ) -> torch.Tensor:
+        """Forward pass for inference.
+        
+        Args:
+            obs: Observation tensor or dict with shape [B, ...]
+            deterministic: Not used for flow matching sampling
+            
+        Returns:
+            Action tensor of shape [B, n_action_steps, action_dim]
+        """
+        if isinstance(obs, torch.Tensor):
+            obs_dict = {'obs': obs}
+        else:
+            obs_dict = obs
+        
+        result = self.predict_action(obs_dict)
+        return result['action']
+    
     # ==================== ODE Integration ====================
     
     def _euler_step(

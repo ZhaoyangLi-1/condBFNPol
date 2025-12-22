@@ -182,6 +182,10 @@ class DiffusionUnetHybridImagePolicy(BasePolicy):
         print(f"Diffusion params: {sum(p.numel() for p in self.model.parameters()):.2e}")
         print(f"Vision params: {sum(p.numel() for p in self.obs_encoder.parameters()):.2e}")
     
+    def reset(self):
+        """Reset action buffer for new episode."""
+        return None
+    
     def _build_robomimic_encoder(
         self,
         obs_config: dict,
