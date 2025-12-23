@@ -6,7 +6,7 @@ from policies.diffusion_policy import DiffusionPolicy, HorizonConfig, InferenceC
 from policies.diffusion_unet_hybrid_image_policy import DiffusionUnetHybridImagePolicy
 from policies.bfn_unet_hybrid_image_policy import BFNUnetHybridImagePolicy
 from policies.conditional_bfn_unet_hybrid_image_policy import ConditionalBFNUnetHybridImagePolicy
-from policies.guided_bfn_unet_hybrid_image_policy import GuidedBFNUnetHybridImagePolicy
+from policies.flow_matching_unet_hybrid_image_policy import FlowMatchingUnetHybridImagePolicy
 
 __all__ = [
     "BasePolicy",
@@ -19,5 +19,5 @@ __all__ = [
     "DiffusionUnetHybridImagePolicy",
     "BFNUnetHybridImagePolicy",
     "ConditionalBFNUnetHybridImagePolicy",
-    "GuidedBFNUnetHybridImagePolicy",
+    "FlowMatchingUnetHybridImagePolicy",
 ]

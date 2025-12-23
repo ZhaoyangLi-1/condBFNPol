@@ -1,7 +1,10 @@
-"""Guided BFN U-Net Hybrid Image Policy.
+"""Flow Matching U-Net Hybrid Image Policy.
 
-This module implements a Guided Bayesian Flow Network (Flow Matching) policy 
-for visual robot control tasks using the same architecture as DiffusionUnetHybridImagePolicy.
+This module implements a Flow Matching (Rectified Flow) policy for visual 
+robot control tasks using the same architecture as DiffusionUnetHybridImagePolicy.
+
+NOTE: This is NOT a Bayesian Flow Network. Flow Matching is a different generative
+model based on learning velocity fields and ODE integration.
 
 The policy uses:
 - A vision encoder (e.g., ResNet) to extract features from RGB images
@@ -38,16 +41,14 @@ try:
 except ImportError:
     HAS_ROBOMIMIC = False
 
-__all__ = ["GuidedBFNUnetHybridImagePolicy", "GuidanceConfig", "HorizonConfig"]
+__all__ = ["FlowMatchingUnetHybridImagePolicy", "FlowConfig", "HorizonConfig"]
 
 
-class GuidanceConfig(NamedTuple):
-    """Configuration for flow guidance mechanisms."""
+class FlowConfig(NamedTuple):
+    """Configuration for Flow Matching sampling."""
     steps: int = 20
     cfg_scale: float = 1.0
-    grad_scale: float = 0.0
     method: str = "midpoint"  # euler, midpoint, rk4
-    use_tqdm: bool = False
 
 
 class HorizonConfig(NamedTuple):
@@ -123,16 +124,18 @@ class UnetFlowWrapper(BFNetwork):
         return out
 
 
-class GuidedBFNUnetHybridImagePolicy(BasePolicy):
-    """Guided BFN (Flow Matching) policy for image observations using U-Net backbone.
+class FlowMatchingUnetHybridImagePolicy(BasePolicy):
+    """Flow Matching (Rectified Flow) policy for image observations using U-Net backbone.
     
-    This policy processes multi-modal observations (images + low-dim state)
-    through a vision encoder, then uses a conditional U-Net with Flow Matching
-    to generate action trajectories via ODE integration.
+    NOTE: This is NOT a Bayesian Flow Network. Flow Matching is a different generative
+    model based on learning velocity fields v(x_t, t) and ODE integration.
+    
+    Training: x_t = (1-t)*x_0 + t*x_1, predict v = x_1 - x_0
+    Sampling: Integrate ODE dx/dt = v(x_t, t) from t=0 to t=1
     
     Key features:
     - Same architecture as DiffusionUnetHybridImagePolicy
-    - Uses Flow Matching objective for training
+    - Uses Flow Matching objective (velocity prediction)
     - ODE-based sampling (euler, midpoint, rk4)
     - Supports classifier-free guidance
     """
@@ -141,7 +144,7 @@ class GuidedBFNUnetHybridImagePolicy(BasePolicy):
         self,
         shape_meta: dict,
         horizon_config: HorizonConfig,
-        guidance_config: Optional[GuidanceConfig] = None,
+        flow_config: Optional[FlowConfig] = None,
         # Vision encoder config
         crop_shape: tuple = (76, 76),
         obs_encoder_group_norm: bool = False,
@@ -175,7 +178,7 @@ class GuidedBFNUnetHybridImagePolicy(BasePolicy):
         
         # Store configs
         self.horizon_config = horizon_config
-        self.guidance_config = guidance_config or GuidanceConfig()
+        self.flow_config = flow_config or FlowConfig()
         self.cond_drop_prob = cond_drop_prob
         self.action_bounds = action_bounds
         
@@ -475,7 +478,7 @@ class GuidedBFNUnetHybridImagePolicy(BasePolicy):
         x0 = torch.randn(B, self.flat_dim, device=device, dtype=dtype)
         
         # Integrate ODE with optional classifier-free guidance
-        cfg = self.guidance_config
+        cfg = self.flow_config
         if cfg.cfg_scale != 1.0:
             naction = self._sample_with_cfg(x0, cond, cfg.cfg_scale, cfg.steps, cfg.method)
         else:

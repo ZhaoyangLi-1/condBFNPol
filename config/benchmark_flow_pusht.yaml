@@ -1,7 +1,8 @@
 # Benchmark Configuration: Flow Matching vs Diffusion on PushT
 # 
-# This config is for the Flow Matching (Guided BFN) policy in the benchmark.
-# Flow Matching has perfect training-inference alignment unlike standard BFN.
+# This config is for the Flow Matching policy in the benchmark.
+# NOTE: Flow Matching is NOT the same as Bayesian Flow Networks.
+# Flow Matching uses velocity prediction and ODE integration.
 #
 # Run with: python scripts/train_workspace.py --config-name=benchmark_flow_pusht
 #
@@ -39,15 +40,15 @@ shape_meta:
 
 # ================== Policy ==================
 policy:
-  _target_: policies.guided_bfn_unet_hybrid_image_policy.GuidedBFNUnetHybridImagePolicy
+  _target_: policies.flow_matching_unet_hybrid_image_policy.FlowMatchingUnetHybridImagePolicy
   shape_meta: ${shape_meta}
   # Horizon config
   horizon_config:
     obs_history: ${n_obs_steps}
     prediction: ${horizon}
     execution: ${n_action_steps}
-  # Guidance/sampling config
-  guidance_config:
+  # Flow Matching sampling config
+  flow_config:
     steps: 20
     cfg_scale: 1.0  # No classifier-free guidance
     method: midpoint  # euler, midpoint, or rk4
