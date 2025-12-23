@@ -102,12 +102,13 @@ class UnetFlowWrapper(BFNetwork):
         x = x.view(B, self.horizon, self.action_dim)  # [B, horizon, action_dim]
         
         # Convert flow time [0, 1] to diffusion timesteps
+        # Flow Matching: t=0 is noise, t=1 is data
+        # Diffusion: timestep=0 is clean, timestep=999 is noisy
+        # So we need to reverse: timestep = (1 - t) * 999
         if t.dim() == 0:
             t = t.expand(B)
         
-        # Scale t from [0, 1] to float timesteps in [0, 999]
-        # Keep as float for proper sinusoidal embedding interpolation
-        timesteps = t * 999.0
+        timesteps = (1.0 - t) * 999.0
         
         # Forward through U-Net
         out = self.model(

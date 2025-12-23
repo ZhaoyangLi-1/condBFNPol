@@ -96,12 +96,13 @@ class UnetBFNWrapper(BFNetwork):
         x = x.view(B, self.horizon, self.action_dim)  # [B, horizon, action_dim]
         
         # Convert BFN time [0, 1] to diffusion timesteps
+        # BFN: t=0 is noisy, t=1 is clean
+        # Diffusion: timestep=0 is clean, timestep=999 is noisy
+        # So we need to reverse: timestep = (1 - t) * 999
         if t.dim() == 0:
             t = t.expand(B)
         
-        # Scale t from [0, 1] to float timesteps in [0, 999]
-        # Keep as float for proper sinusoidal embedding interpolation
-        timesteps = t * 999.0
+        timesteps = (1.0 - t) * 999.0
         
         # Forward through U-Net
         out = self.model(
@@ -470,7 +471,11 @@ class ConditionalBFNUnetHybridImagePolicy(BasePolicy):
     # ==================== Training ====================
     
     def compute_loss(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
-        """Compute BFN loss for training with conditioning dropout.
+        """Compute BFN continuous-time loss for training with conditioning dropout.
+        
+        Implements the official BFN loss from NNAISENSE:
+        loss = C * MSE / posterior_var
+        where C = -log(sigma_1) and posterior_var = sigma_1^(2t)
         
         Args:
             batch: Dictionary containing 'obs' and 'action' tensors
@@ -478,35 +483,57 @@ class ConditionalBFNUnetHybridImagePolicy(BasePolicy):
         Returns:
             Scalar loss tensor
         """
-        # Normalize inputs separately
+        # Normalize inputs
         nobs = self.normalizer.normalize(batch['obs'])
         naction = self.normalizer['action'].normalize(batch['action'])
         
         B = naction.shape[0]
-        T = self.horizon
-        Da = self.action_dim
+        device = naction.device
+        dtype = naction.dtype
         
         # Encode observations
         this_nobs = dict_apply(nobs, lambda x: x[:, :self.n_obs_steps, ...].reshape(-1, *x.shape[2:]))
         nobs_features = self.obs_encoder(this_nobs)
-        
-        # Reshape to [B, T*Do]
         cond = nobs_features.reshape(B, -1)
         
         # Apply conditioning dropout for classifier-free guidance training
         if self.training and self.cond_drop_prob > 0:
-            drop_mask = torch.rand(B, device=cond.device) < self.cond_drop_prob
+            drop_mask = torch.rand(B, device=device) < self.cond_drop_prob
             cond = torch.where(drop_mask.unsqueeze(-1), torch.zeros_like(cond), cond)
         
-        # Flatten actions for BFN
-        naction_flat = naction.reshape(B, -1)
+        # Flatten actions: [B, T, Da] -> [B, T * Da]
+        x = naction.reshape(B, -1)
         
-        # Compute BFN loss
-        loss = self.bfn.loss(
-            naction_flat,
-            cond=cond,
-            sigma_1=self.sigma_1,
-        )
+        # Sample time uniformly in [0, 1]
+        t = torch.rand(B, device=device, dtype=dtype)
+        
+        # BFN forward pass: sample input parameters at time t
+        # Following official implementation from torch_bfn
+        sigma_1 = self.bfn_config.sigma_1
+        s1 = torch.tensor([sigma_1], device=device, dtype=dtype)
+        t_expanded = t.unsqueeze(-1)  # [B, 1]
+        
+        # gamma = 1 - sigma_1^(2t)
+        gamma = 1.0 - s1.pow(2.0 * t_expanded)
+        
+        # Sample mu from N(gamma * x, sqrt(gamma * (1 - gamma)))
+        # std = sqrt(gamma * (1 - gamma) + eps) for numerical stability
+        std = (gamma * (1.0 - gamma) + 1e-9).sqrt()
+        mu = gamma * x + std * torch.randn_like(x)
+        
+        # Forward through network to get eps prediction
+        eps_pred = self.unet_wrapper(mu, t, cond=cond)
+        
+        # Convert noise prediction to data prediction: x = (mu / gamma) - sqrt((1-gamma)/gamma) * eps
+        # Handle gamma=0 case (t=0) by using zeros
+        gamma_safe = gamma.clamp(min=1e-8)
+        x_pred = (mu / gamma_safe) - ((1.0 - gamma) / gamma_safe).sqrt() * eps_pred
+        
+        # Compute continuous-time loss following official BFN:
+        # diff = ||x - x_pred||_2 (L2 norm)
+        # loss = -log(sigma_1) * diff / sigma_1^(2t)
+        diff = (x - x_pred).pow(2.0).sum(-1).sqrt()  # [B] L2 norm
+        loss = -(s1.log() * diff / s1.pow(2.0 * t))  # [B]
         
         return loss.mean()
     
