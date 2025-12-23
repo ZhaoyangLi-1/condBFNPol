@@ -175,7 +175,7 @@ logging:
 # ================== Hydra ==================
 hydra:
   run:
-    dir: outputs/benchmark/${now:%Y-%m-%d}/${now:%H-%M-%S}_flow_seed${training.seed}
+    dir: "/dss/dssfs04/scratch/ge87gob2/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_flow_seed${SEED}"
   sweep:
     dir: outputs/benchmark/${now:%Y-%m-%d}
     subdir: flow_seed${training.seed}

@@ -115,7 +115,7 @@ task:
   dataset:
     _target_: diffusion_policy.dataset.pusht_image_dataset.PushTImageDataset
     # Use absolute path - override with task.dataset.zarr_path=/path/to/data on cluster
-    zarr_path: ${oc.env:PUSHT_DATA_PATH,data/pusht_cchi_v7_replay.zarr}
+    zarr_path: data/pusht/pusht_cchi_v7_replay.zarr
     horizon: ${horizon}
     pad_before: 1
     pad_after: 7
@@ -166,7 +166,7 @@ logging:
 # ================== Hydra ==================
 hydra:
   run:
-    dir: outputs/benchmark/${now:%Y-%m-%d}/${now:%H-%M-%S}_bfn_seed${training.seed}
+    dir: "/dss/dssfs04/scratch/ge87gob2/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_bfn_seed${SEED}"
   sweep:
     dir: outputs/benchmark/${now:%Y-%m-%d}
     subdir: bfn_seed${training.seed}
