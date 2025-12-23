@@ -474,26 +474,25 @@ class BFNUnetHybridImagePolicy(BasePolicy):
     # ==================== Training ====================
     
     def compute_loss(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
-        """Compute BFN continuous-time loss (cts_time_loss from original).
+        """Compute BFN loss with simple MSE (stable training).
         
-        From the original NNAISENSE implementation (bfn.py, CtsBayesianFlowLoss):
+        The original BFN weighted loss (C * MSE / sigma_1^(2t)) is unstable because:
+        - At t=0: weight ≈ 1
+        - At t=1: weight ≈ 1,000,000 (for sigma_1=0.001)
         
-            C = -0.5 * log(min_variance) = -log(σ₁)  [since min_variance = σ₁²]
-            posterior_var = min_variance^t = σ₁^(2t)
-            loss = C * mse / posterior_var
-                 = -log(σ₁) * ||x - x̂||² / σ₁^(2t)
+        This causes the network to only focus on t≈1 predictions.
         
-        Input distribution (from forward() in CtsBayesianFlow):
-            post_var = σ₁^(2t)
-            α_t = 1 - post_var = 1 - σ₁^(2t)  [this is gamma]
-            mean = α_t * x + sqrt(α_t * post_var) * noise
-                 = γ * x + sqrt(γ * (1-γ)) * noise
+        Instead, we use simple MSE loss which:
+        - Is stable and well-understood
+        - Aligns with the evaluation metric (action MSE)
+        - Still trains the network to predict x from noisy mu
         
-        Args:
-            batch: Dictionary containing 'obs' and 'action' tensors
-            
-        Returns:
-            Scalar loss tensor
+        The BFN-specific part is preserved in the INPUT DISTRIBUTION:
+        - mu ~ N(gamma * x, sqrt(gamma * (1-gamma)))
+        - where gamma = 1 - sigma_1^(2t)
+        
+        This is similar to how diffusion policy uses MSE loss but diffusion-specific
+        noise schedule for the input.
         """
         # Normalize inputs
         nobs = self.normalizer.normalize(batch['obs'])
@@ -512,46 +511,29 @@ class BFNUnetHybridImagePolicy(BasePolicy):
         x = naction.reshape(B, -1)
         
         # Sample time uniformly in (0, 1)
-        # Original doesn't clamp, but we avoid exact 0 for numerical stability
         t = torch.rand(B, device=device, dtype=dtype)
-        t = t.clamp(min=1e-5)  # Avoid t=0 where gamma=0
+        t = t.clamp(min=1e-5, max=1.0 - 1e-5)
         
-        # BFN parameter (this is σ₁, original uses min_variance = σ₁²)
+        # BFN parameter
         sigma_1 = self.sigma_1
         
-        # Posterior variance at time t: σ₁^(2t)
-        # From original: post_var = torch.pow(self.min_variance, t) = (σ₁²)^t = σ₁^(2t)
-        posterior_var = sigma_1 ** (2.0 * t)  # [B]
+        # gamma = 1 - sigma_1^(2t) [BFN accuracy schedule]
+        # At t=0: gamma=0 (pure noise), at t=1: gamma≈1 (nearly clean)
+        gamma = 1.0 - (sigma_1 ** (2.0 * t))
+        gamma_expanded = gamma.unsqueeze(-1)
         
-        # α_t = 1 - σ₁^(2t) = γ(t) [accuracy/signal ratio at time t]
-        alpha_t = 1.0 - posterior_var  # [B]
+        # Sample mu from BFN input distribution: N(gamma*x, sqrt(gamma*(1-gamma)))
+        var = gamma_expanded * (1.0 - gamma_expanded)
+        std = (var + 1e-8).sqrt()
+        mu = gamma_expanded * x + std * torch.randn_like(x)
         
-        # Expand for broadcasting with x: [B] -> [B, 1]
-        alpha_t_expanded = alpha_t.unsqueeze(-1)
-        posterior_var_expanded = posterior_var.unsqueeze(-1)
-        
-        # Sample μ from input distribution (from original forward()):
-        # mean_mean = α_t * x
-        # mean_var = α_t * post_var = γ * (1-γ)
-        # mean = mean_mean + sqrt(mean_var) * noise
-        mean_var = alpha_t_expanded * posterior_var_expanded  # γ * (1-γ)
-        mean_std = mean_var.sqrt()
-        mu = alpha_t_expanded * x + mean_std * torch.randn_like(x)
-        
-        # Network predicts clean data x from noisy μ
+        # Network predicts clean data x from noisy mu
         x_pred = self.unet_wrapper(mu, t, cond=cond)
         
-        # Loss: C * MSE / posterior_var
-        # C = -0.5 * log(min_variance) = -0.5 * log(σ₁²) = -log(σ₁)
-        C = -math.log(sigma_1)
+        # Simple MSE loss - stable and aligned with evaluation
+        loss = F.mse_loss(x_pred, x)
         
-        # MSE per element, then mean over dimensions
-        mse = ((x - x_pred) ** 2).mean(dim=-1)  # [B]
-        
-        # Weight by 1/σ₁^(2t)
-        loss = C * mse / (posterior_var + 1e-8)
-        
-        return loss.mean()
+        return loss
     
     def set_actions(self, action: torch.Tensor):
         """Set actions for inpainting (not used with BFN)."""

@@ -522,16 +522,11 @@ class ConditionalBFNUnetHybridImagePolicy(BasePolicy):
     # ==================== Training ======================================
     
     def compute_loss(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
-        """Compute BFN continuous-time loss (cts_time_loss from original NNAISENSE code).
+        """Compute BFN loss with simple MSE (stable training).
         
-        From original: loss = C * mse / posterior_var
-        where C = -log(σ₁), posterior_var = σ₁^(2t)
-        
-        Args:
-            batch: Dictionary containing 'obs' and 'action' tensors
-            
-        Returns:
-            Scalar loss tensor
+        Uses BFN input distribution but simple MSE loss for stability.
+        The original weighted loss (C * MSE / sigma_1^(2t)) causes instability
+        because the weight at t=1 is ~1,000,000x larger than at t=0.
         """
         # Normalize inputs
         nobs = self.normalizer.normalize(batch['obs'])
@@ -556,33 +551,27 @@ class ConditionalBFNUnetHybridImagePolicy(BasePolicy):
         
         # Sample time uniformly in (0, 1)
         t = torch.rand(B, device=device, dtype=dtype)
-        t = t.clamp(min=1e-5)  # Avoid t=0
+        t = t.clamp(min=1e-5, max=1.0 - 1e-5)
         
         # BFN parameter
         sigma_1 = self.bfn_config.sigma_1
         
-        # posterior_var = σ₁^(2t)
-        posterior_var = sigma_1 ** (2.0 * t)  # [B]
+        # gamma = 1 - sigma_1^(2t) [BFN accuracy schedule]
+        gamma = 1.0 - (sigma_1 ** (2.0 * t))
+        gamma_expanded = gamma.unsqueeze(-1)
         
-        # α_t = 1 - σ₁^(2t) = γ(t)
-        alpha_t = 1.0 - posterior_var  # [B]
-        alpha_t_expanded = alpha_t.unsqueeze(-1)
-        posterior_var_expanded = posterior_var.unsqueeze(-1)
-        
-        # Sample μ from input distribution: N(α_t*x, sqrt(α_t*posterior_var))
-        mean_var = alpha_t_expanded * posterior_var_expanded
-        mean_std = mean_var.sqrt()
-        mu = alpha_t_expanded * x + mean_std * torch.randn_like(x)
+        # Sample mu from BFN input distribution: N(gamma*x, sqrt(gamma*(1-gamma)))
+        var = gamma_expanded * (1.0 - gamma_expanded)
+        std = (var + 1e-8).sqrt()
+        mu = gamma_expanded * x + std * torch.randn_like(x)
         
         # Predict x
         x_pred = self.unet_wrapper(mu, t, cond=cond)
         
-        # Loss: C * MSE / posterior_var where C = -log(σ₁)
-        C = -math.log(sigma_1)
-        mse = ((x - x_pred) ** 2).mean(dim=-1)  # [B]
-        loss = C * mse / (posterior_var + 1e-8)
+        # Simple MSE loss - stable and aligned with evaluation
+        loss = F.mse_loss(x_pred, x)
         
-        return loss.mean()
+        return loss
     
     def set_actions(self, action: torch.Tensor):
         """Set actions for inpainting (not used with BFN)."""

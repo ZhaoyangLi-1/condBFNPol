@@ -83,9 +83,9 @@ training:
   num_epochs: 300
   gradient_accumulate_every: 1
   rollout_every: 50
-  checkpoint_every: 50
+  checkpoint_every: 100  # Less frequent checkpoints to save disk
   val_every: 1
-  sample_every: 5
+  sample_every: 10  # Less frequent sampling to save disk
   max_train_steps: null
   max_val_steps: null
   tqdm_interval_sec: 1.0
@@ -144,9 +144,9 @@ checkpoint:
   topk:
     monitor_key: test_mean_score
     mode: max
-    k: 5
+    k: 3  # Only keep top 3 checkpoints to save disk
     format_str: epoch={epoch:04d}-test_mean_score={test_mean_score:.3f}.ckpt
-  save_last_ckpt: true
+  save_last_ckpt: false  # Disabled to save disk
   save_last_snapshot: false
 
 # ================== Logging ==================

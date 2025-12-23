@@ -39,6 +39,20 @@ export WANDB_API_KEY='d47c0bfd84b46e8364f863f142e4fa03c425500e'
 export PYTHONPATH=.
 export HYDRA_FULL_ERROR=1
 
+# ================== Disk Space Management ==================
+# Use scratch storage for outputs (NOT home directory!)
+SCRATCH_DIR="/dss/dssfs04/scratch/ge87gob2"
+OUTPUT_DIR="${SCRATCH_DIR}/outputs"
+mkdir -p "$OUTPUT_DIR"
+
+# Set wandb to use scratch storage
+export WANDB_DIR="${SCRATCH_DIR}/wandb"
+export WANDB_CACHE_DIR="${SCRATCH_DIR}/wandb_cache"
+mkdir -p "$WANDB_DIR" "$WANDB_CACHE_DIR"
+
+# Clean up old wandb runs from home (optional, uncomment if needed)
+# rm -rf ~/condBFNPol/wandb/run-*
+
 # ================== Configuration ==================
 # Default values
 SEEDS="${SEEDS:-42 43 44}"
@@ -46,7 +60,7 @@ EPOCHS="${EPOCHS:-300}"
 DEVICE="${DEVICE:-cuda:0}"
 PROJECT="${PROJECT:-pusht-benchmark}"
 ENTITY="${ENTITY:-aleyna-research}"
-NUM_WORKERS="${NUM_WORKERS:-16}"
+NUM_WORKERS="${NUM_WORKERS:-8}"  # Reduced to avoid memory issues
 
 # Data path - auto-detect based on hostname or set explicitly
 if [ -z "$DATA_PATH" ]; then
@@ -106,6 +120,7 @@ echo "Device: $DEVICE"
 echo "WandB Project: $PROJECT"
 echo "WandB Entity: $ENTITY"
 echo "Data Path: $DATA_PATH"
+echo "Output Dir: $OUTPUT_DIR"
 echo "Num Workers: $NUM_WORKERS"
 echo "======================================"
 
@@ -129,11 +144,14 @@ for SEED in $SEEDS; do
     echo "--- Training BFN (seed=$SEED) ---"
     python scripts/train_workspace.py \
         --config-name=benchmark_bfn_pusht \
-        hydra.run.dir="data/outputs/\${now:%Y.%m.%d}/\${now:%H.%M.%S}_bfn_seed${SEED}" \
+        hydra.run.dir="${OUTPUT_DIR}/\${now:%Y.%m.%d}/\${now:%H.%M.%S}_bfn_seed${SEED}" \
         task.dataset.zarr_path="$DATA_PATH" \
         training.seed=$SEED \
         training.device=$DEVICE \
         training.num_epochs=$EPOCHS \
+        training.checkpoint_every=100 \
+        checkpoint.save_last_ckpt=false \
+        checkpoint.topk.k=2 \
         dataloader.num_workers=$NUM_WORKERS \
         val_dataloader.num_workers=$NUM_WORKERS \
         logging.project=$PROJECT \
@@ -145,11 +163,14 @@ for SEED in $SEEDS; do
     echo "--- Training Diffusion (seed=$SEED) ---"
     python scripts/train_workspace.py \
         --config-name=benchmark_diffusion_pusht \
-        hydra.run.dir="data/outputs/\${now:%Y.%m.%d}/\${now:%H.%M.%S}_diffusion_seed${SEED}" \
+        hydra.run.dir="${OUTPUT_DIR}/\${now:%Y.%m.%d}/\${now:%H.%M.%S}_diffusion_seed${SEED}" \
         task.dataset.zarr_path="$DATA_PATH" \
         training.seed=$SEED \
         training.device=$DEVICE \
         training.num_epochs=$EPOCHS \
+        training.checkpoint_every=100 \
+        checkpoint.save_last_ckpt=false \
+        checkpoint.topk.k=2 \
         dataloader.num_workers=$NUM_WORKERS \
         val_dataloader.num_workers=$NUM_WORKERS \
         logging.project=$PROJECT \
