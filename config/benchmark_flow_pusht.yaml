@@ -123,7 +123,7 @@ task:
   
   dataset:
     _target_: diffusion_policy.dataset.pusht_image_dataset.PushTImageDataset
-    zarr_path: ${oc.env:PUSHT_DATA_PATH,data/pusht_cchi_v7_replay.zarr}
+    zarr_path: data/pusht/pusht_cchi_v7_replay.zarr
     horizon: ${horizon}
     pad_before: 1
     pad_after: 7
