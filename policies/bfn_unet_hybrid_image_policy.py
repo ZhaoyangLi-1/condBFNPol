@@ -86,12 +86,14 @@ class UnetBFNWrapper(BFNetwork):
         # ConditionalUnet1D expects [B, T, input_dim] and internally rearranges to [B, input_dim, T]
         x = x.view(B, self.horizon, self.action_dim)  # [B, horizon, action_dim]
         
-        # Convert BFN time to integer timesteps for U-Net
+        # Convert BFN time [0, 1] to diffusion timesteps
         if t.dim() == 0:
             t = t.expand(B)
         
-        # Scale t from [0, 1] to integer timesteps
-        timesteps = (t * 999).long().clamp(0, 999)
+        # Scale t from [0, 1] to float timesteps in [0, 999]
+        # Keep as float for proper sinusoidal embedding interpolation
+        # The U-Net's sinusoidal embedding will handle float values
+        timesteps = t * 999.0
         
         # Forward through U-Net
         out = self.model(
