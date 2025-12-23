@@ -82,16 +82,9 @@ class UnetBFNWrapper(BFNetwork):
         """
         B = x.shape[0]
         
-        print(f"[DEBUG] UnetBFNWrapper.forward input x.shape: {x.shape}")
-        print(f"[DEBUG] self.horizon={self.horizon}, self.action_dim={self.action_dim}")
-        
-        # Reshape from [B, horizon * action_dim] to [B, action_dim, horizon]
-        # The flat tensor is ordered as [t0_a0, t0_a1, t1_a0, t1_a1, ...] (time-major)
-        # We need [B, action_dim, horizon] for Conv1d
+        # Reshape from [B, horizon * action_dim] to [B, horizon, action_dim]
+        # ConditionalUnet1D expects [B, T, input_dim] and internally rearranges to [B, input_dim, T]
         x = x.view(B, self.horizon, self.action_dim)  # [B, horizon, action_dim]
-        print(f"[DEBUG] After view: x.shape={x.shape}")
-        x = x.permute(0, 2, 1).contiguous()  # [B, action_dim, horizon]
-        print(f"[DEBUG] After permute: x.shape={x.shape}")
         
         # Convert BFN time to integer timesteps for U-Net
         if t.dim() == 0:
@@ -107,9 +100,8 @@ class UnetBFNWrapper(BFNetwork):
             global_cond=cond,
         )
         
-        # Convert back to [B, horizon * action_dim]
-        out = out.permute(0, 2, 1).contiguous()  # [B, horizon, action_dim]
-        out = out.view(B, -1)  # [B, horizon * action_dim]
+        # U-Net outputs [B, horizon, action_dim], flatten to [B, horizon * action_dim]
+        out = out.reshape(B, -1)  # [B, horizon * action_dim]
         
         return out
 

@@ -97,9 +97,9 @@ class UnetFlowWrapper(BFNetwork):
         """
         B = x.shape[0]
         
-        # Reshape from [B, horizon * action_dim] to [B, action_dim, horizon]
+        # Reshape from [B, horizon * action_dim] to [B, horizon, action_dim]
+        # ConditionalUnet1D expects [B, T, input_dim] and internally rearranges to [B, input_dim, T]
         x = x.view(B, self.horizon, self.action_dim)  # [B, horizon, action_dim]
-        x = x.permute(0, 2, 1).contiguous()  # [B, action_dim, horizon]
         
         # Convert flow time to integer timesteps for U-Net
         if t.dim() == 0:
@@ -115,9 +115,8 @@ class UnetFlowWrapper(BFNetwork):
             global_cond=cond,
         )
         
-        # Convert back to [B, horizon * action_dim]
-        out = out.permute(0, 2, 1).contiguous()  # [B, horizon, action_dim]
-        out = out.view(B, -1)  # [B, horizon * action_dim]
+        # U-Net outputs [B, horizon, action_dim], flatten to [B, horizon * action_dim]
+        out = out.reshape(B, -1)  # [B, horizon * action_dim]
         
         return out
 
