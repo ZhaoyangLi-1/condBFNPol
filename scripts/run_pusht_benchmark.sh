@@ -136,17 +136,13 @@ echo "Output Dir: $OUTPUT_DIR"
 echo "Num Workers: $NUM_WORKERS"
 echo "======================================"
 
-# Get script directory and cd to project root
-SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
-PROJECT_ROOT="$( cd "$SCRIPT_DIR/.." && pwd )"
-
-# IMPORTANT: Change to project root directory
-echo "Changing to project root: $PROJECT_ROOT"
-cd "$PROJECT_ROOT" || { echo "ERROR: Cannot cd to $PROJECT_ROOT"; exit 1; }
-pwd
-
-# Create logs directory if it doesn't exist
-mkdir -p logs
+# Verify we're in the project directory (already set by SLURM --chdir or earlier cd)
+if [ ! -f "scripts/train_workspace.py" ]; then
+    echo "ERROR: Cannot find scripts/train_workspace.py in $(pwd)"
+    echo "Please run from condBFNPol project root"
+    exit 1
+fi
+echo "Project root confirmed: $(pwd)"
 
 # ================== Run Benchmark ==================
 for SEED in $SEEDS; do
