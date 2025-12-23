@@ -430,8 +430,10 @@ class BFNUnetHybridImagePolicy(BasePolicy):
         Implements the official NNAISENSE BFN loss (CtsBayesianFlowLoss.cts_time_loss):
         - posterior_var = min_variance^t where min_variance = sigma_1^2
         - alpha_t = 1 - posterior_var  
-        - C = -0.5 * log(min_variance) = -log(sigma_1)
-        - loss = C * MSE_elementwise / posterior_var
+        - C = -0.5 * log(min_variance)
+        - loss = C * MSE / posterior_var
+        
+        The network directly predicts x (data prediction mode) for stable training.
         
         Args:
             batch: Dictionary containing 'obs' and 'action' tensors
@@ -462,33 +464,25 @@ class BFNUnetHybridImagePolicy(BasePolicy):
         # Following NNAISENSE CtsBayesianFlow:
         # min_variance = sigma_1^2
         # posterior_var = min_variance^t = sigma_1^(2t)
-        # alpha_t = 1 - posterior_var (same as gamma in other implementations)
+        # alpha_t = 1 - posterior_var
         min_variance = self.sigma_1 ** 2
         posterior_var = torch.pow(torch.tensor(min_variance, device=device, dtype=dtype), t_expanded)
         alpha_t = 1.0 - posterior_var
         
         # Sample input params (mean) from Bayesian Flow distribution
-        # mean_mean = alpha_t * x
-        # mean_var = alpha_t * posterior_var = alpha_t * (1 - alpha_t)
-        # mean = mean_mean + sqrt(mean_var) * noise
+        # mean = alpha_t * x + sqrt(alpha_t * posterior_var) * noise
         mean_var = alpha_t * posterior_var
         mean_std = (mean_var + 1e-9).sqrt()
         noise = torch.randn_like(x)
         mu = alpha_t * x + mean_std * noise
         
-        # Forward through network to get eps prediction
-        eps_pred = self.unet_wrapper(mu, t, cond=cond)
-        
-        # Convert noise prediction to data prediction
-        # x_pred = (mu / alpha_t) - sqrt((1 - alpha_t) / alpha_t) * eps
-        # Same as: x_pred = (mu / alpha_t) - sqrt(posterior_var / alpha_t) * eps
-        alpha_t_safe = alpha_t.clamp(min=1e-8)
-        x_pred = (mu / alpha_t_safe) - (posterior_var / alpha_t_safe).sqrt() * eps_pred
+        # Forward through network - network directly predicts x (data prediction mode)
+        # The U-Net output is interpreted as x_pred, not noise
+        x_pred = self.unet_wrapper(mu, t, cond=cond)
         
         # Compute continuous-time loss following NNAISENSE CtsBayesianFlowLoss:
         # C = -0.5 * log(min_variance)
-        # mse_loss = (x - x_pred)^2  (element-wise)
-        # loss = C * mse_loss / posterior_var
+        # loss = C * MSE / posterior_var
         C = -0.5 * torch.log(torch.tensor(min_variance, device=device, dtype=dtype))
         mse_loss = (x - x_pred).square()
         posterior_var_clamped = posterior_var.clamp(min=1e-6)

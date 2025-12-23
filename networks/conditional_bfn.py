@@ -43,6 +43,7 @@ class ContinuousBFN(nn.Module):
         device_str: str = "cpu",
         dtype_str: str = "float32",
         eps: float = 1e-9,
+        data_prediction: bool = True,
     ):
         """
         Bayesian flow network for continuous data.
@@ -54,11 +55,14 @@ class ContinuousBFN(nn.Module):
             device_str: PyTorch device to use
             dtype_str: PyTorch dtype to use
             eps: stability parameter
+            data_prediction: If True, network directly predicts x (data).
+                           If False, network predicts noise eps.
         """
         super().__init__()
         self.device = t.device(device_str)
         self.dtype = str_to_torch_dtype(dtype_str)
         self.dim = dim if isinstance(dim, Tuple) else (dim,)
+        self.data_prediction = data_prediction
 
         dtype_eps = t.finfo(self.dtype).eps
         self.eps = eps if eps < dtype_eps else dtype_eps
@@ -105,7 +109,7 @@ class ContinuousBFN(nn.Module):
         zeros = t.zeros_like(mu)
         if cond is not None:
             if exists(cond_scale) or exists(rescaled_phi):
-                eps = self.net.forward_with_cond_scale(
+                out = self.net.forward_with_cond_scale(
                     mu,
                     time.view(-1),
                     cond,
@@ -113,10 +117,19 @@ class ContinuousBFN(nn.Module):
                     rescaled_phi=default(rescaled_phi, 0.0),
                 )
             else:
-                eps = self.net(mu, time.view(-1), cond)
+                out = self.net(mu, time.view(-1), cond)
         else:
-            eps = self.net(mu, time.view(-1))
-        x = (mu / gamma) - t.sqrt((1.0 - gamma) / gamma) * eps
+            out = self.net(mu, time.view(-1))
+        
+        # Check if network uses data prediction mode (outputs x directly)
+        # or noise prediction mode (outputs eps, needs conversion)
+        if getattr(self, 'data_prediction', True):
+            # Network directly outputs x_pred
+            x = out
+        else:
+            # Network outputs noise eps, convert to x
+            x = (mu / gamma) - t.sqrt((1.0 - gamma) / gamma) * out
+        
         x = t.clip(x, x_min, x_max)
         return t.where(time < t_min, zeros, x)
 
