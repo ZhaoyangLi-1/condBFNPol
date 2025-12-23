@@ -402,6 +402,10 @@ class ConditionalBFNUnetHybridImagePolicy(BasePolicy):
         # Reshape to [B, T*Do]
         cond = nobs_features.reshape(B, -1)
         
+        # Ensure BFN uses the same device as the conditioning tensor
+        self.bfn.device = cond.device
+        self.bfn.dtype = cond.dtype
+        
         # Sample from BFN with optional classifier-free guidance
         cfg = self.bfn_config
         if cfg.cond_scale is not None and cfg.cond_scale != 1.0:

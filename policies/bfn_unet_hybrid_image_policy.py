@@ -389,6 +389,11 @@ class BFNUnetHybridImagePolicy(BasePolicy):
         # Reshape to [B, T*Do]
         cond = nobs_features.reshape(B, -1)
         
+        # Ensure BFN uses the same device as the conditioning tensor
+        # (BFN's self.device is set at init and doesn't update when model.to(device) is called)
+        self.bfn.device = cond.device
+        self.bfn.dtype = cond.dtype
+        
         # Sample from BFN
         # sample() with cond returns [B, n_samples, dim], we use n_samples=1
         naction = self.bfn.sample(
