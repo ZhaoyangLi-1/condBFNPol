@@ -40,15 +40,35 @@ export PYTHONPATH=.
 export HYDRA_FULL_ERROR=1
 
 # ================== Disk Space Management ==================
-# Use scratch storage for outputs (NOT home directory!)
-SCRATCH_DIR="/dss/dssfs04/scratch/ge87gob2"
+# Try to find/create a suitable output directory
+# Priority: 1) User-specified SCRATCH_DIR, 2) Common LRZ scratch paths, 3) Home directory
+
+if [ -z "$SCRATCH_DIR" ]; then
+    # Try common LRZ scratch locations
+    for candidate in \
+        "/dss/dssfs04/scratch/ge87gob2" \
+        "/dss/dsshome1/0D/ge87gob2/scratch" \
+        "$HOME/scratch" \
+        "$WORK" \
+        "$SCRATCH" \
+        "$HOME/outputs"; do
+        if [ -d "$(dirname "$candidate")" ] && [ -w "$(dirname "$candidate")" ]; then
+            SCRATCH_DIR="$candidate"
+            break
+        fi
+    done
+    # Fallback to home directory
+    SCRATCH_DIR="${SCRATCH_DIR:-$HOME/condBFNPol_outputs}"
+fi
+
+echo "Using scratch directory: $SCRATCH_DIR"
 OUTPUT_DIR="${SCRATCH_DIR}/outputs"
-mkdir -p "$OUTPUT_DIR"
+mkdir -p "$OUTPUT_DIR" || { echo "ERROR: Cannot create $OUTPUT_DIR"; exit 1; }
 
 # Set wandb to use scratch storage
 export WANDB_DIR="${SCRATCH_DIR}/wandb"
 export WANDB_CACHE_DIR="${SCRATCH_DIR}/wandb_cache"
-mkdir -p "$WANDB_DIR" "$WANDB_CACHE_DIR"
+mkdir -p "$WANDB_DIR" "$WANDB_CACHE_DIR" 2>/dev/null || true
 
 # Clean up old wandb runs from home (optional, uncomment if needed)
 # rm -rf ~/condBFNPol/wandb/run-*
