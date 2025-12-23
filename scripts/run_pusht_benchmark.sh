@@ -7,14 +7,14 @@
 #SBATCH --time=48:00:00                  # 48 hour limit for full benchmark
 #SBATCH --output=logs/benchmark-%j.out   # Save logs here
 
-# PushT Benchmark: Flow Matching vs Diffusion Policy
+# PushT Benchmark: BFN vs Diffusion Policy
 #
-# This script runs the full benchmark comparing Flow Matching and Diffusion policies
+# This script runs the full benchmark comparing Bayesian Flow Networks and Diffusion policies
 # on the PushT task with multiple seeds.
 #
-# Flow Matching is preferred over BFN because training and inference are perfectly aligned:
-# - Training: predict velocity v = data - noise
-# - Inference: integrate ODE from noise to data
+# BFN (Bayesian Flow Network):
+# - Training: predict x from noisy mu, weighted BFN loss
+# - Inference: Bayesian posterior updates
 #
 # Usage (interactive):
 #   ./scripts/run_pusht_benchmark.sh [--seeds "42 43 44"] [--epochs 300]
@@ -98,7 +98,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 echo "======================================"
-echo "PushT Benchmark: Flow Matching vs Diffusion"
+echo "PushT Benchmark: BFN vs Diffusion"
 echo "======================================"
 echo "Seeds: $SEEDS"
 echo "Epochs: $EPOCHS"
@@ -124,12 +124,12 @@ for SEED in $SEEDS; do
     echo "Running seed $SEED"
     echo "======================================"
     
-    # Train Flow Matching (recommended over BFN - training/inference aligned)
+    # Train BFN (Bayesian Flow Network)
     echo ""
-    echo "--- Training Flow Matching (seed=$SEED) ---"
+    echo "--- Training BFN (seed=$SEED) ---"
     python scripts/train_workspace.py \
-        --config-name=benchmark_flow_pusht \
-        hydra.run.dir="data/outputs/\${now:%Y.%m.%d}/\${now:%H.%M.%S}_flow_seed${SEED}" \
+        --config-name=benchmark_bfn_pusht \
+        hydra.run.dir="data/outputs/\${now:%Y.%m.%d}/\${now:%H.%M.%S}_bfn_seed${SEED}" \
         task.dataset.zarr_path="$DATA_PATH" \
         training.seed=$SEED \
         training.device=$DEVICE \
@@ -145,7 +145,7 @@ for SEED in $SEEDS; do
     echo "--- Training Diffusion (seed=$SEED) ---"
     python scripts/train_workspace.py \
         --config-name=benchmark_diffusion_pusht \
-        hydra.run.dir="/benchmark/\${now:%Y.%m.%d}/\${now:%H.%M.%S}_diffusion_seed${SEED}" \
+        hydra.run.dir="data/outputs/\${now:%Y.%m.%d}/\${now:%H.%M.%S}_diffusion_seed${SEED}" \
         task.dataset.zarr_path="$DATA_PATH" \
         training.seed=$SEED \
         training.device=$DEVICE \
