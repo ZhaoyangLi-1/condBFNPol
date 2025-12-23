@@ -11,6 +11,7 @@ The policy uses:
 
 from __future__ import annotations
 
+import math
 from typing import Any, Dict, Optional, Union
 
 import torch
@@ -419,61 +420,74 @@ class BFNUnetHybridImagePolicy(BasePolicy):
         device: torch.device,
         dtype: torch.dtype,
     ) -> torch.Tensor:
-        """Sample using proper BFN Bayesian updates (matching training distribution).
+        """Sample using true BFN Bayesian posterior updates.
         
-        This implements the exact BFN sampling from the paper:
-        - Initialize mu=0, rho=1
-        - For each step: predict x, sample y from sender, update posterior
+        From the original NNAISENSE implementation (bfn.py):
+        - min_variance = σ₁² (our sigma_1 is σ₁, so min_variance = sigma_1²)
+        - Initialize: μ=0 (prior mean), ρ=1 (prior precision, scalar)
+        - For step i=1 to n:
+            - t = (i-1)/n
+            - Get network output x̂ from μ at time t
+            - α_i = σ₁^(-2i/n) × (1 - σ₁^(2/n))  [precision increment]
+            - y ~ N(x̂, 1/√α_i)  [sender sample]
+            - μ = (ρ·μ + α_i·y) / (ρ + α_i)  [Bayesian update]
+            - ρ = ρ + α_i
+        - Final: return network(μ, t=1)
         """
         n_steps = self.n_timesteps
         sigma_1 = self.sigma_1
-        s1 = torch.tensor([sigma_1], device=device, dtype=dtype)
         
-        # Initialize
+        # Initialize: prior mean=0, prior precision=1 (scalar, same for all samples)
         mu = torch.zeros(batch_size, dim, device=device, dtype=dtype)
-        rho = 1.0
+        rho = 1.0  # Scalar precision, same for all samples
         
         for i in range(1, n_steps + 1):
-            # Time for this step
+            # Time for network: t = (i-1)/n
             t_val = (i - 1) / n_steps
             t_batch = torch.full((batch_size,), t_val, device=device, dtype=dtype)
             
-            # Compute gamma at this time
-            gamma = 1.0 - s1.pow(2.0 * t_val)
-            
-            # Predict x from current mu
+            # Network predicts clean data x̂ from current posterior mean μ
             x_pred = self.unet_wrapper(mu, t_batch, cond=cond)
-            x_pred = x_pred.clamp(-1.0, 1.0)  # Clip to valid range
             
-            # Compute alpha (precision increase at this step)
-            alpha = s1.pow(-2.0 * i / n_steps) * (1.0 - s1.pow(2.0 / n_steps))
+            # Precision increment: α_i = σ₁^(-2i/n) × (1 - σ₁^(2/n))
+            # From get_alpha() in original: sigma_1 ** (-2 * i / n_steps) * (1 - sigma_1 ** (2 / n_steps))
+            alpha_i = (sigma_1 ** (-2.0 * i / n_steps)) * (1.0 - sigma_1 ** (2.0 / n_steps))
             
-            # Sample y from sender distribution: y ~ N(x_pred, 1/sqrt(alpha))
-            std = (1.0 / alpha + 1e-9).sqrt()
-            y = x_pred + std * torch.randn_like(x_pred)
+            # Sender distribution: y ~ N(x̂, 1/√α_i)
+            # From get_sender_dist(): D.Normal(x, 1.0 / alpha**0.5)
+            sender_std = 1.0 / (alpha_i ** 0.5)
+            y = x_pred + sender_std * torch.randn_like(x_pred)
             
-            # Bayesian update of posterior mean
-            mu = (rho * mu + alpha * y) / (rho + alpha)
-            rho = rho + alpha
+            # Bayesian update (from update_input_params):
+            # new_mean = (input_precision * input_mean + alpha * y) / new_precision
+            # new_precision = input_precision + alpha
+            new_rho = rho + alpha_i
+            mu = (rho * mu + alpha_i * y) / new_rho
+            rho = new_rho
         
         # Final prediction at t=1
         t_final = torch.ones(batch_size, device=device, dtype=dtype)
-        gamma_final = 1.0 - s1.pow(2.0)
         x_final = self.unet_wrapper(mu, t_final, cond=cond)
-        x_final = x_final.clamp(-1.0, 1.0)
         
-        return x_final
+        return x_final.clamp(-1.0, 1.0)
     
     # ==================== Training ====================
     
     def compute_loss(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
-        """Compute BFN continuous-time loss L_infinity(x).
+        """Compute BFN continuous-time loss (cts_time_loss from original).
         
-        From the BFN paper, the continuous loss is:
-            L = -log(sigma_1) * ||x - x_pred||_2 / sigma_1^(2t)
+        From the original NNAISENSE implementation (bfn.py, CtsBayesianFlowLoss):
         
-        This weights errors more heavily at later times (t close to 1)
-        where the model should be more accurate.
+            C = -0.5 * log(min_variance) = -log(σ₁)  [since min_variance = σ₁²]
+            posterior_var = min_variance^t = σ₁^(2t)
+            loss = C * mse / posterior_var
+                 = -log(σ₁) * ||x - x̂||² / σ₁^(2t)
+        
+        Input distribution (from forward() in CtsBayesianFlow):
+            post_var = σ₁^(2t)
+            α_t = 1 - post_var = 1 - σ₁^(2t)  [this is gamma]
+            mean = α_t * x + sqrt(α_t * post_var) * noise
+                 = γ * x + sqrt(γ * (1-γ)) * noise
         
         Args:
             batch: Dictionary containing 'obs' and 'action' tensors
@@ -497,36 +511,47 @@ class BFNUnetHybridImagePolicy(BasePolicy):
         # Flatten actions: [B, T, Da] -> [B, T * Da]
         x = naction.reshape(B, -1)
         
-        # Sample time uniformly in [0, 1]
+        # Sample time uniformly in (0, 1)
+        # Original doesn't clamp, but we avoid exact 0 for numerical stability
         t = torch.rand(B, device=device, dtype=dtype)
-        t_expanded = t.unsqueeze(-1)  # [B, 1]
+        t = t.clamp(min=1e-5)  # Avoid t=0 where gamma=0
         
-        # BFN parameters
+        # BFN parameter (this is σ₁, original uses min_variance = σ₁²)
         sigma_1 = self.sigma_1
-        s1 = torch.tensor([sigma_1], device=device, dtype=dtype)
         
-        # gamma = 1 - sigma_1^(2t)
-        gamma = 1.0 - s1.pow(2.0 * t_expanded)
+        # Posterior variance at time t: σ₁^(2t)
+        # From original: post_var = torch.pow(self.min_variance, t) = (σ₁²)^t = σ₁^(2t)
+        posterior_var = sigma_1 ** (2.0 * t)  # [B]
         
-        # Sample mu from the BFN input distribution: N(gamma*x, sqrt(gamma*(1-gamma)))
-        # This IS the marginal distribution of mu at time t (proven in BFN paper)
-        std = (gamma * (1.0 - gamma) + 1e-9).sqrt()
-        mu = gamma * x + std * torch.randn_like(x)
+        # α_t = 1 - σ₁^(2t) = γ(t) [accuracy/signal ratio at time t]
+        alpha_t = 1.0 - posterior_var  # [B]
         
-        # Network predicts clean data x from noisy mu
+        # Expand for broadcasting with x: [B] -> [B, 1]
+        alpha_t_expanded = alpha_t.unsqueeze(-1)
+        posterior_var_expanded = posterior_var.unsqueeze(-1)
+        
+        # Sample μ from input distribution (from original forward()):
+        # mean_mean = α_t * x
+        # mean_var = α_t * post_var = γ * (1-γ)
+        # mean = mean_mean + sqrt(mean_var) * noise
+        mean_var = alpha_t_expanded * posterior_var_expanded  # γ * (1-γ)
+        mean_std = mean_var.sqrt()
+        mu = alpha_t_expanded * x + mean_std * torch.randn_like(x)
+        
+        # Network predicts clean data x from noisy μ
         x_pred = self.unet_wrapper(mu, t, cond=cond)
         
-        # BFN continuous-time loss: L = -log(sigma_1) * ||x - x_pred||_2 / sigma_1^(2t)
-        # ||x - x_pred||_2 is L2 norm (not squared)
-        diff = (x - x_pred).pow(2.0).sum(-1).sqrt()  # [B] L2 norm per sample
+        # Loss: C * MSE / posterior_var
+        # C = -0.5 * log(min_variance) = -0.5 * log(σ₁²) = -log(σ₁)
+        C = -math.log(sigma_1)
         
-        # Weight by -log(sigma_1) / sigma_1^(2t)
-        # Note: -log(sigma_1) > 0 since sigma_1 < 1
-        weight = -s1.log() / s1.pow(2.0 * t)  # [B]
+        # MSE per element, then mean over dimensions
+        mse = ((x - x_pred) ** 2).mean(dim=-1)  # [B]
         
-        loss = (weight * diff).mean()
+        # Weight by 1/σ₁^(2t)
+        loss = C * mse / (posterior_var + 1e-8)
         
-        return loss
+        return loss.mean()
     
     def set_actions(self, action: torch.Tensor):
         """Set actions for inpainting (not used with BFN)."""

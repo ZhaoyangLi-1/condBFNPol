@@ -11,6 +11,7 @@ The policy uses:
 
 from __future__ import annotations
 
+import math
 from typing import Any, Dict, Optional, Union, NamedTuple
 
 import torch
@@ -440,33 +441,31 @@ class ConditionalBFNUnetHybridImagePolicy(BasePolicy):
         sigma_1: float,
         n_steps: int,
     ) -> torch.Tensor:
-        """Sample using proper BFN Bayesian updates."""
-        s1 = torch.tensor([sigma_1], device=device, dtype=dtype)
-        
-        # Initialize
+        """Sample using true BFN Bayesian posterior updates (from original NNAISENSE code)."""
+        # Initialize: prior mean=0, prior precision=1 (scalar)
         mu = torch.zeros(batch_size, dim, device=device, dtype=dtype)
-        rho = 1.0
+        rho = 1.0  # Scalar precision
         
         for i in range(1, n_steps + 1):
             t_val = (i - 1) / n_steps
             t_batch = torch.full((batch_size,), t_val, device=device, dtype=dtype)
             
-            # Predict x from current mu
+            # Predict clean data
             x_pred = self.unet_wrapper(mu, t_batch, cond=cond)
-            x_pred = x_pred.clamp(-1.0, 1.0)
             
-            # Compute alpha
-            alpha = s1.pow(-2.0 * i / n_steps) * (1.0 - s1.pow(2.0 / n_steps))
+            # Precision increment: α_i = σ₁^(-2i/n) × (1 - σ₁^(2/n))
+            alpha_i = (sigma_1 ** (-2.0 * i / n_steps)) * (1.0 - sigma_1 ** (2.0 / n_steps))
             
-            # Sample y from sender
-            std = (1.0 / alpha + 1e-9).sqrt()
-            y = x_pred + std * torch.randn_like(x_pred)
+            # Sender distribution: y ~ N(x̂, 1/√α_i)
+            sender_std = 1.0 / (alpha_i ** 0.5)
+            y = x_pred + sender_std * torch.randn_like(x_pred)
             
             # Bayesian update
-            mu = (rho * mu + alpha * y) / (rho + alpha)
-            rho = rho + alpha
+            new_rho = rho + alpha_i
+            mu = (rho * mu + alpha_i * y) / new_rho
+            rho = new_rho
         
-        # Final prediction
+        # Final prediction at t=1
         t_final = torch.ones(batch_size, device=device, dtype=dtype)
         x_final = self.unet_wrapper(mu, t_final, cond=cond)
         return x_final.clamp(-1.0, 1.0)
@@ -483,12 +482,12 @@ class ConditionalBFNUnetHybridImagePolicy(BasePolicy):
         n_steps: int,
         cond_scale: float,
     ) -> torch.Tensor:
-        """Sample using BFN with classifier-free guidance."""
-        s1 = torch.tensor([sigma_1], device=device, dtype=dtype)
+        """Sample using true BFN with classifier-free guidance."""
         null_cond = torch.zeros_like(cond)
         
+        # Initialize: prior mean=0, prior precision=1 (scalar)
         mu = torch.zeros(batch_size, dim, device=device, dtype=dtype)
-        rho = 1.0
+        rho = 1.0  # Scalar precision
         
         for i in range(1, n_steps + 1):
             t_val = (i - 1) / n_steps
@@ -500,14 +499,18 @@ class ConditionalBFNUnetHybridImagePolicy(BasePolicy):
             
             # CFG interpolation
             x_pred = x_uncond + cond_scale * (x_cond - x_uncond)
-            x_pred = x_pred.clamp(-1.0, 1.0)
             
-            alpha = s1.pow(-2.0 * i / n_steps) * (1.0 - s1.pow(2.0 / n_steps))
-            std = (1.0 / alpha + 1e-9).sqrt()
-            y = x_pred + std * torch.randn_like(x_pred)
+            # Precision increment: α_i = σ₁^(-2i/n) × (1 - σ₁^(2/n))
+            alpha_i = (sigma_1 ** (-2.0 * i / n_steps)) * (1.0 - sigma_1 ** (2.0 / n_steps))
             
-            mu = (rho * mu + alpha * y) / (rho + alpha)
-            rho = rho + alpha
+            # Sender distribution: y ~ N(x̂, 1/√α_i)
+            sender_std = 1.0 / (alpha_i ** 0.5)
+            y = x_pred + sender_std * torch.randn_like(x_pred)
+            
+            # Bayesian update
+            new_rho = rho + alpha_i
+            mu = (rho * mu + alpha_i * y) / new_rho
+            rho = new_rho
         
         # Final with CFG
         t_final = torch.ones(batch_size, device=device, dtype=dtype)
@@ -516,10 +519,13 @@ class ConditionalBFNUnetHybridImagePolicy(BasePolicy):
         x_final = x_uncond + cond_scale * (x_cond - x_uncond)
         return x_final.clamp(-1.0, 1.0)
     
-    # ==================== Training ====================
+    # ==================== Training ======================================
     
     def compute_loss(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
-        """Compute BFN continuous-time loss with conditioning dropout for CFG.
+        """Compute BFN continuous-time loss (cts_time_loss from original NNAISENSE code).
+        
+        From original: loss = C * mse / posterior_var
+        where C = -log(σ₁), posterior_var = σ₁^(2t)
         
         Args:
             batch: Dictionary containing 'obs' and 'action' tensors
@@ -548,30 +554,35 @@ class ConditionalBFNUnetHybridImagePolicy(BasePolicy):
         # Flatten actions: [B, T, Da] -> [B, T * Da]
         x = naction.reshape(B, -1)
         
-        # Sample time uniformly in [0, 1]
+        # Sample time uniformly in (0, 1)
         t = torch.rand(B, device=device, dtype=dtype)
-        t_expanded = t.unsqueeze(-1)
+        t = t.clamp(min=1e-5)  # Avoid t=0
         
-        # BFN parameters
+        # BFN parameter
         sigma_1 = self.bfn_config.sigma_1
-        s1 = torch.tensor([sigma_1], device=device, dtype=dtype)
         
-        # gamma = 1 - sigma_1^(2t)
-        gamma = 1.0 - s1.pow(2.0 * t_expanded)
+        # posterior_var = σ₁^(2t)
+        posterior_var = sigma_1 ** (2.0 * t)  # [B]
         
-        # Sample mu from BFN input distribution
-        std = (gamma * (1.0 - gamma) + 1e-9).sqrt()
-        mu = gamma * x + std * torch.randn_like(x)
+        # α_t = 1 - σ₁^(2t) = γ(t)
+        alpha_t = 1.0 - posterior_var  # [B]
+        alpha_t_expanded = alpha_t.unsqueeze(-1)
+        posterior_var_expanded = posterior_var.unsqueeze(-1)
+        
+        # Sample μ from input distribution: N(α_t*x, sqrt(α_t*posterior_var))
+        mean_var = alpha_t_expanded * posterior_var_expanded
+        mean_std = mean_var.sqrt()
+        mu = alpha_t_expanded * x + mean_std * torch.randn_like(x)
         
         # Predict x
         x_pred = self.unet_wrapper(mu, t, cond=cond)
         
-        # BFN continuous-time loss
-        diff = (x - x_pred).pow(2.0).sum(-1).sqrt()
-        weight = -s1.log() / s1.pow(2.0 * t)
-        loss = (weight * diff).mean()
+        # Loss: C * MSE / posterior_var where C = -log(σ₁)
+        C = -math.log(sigma_1)
+        mse = ((x - x_pred) ** 2).mean(dim=-1)  # [B]
+        loss = C * mse / (posterior_var + 1e-8)
         
-        return loss
+        return loss.mean()
     
     def set_actions(self, action: torch.Tensor):
         """Set actions for inpainting (not used with BFN)."""
