@@ -427,9 +427,11 @@ class BFNUnetHybridImagePolicy(BasePolicy):
     def compute_loss(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
         """Compute BFN continuous-time loss for training.
         
-        Implements the official BFN loss from NNAISENSE:
-        loss = C * MSE / posterior_var
-        where C = -log(sigma_1) and posterior_var = sigma_1^(2t)
+        Implements the official NNAISENSE BFN loss (CtsBayesianFlowLoss.cts_time_loss):
+        - posterior_var = min_variance^t where min_variance = sigma_1^2
+        - alpha_t = 1 - posterior_var  
+        - C = -0.5 * log(min_variance) = -log(sigma_1)
+        - loss = C * MSE_elementwise / posterior_var
         
         Args:
             batch: Dictionary containing 'obs' and 'action' tensors
@@ -455,35 +457,44 @@ class BFNUnetHybridImagePolicy(BasePolicy):
         
         # Sample time uniformly in [0, 1]
         t = torch.rand(B, device=device, dtype=dtype)
-        
-        # BFN forward pass: sample input parameters at time t
-        # Following official implementation from torch_bfn
-        sigma_1 = self.sigma_1
-        s1 = torch.tensor([sigma_1], device=device, dtype=dtype)
         t_expanded = t.unsqueeze(-1)  # [B, 1]
         
-        # gamma = 1 - sigma_1^(2t)
-        gamma = 1.0 - s1.pow(2.0 * t_expanded)
+        # Following NNAISENSE CtsBayesianFlow:
+        # min_variance = sigma_1^2
+        # posterior_var = min_variance^t = sigma_1^(2t)
+        # alpha_t = 1 - posterior_var (same as gamma in other implementations)
+        min_variance = self.sigma_1 ** 2
+        posterior_var = torch.pow(torch.tensor(min_variance, device=device, dtype=dtype), t_expanded)
+        alpha_t = 1.0 - posterior_var
         
-        # Sample mu from N(gamma * x, sqrt(gamma * (1 - gamma)))
-        # std = sqrt(gamma * (1 - gamma) + eps) for numerical stability
-        std = (gamma * (1.0 - gamma) + 1e-9).sqrt()
-        mu = gamma * x + std * torch.randn_like(x)
+        # Sample input params (mean) from Bayesian Flow distribution
+        # mean_mean = alpha_t * x
+        # mean_var = alpha_t * posterior_var = alpha_t * (1 - alpha_t)
+        # mean = mean_mean + sqrt(mean_var) * noise
+        mean_var = alpha_t * posterior_var
+        mean_std = (mean_var + 1e-9).sqrt()
+        noise = torch.randn_like(x)
+        mu = alpha_t * x + mean_std * noise
         
         # Forward through network to get eps prediction
         eps_pred = self.unet_wrapper(mu, t, cond=cond)
         
-        # Convert noise prediction to data prediction: x = (mu / gamma) - sqrt((1-gamma)/gamma) * eps
-        # Handle gamma=0 case (t=0) by using zeros
-        gamma_safe = gamma.clamp(min=1e-8)
-        x_pred = (mu / gamma_safe) - ((1.0 - gamma) / gamma_safe).sqrt() * eps_pred
+        # Convert noise prediction to data prediction
+        # x_pred = (mu / alpha_t) - sqrt((1 - alpha_t) / alpha_t) * eps
+        # Same as: x_pred = (mu / alpha_t) - sqrt(posterior_var / alpha_t) * eps
+        alpha_t_safe = alpha_t.clamp(min=1e-8)
+        x_pred = (mu / alpha_t_safe) - (posterior_var / alpha_t_safe).sqrt() * eps_pred
         
-        # Compute continuous-time loss following official BFN:
-        # diff = ||x - x_pred||_2 (L2 norm)
-        # loss = -log(sigma_1) * diff / sigma_1^(2t)
-        diff = (x - x_pred).pow(2.0).sum(-1).sqrt()  # [B] L2 norm
-        loss = -(s1.log() * diff / s1.pow(2.0 * t))  # [B]
+        # Compute continuous-time loss following NNAISENSE CtsBayesianFlowLoss:
+        # C = -0.5 * log(min_variance)
+        # mse_loss = (x - x_pred)^2  (element-wise)
+        # loss = C * mse_loss / posterior_var
+        C = -0.5 * torch.log(torch.tensor(min_variance, device=device, dtype=dtype))
+        mse_loss = (x - x_pred).square()
+        posterior_var_clamped = posterior_var.clamp(min=1e-6)
+        loss = C * mse_loss / posterior_var_clamped
         
+        # Mean over all dimensions
         return loss.mean()
     
     def set_actions(self, action: torch.Tensor):
