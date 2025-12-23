@@ -404,9 +404,12 @@ class BFNUnetHybridImagePolicy(BasePolicy):
         action = naction[:, start:end]
         
         # Unnormalize
-        result = {'action': action}
-        result = self.normalizer['action'].unnormalize(result)
+        action = self.normalizer['action'].unnormalize(action)
         
+        result = {
+            'action': action,
+            'action_pred': naction
+        }
         return result
     
     # ==================== Training ====================
@@ -420,10 +423,10 @@ class BFNUnetHybridImagePolicy(BasePolicy):
         Returns:
             Scalar loss tensor
         """
-        # Normalize batch
-        nbatch = self.normalizer.normalize(batch)
-        nobs = nbatch['obs']
-        naction = nbatch['action']
+        # Normalize inputs
+        # obs is a dict with keys like 'image', 'agent_pos'
+        nobs = self.normalizer.normalize(batch['obs'])
+        naction = self.normalizer['action'].normalize(batch['action'])
         
         B = naction.shape[0]
         T = self.horizon

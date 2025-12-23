@@ -423,9 +423,12 @@ class ConditionalBFNUnetHybridImagePolicy(BasePolicy):
         action = naction[:, start:end]
         
         # Unnormalize
-        result = {'action': action}
-        result = self.normalizer['action'].unnormalize(result)
+        action = self.normalizer['action'].unnormalize(action)
         
+        result = {
+            'action': action,
+            'action_pred': naction.reshape(B, T, Da)
+        }
         return result
     
     def _sample_with_cfg(
@@ -467,10 +470,9 @@ class ConditionalBFNUnetHybridImagePolicy(BasePolicy):
         Returns:
             Scalar loss tensor
         """
-        # Normalize batch
-        nbatch = self.normalizer.normalize(batch)
-        nobs = nbatch['obs']
-        naction = nbatch['action']
+        # Normalize inputs separately
+        nobs = self.normalizer.normalize(batch['obs'])
+        naction = self.normalizer['action'].normalize(batch['action'])
         
         B = naction.shape[0]
         T = self.horizon
