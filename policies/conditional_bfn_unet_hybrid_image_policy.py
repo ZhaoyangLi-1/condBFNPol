@@ -408,12 +408,15 @@ class ConditionalBFNUnetHybridImagePolicy(BasePolicy):
             # Classifier-free guidance
             naction = self._sample_with_cfg(B, cond, cfg.cond_scale)
         else:
+            # sample() with cond returns [B, n_samples, dim], we use n_samples=1
             naction = self.bfn.sample(
-                batch_size=B,
+                n_samples=1,
                 sigma_1=cfg.sigma_1,
                 n_timesteps=cfg.n_timesteps,
                 cond=cond,
             )
+            # Squeeze the n_samples dimension: [B, 1, dim] -> [B, dim]
+            naction = naction.squeeze(1)
         
         # Reshape actions
         naction = naction.reshape(B, T, Da)
@@ -441,21 +444,21 @@ class ConditionalBFNUnetHybridImagePolicy(BasePolicy):
         """Sample with classifier-free guidance."""
         cfg = self.bfn_config
         
-        # Sample conditioned
+        # Sample conditioned - returns [B, 1, dim] with n_samples=1
         cond_sample = self.bfn.sample(
-            batch_size=batch_size,
+            n_samples=1,
             sigma_1=cfg.sigma_1,
             n_timesteps=cfg.n_timesteps,
             cond=cond,
-        )
+        ).squeeze(1)  # [B, dim]
         
-        # Sample unconditioned
+        # Sample unconditioned - returns [n_samples, dim] without cond
         uncond_sample = self.bfn.sample(
-            batch_size=batch_size,
+            n_samples=batch_size,
             sigma_1=cfg.sigma_1,
             n_timesteps=cfg.n_timesteps,
             cond=None,
-        )
+        )  # [B, dim]
         
         # Apply guidance
         return uncond_sample + cond_scale * (cond_sample - uncond_sample)

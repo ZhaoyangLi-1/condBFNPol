@@ -390,12 +390,15 @@ class BFNUnetHybridImagePolicy(BasePolicy):
         cond = nobs_features.reshape(B, -1)
         
         # Sample from BFN
+        # sample() with cond returns [B, n_samples, dim], we use n_samples=1
         naction = self.bfn.sample(
-            batch_size=B,
+            n_samples=1,
             sigma_1=self.sigma_1,
             n_timesteps=self.n_timesteps,
             cond=cond,
         )
+        # Squeeze the n_samples dimension: [B, 1, dim] -> [B, dim]
+        naction = naction.squeeze(1)
         
         # Reshape actions
         naction = naction.reshape(B, T, Da)
