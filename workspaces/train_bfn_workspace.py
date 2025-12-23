@@ -330,7 +330,17 @@ class TrainBFNWorkspace(BaseWorkspace):
                         pred_action = policy(obs)
                         
                         # Handle different action shapes
-                        if pred_action.ndim == 3 and gt_action.ndim == 2:
+                        # Policy returns [B, n_action_steps, Da], gt_action is [B, horizon, Da]
+                        # We need to compare only the overlapping timesteps
+                        if pred_action.ndim == 3 and gt_action.ndim == 3:
+                            # Get the number of action steps from prediction
+                            n_action_steps = pred_action.shape[1]
+                            # Slice ground truth to match (starting from n_obs_steps - 1)
+                            n_obs_steps = getattr(policy, 'n_obs_steps', 2)
+                            start_idx = n_obs_steps - 1
+                            end_idx = start_idx + n_action_steps
+                            gt_action = gt_action[:, start_idx:end_idx, :]
+                        elif pred_action.ndim == 3 and gt_action.ndim == 2:
                             pred_action = pred_action.reshape(pred_action.shape[0], -1)
                         elif pred_action.ndim == 2 and gt_action.ndim == 3:
                             gt_action = gt_action.reshape(gt_action.shape[0], -1)
