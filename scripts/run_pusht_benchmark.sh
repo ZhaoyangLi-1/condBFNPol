@@ -14,6 +14,7 @@ SEEDS="42 43 44"
 EPOCHS=300
 DEVICE="cuda:0"
 PROJECT="pusht_bfn_vs_diffusion"
+DATA_PATH=""  # Set to absolute path on cluster
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -34,6 +35,10 @@ while [[ $# -gt 0 ]]; do
             PROJECT="$2"
             shift 2
             ;;
+        --data-path)
+            DATA_PATH="$2"
+            shift 2
+            ;;
         *)
             echo "Unknown option: $1"
             exit 1
@@ -48,6 +53,7 @@ echo "Seeds: $SEEDS"
 echo "Epochs: $EPOCHS"
 echo "Device: $DEVICE"
 echo "WandB Project: $PROJECT"
+echo "Data Path: ${DATA_PATH:-data/pusht/pusht_cchi_v7_replay.zarr (default)}"
 echo "======================================"
 
 # Get script directory
@@ -63,6 +69,12 @@ for SEED in $SEEDS; do
     echo "Running seed $SEED"
     echo "======================================"
     
+    # Build data path override if specified
+    DATA_OVERRIDE=""
+    if [ -n "$DATA_PATH" ]; then
+        DATA_OVERRIDE="task.dataset.zarr_path=$DATA_PATH"
+    fi
+    
     # Train BFN
     echo ""
     echo "--- Training BFN (seed=$SEED) ---"
@@ -72,7 +84,8 @@ for SEED in $SEEDS; do
         training.device=$DEVICE \
         training.num_epochs=$EPOCHS \
         logging.project=$PROJECT \
-        logging.mode=online
+        logging.mode=online \
+        $DATA_OVERRIDE
     
     # Train Diffusion
     echo ""
@@ -83,7 +96,8 @@ for SEED in $SEEDS; do
         training.device=$DEVICE \
         training.num_epochs=$EPOCHS \
         logging.project=$PROJECT \
-        logging.mode=online
+        logging.mode=online \
+        $DATA_OVERRIDE
 done
 
 echo ""
