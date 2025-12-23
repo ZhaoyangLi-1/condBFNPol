@@ -6,6 +6,7 @@
 #SBATCH --mem=64G                        # 64GB RAM
 #SBATCH --time=48:00:00                  # 48 hour limit for full benchmark
 #SBATCH --output=logs/benchmark-%j.out   # Save logs here
+#SBATCH --chdir=/dss/dsshome1/0D/ge87gob2/condBFNPol  # Set working directory
 
 # PushT Benchmark: BFN vs Diffusion Policy
 #
@@ -25,6 +26,14 @@
 set -e
 
 # ================== Environment Setup ==================
+# First, ensure we're in the project directory (handles both SLURM and interactive)
+if [ -n "$SLURM_SUBMIT_DIR" ]; then
+    cd "$SLURM_SUBMIT_DIR"
+elif [ -f "$(dirname "$0")/../scripts/train_workspace.py" ]; then
+    cd "$(dirname "$0")/.."
+fi
+echo "Working directory: $(pwd)"
+
 # Activate conda environment
 source activate robodiff
 
@@ -130,7 +139,11 @@ echo "======================================"
 # Get script directory and cd to project root
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 PROJECT_ROOT="$( cd "$SCRIPT_DIR/.." && pwd )"
-cd "$PROJECT_ROOT"
+
+# IMPORTANT: Change to project root directory
+echo "Changing to project root: $PROJECT_ROOT"
+cd "$PROJECT_ROOT" || { echo "ERROR: Cannot cd to $PROJECT_ROOT"; exit 1; }
+pwd
 
 # Create logs directory if it doesn't exist
 mkdir -p logs
