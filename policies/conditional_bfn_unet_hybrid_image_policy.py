@@ -494,9 +494,13 @@ class ConditionalBFNUnetHybridImagePolicy(BasePolicy):
         naction_flat = naction.reshape(B, -1)
         
         # Compute BFN loss
-        loss = self.bfn.continuous_loss(naction_flat, cond=cond)
+        loss = self.bfn.loss(
+            naction_flat,
+            cond=cond,
+            sigma_1=self.sigma_1,
+        )
         
-        return loss
+        return loss.mean()
     
     def set_actions(self, action: torch.Tensor):
         """Set actions for inpainting (not used with BFN)."""
