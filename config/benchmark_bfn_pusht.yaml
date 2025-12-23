@@ -114,7 +114,8 @@ task:
   
   dataset:
     _target_: diffusion_policy.dataset.pusht_image_dataset.PushTImageDataset
-    zarr_path: data/pusht_cchi_v7_replay.zarr
+    # Use absolute path - override with task.dataset.zarr_path=/path/to/data on cluster
+    zarr_path: ${oc.env:PUSHT_DATA_PATH,data/pusht_cchi_v7_replay.zarr}
     horizon: ${horizon}
     pad_before: 1
     pad_after: 7
