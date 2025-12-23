@@ -366,7 +366,7 @@ class BFNUnetHybridImagePolicy(BasePolicy):
     def predict_action(
         self, obs_dict: Dict[str, torch.Tensor]
     ) -> Dict[str, torch.Tensor]:
-        """Predict action from observation.
+        """Predict action from observation using iterative denoising.
         
         Args:
             obs_dict: Dictionary of observations with shape [B, T, ...]
@@ -380,30 +380,19 @@ class BFNUnetHybridImagePolicy(BasePolicy):
         B, To = value.shape[:2]
         T = self.horizon
         Da = self.action_dim
-        Do = self.obs_feature_dim
         
         # Flatten observations for encoder
         this_nobs = dict_apply(nobs, lambda x: x[:, :self.n_obs_steps, ...].reshape(-1, *x.shape[2:]))
         nobs_features = self.obs_encoder(this_nobs)
         
-        # Reshape to [B, T*Do]
+        # Reshape to [B, cond_dim]
         cond = nobs_features.reshape(B, -1)
+        device = cond.device
+        dtype = cond.dtype
         
-        # Ensure BFN uses the same device as the conditioning tensor
-        # (BFN's self.device is set at init and doesn't update when model.to(device) is called)
-        self.bfn.device = cond.device
-        self.bfn.dtype = cond.dtype
-        
-        # Sample from BFN
-        # sample() with cond returns [B, n_samples, dim], we use n_samples=1
-        naction = self.bfn.sample(
-            n_samples=1,
-            sigma_1=self.sigma_1,
-            n_timesteps=self.n_timesteps,
-            cond=cond,
-        )
-        # Squeeze the n_samples dimension: [B, 1, dim] -> [B, dim]
-        naction = naction.squeeze(1)
+        # Simple iterative denoising (matching training)
+        # Start from pure noise and iteratively denoise
+        naction = self._sample_iterative(B, T * Da, cond, device, dtype)
         
         # Reshape actions
         naction = naction.reshape(B, T, Da)
@@ -422,18 +411,62 @@ class BFNUnetHybridImagePolicy(BasePolicy):
         }
         return result
     
+    @torch.no_grad()
+    def _sample_iterative(
+        self,
+        batch_size: int,
+        dim: int,
+        cond: torch.Tensor,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Sample using iterative denoising that matches training.
+        
+        We go from t=0 (noisy) to t=1 (clean) in n_timesteps steps.
+        At each step, we predict x from the current noisy estimate.
+        """
+        n_steps = self.n_timesteps
+        sigma_1 = self.sigma_1
+        
+        # Start from noise (t=0 means gamma=0, pure noise)
+        x = torch.randn(batch_size, dim, device=device, dtype=dtype)
+        
+        # Time steps from 0 to 1
+        timesteps = torch.linspace(0, 1, n_steps + 1, device=device, dtype=dtype)
+        
+        for i in range(n_steps):
+            t_curr = timesteps[i]
+            t_next = timesteps[i + 1]
+            
+            # Current noise level
+            gamma_curr = 1.0 - (sigma_1 ** (2.0 * t_curr))
+            gamma_next = 1.0 - (sigma_1 ** (2.0 * t_next))
+            
+            # Predict clean x from current noisy x
+            t_batch = torch.full((batch_size,), t_curr, device=device, dtype=dtype)
+            x_pred = self.unet_wrapper(x, t_batch, cond=cond)
+            
+            # If not at the last step, add noise for next level
+            if i < n_steps - 1:
+                # Compute the noisy version at t_next
+                # mu_next = gamma_next * x_pred + sqrt(gamma_next * (1-gamma_next)) * noise
+                gamma_next_safe = max(gamma_next, 1e-8)
+                noise_scale = (gamma_next_safe * (1.0 - gamma_next_safe)) ** 0.5
+                noise = torch.randn_like(x)
+                x = gamma_next_safe * x_pred + noise_scale * noise
+            else:
+                # Last step: use the prediction directly
+                x = x_pred
+        
+        return x
+    
     # ==================== Training ====================
     
     def compute_loss(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
-        """Compute BFN continuous-time loss for training.
+        """Compute simple MSE loss for training (denoising objective).
         
-        Implements the official NNAISENSE BFN loss (CtsBayesianFlowLoss.cts_time_loss):
-        - posterior_var = min_variance^t where min_variance = sigma_1^2
-        - alpha_t = 1 - posterior_var  
-        - C = -0.5 * log(min_variance)
-        - loss = C * MSE / posterior_var
-        
-        The network directly predicts x (data prediction mode) for stable training.
+        We train the network to predict x from noisy mu at various noise levels.
+        This is similar to diffusion but uses BFN's noise schedule.
         
         Args:
             batch: Dictionary containing 'obs' and 'action' tensors
@@ -458,38 +491,32 @@ class BFNUnetHybridImagePolicy(BasePolicy):
         x = naction.reshape(B, -1)
         
         # Sample time uniformly in [0, 1]
+        # t=0 means pure noise, t=1 means clean data
         t = torch.rand(B, device=device, dtype=dtype)
         t_expanded = t.unsqueeze(-1)  # [B, 1]
         
-        # Following NNAISENSE CtsBayesianFlow:
-        # min_variance = sigma_1^2
-        # posterior_var = min_variance^t = sigma_1^(2t)
-        # alpha_t = 1 - posterior_var
-        min_variance = self.sigma_1 ** 2
-        posterior_var = torch.pow(torch.tensor(min_variance, device=device, dtype=dtype), t_expanded)
-        alpha_t = 1.0 - posterior_var
+        # BFN noise schedule: gamma = 1 - sigma_1^(2t)
+        # At t=0: gamma=0 (pure noise)
+        # At t=1: gamma=1-sigma_1^2 ≈ 1 (clean)
+        sigma_1 = self.sigma_1
+        gamma = 1.0 - (sigma_1 ** (2.0 * t_expanded))
         
-        # Sample input params (mean) from Bayesian Flow distribution
-        # mean = alpha_t * x + sqrt(alpha_t * posterior_var) * noise
-        mean_var = alpha_t * posterior_var
-        mean_std = (mean_var + 1e-9).sqrt()
+        # Create noisy input: mu = gamma * x + sqrt(gamma * (1-gamma)) * noise
+        # This is the expected value of the posterior mean given data x at time t
         noise = torch.randn_like(x)
-        mu = alpha_t * x + mean_std * noise
+        gamma_safe = gamma.clamp(min=1e-8)
+        noise_scale = (gamma_safe * (1.0 - gamma_safe)).sqrt()
+        mu = gamma_safe * x + noise_scale * noise
         
-        # Forward through network - network directly predicts x (data prediction mode)
-        # The U-Net output is interpreted as x_pred, not noise
+        # Network predicts clean data x from noisy mu
         x_pred = self.unet_wrapper(mu, t, cond=cond)
         
-        # Compute continuous-time loss following NNAISENSE CtsBayesianFlowLoss:
-        # C = -0.5 * log(min_variance)
-        # loss = C * MSE / posterior_var
-        C = -0.5 * torch.log(torch.tensor(min_variance, device=device, dtype=dtype))
-        mse_loss = (x - x_pred).square()
-        posterior_var_clamped = posterior_var.clamp(min=1e-6)
-        loss = C * mse_loss / posterior_var_clamped
+        # Simple MSE loss (weighted by 1/gamma to focus on harder cases near t=0)
+        mse = (x - x_pred).square()
+        # Use unweighted MSE for stability (weighted often causes issues)
+        loss = mse.mean()
         
-        # Mean over all dimensions
-        return loss.mean()
+        return loss
     
     def set_actions(self, action: torch.Tensor):
         """Set actions for inpainting (not used with BFN)."""

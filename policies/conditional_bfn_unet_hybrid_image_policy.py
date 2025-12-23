@@ -381,7 +381,7 @@ class ConditionalBFNUnetHybridImagePolicy(BasePolicy):
     def predict_action(
         self, obs_dict: Dict[str, torch.Tensor]
     ) -> Dict[str, torch.Tensor]:
-        """Predict action from observation.
+        """Predict action from observation using iterative denoising.
         
         Args:
             obs_dict: Dictionary of observations with shape [B, T, ...]
@@ -400,28 +400,14 @@ class ConditionalBFNUnetHybridImagePolicy(BasePolicy):
         this_nobs = dict_apply(nobs, lambda x: x[:, :self.n_obs_steps, ...].reshape(-1, *x.shape[2:]))
         nobs_features = self.obs_encoder(this_nobs)
         
-        # Reshape to [B, T*Do]
+        # Reshape to [B, cond_dim]
         cond = nobs_features.reshape(B, -1)
+        device = cond.device
+        dtype = cond.dtype
         
-        # Ensure BFN uses the same device as the conditioning tensor
-        self.bfn.device = cond.device
-        self.bfn.dtype = cond.dtype
-        
-        # Sample from BFN with optional classifier-free guidance
+        # Simple iterative denoising (matching training)
         cfg = self.bfn_config
-        if cfg.cond_scale is not None and cfg.cond_scale != 1.0:
-            # Classifier-free guidance
-            naction = self._sample_with_cfg(B, cond, cfg.cond_scale)
-        else:
-            # sample() with cond returns [B, n_samples, dim], we use n_samples=1
-            naction = self.bfn.sample(
-                n_samples=1,
-                sigma_1=cfg.sigma_1,
-                n_timesteps=cfg.n_timesteps,
-                cond=cond,
-            )
-            # Squeeze the n_samples dimension: [B, 1, dim] -> [B, dim]
-            naction = naction.squeeze(1)
+        naction = self._sample_iterative(B, T * Da, cond, device, dtype, cfg.sigma_1, cfg.n_timesteps)
         
         # Reshape actions
         naction = naction.reshape(B, T, Da)
@@ -436,46 +422,64 @@ class ConditionalBFNUnetHybridImagePolicy(BasePolicy):
         
         result = {
             'action': action,
-            'action_pred': naction.reshape(B, T, Da)
+            'action_pred': naction
         }
         return result
     
-    def _sample_with_cfg(
+    @torch.no_grad()
+    def _sample_iterative(
         self,
         batch_size: int,
+        dim: int,
         cond: torch.Tensor,
-        cond_scale: float,
+        device: torch.device,
+        dtype: torch.dtype,
+        sigma_1: float,
+        n_steps: int,
     ) -> torch.Tensor:
-        """Sample with classifier-free guidance."""
-        cfg = self.bfn_config
+        """Sample using iterative denoising that matches training.
         
-        # Sample conditioned - returns [B, 1, dim] with n_samples=1
-        cond_sample = self.bfn.sample(
-            n_samples=1,
-            sigma_1=cfg.sigma_1,
-            n_timesteps=cfg.n_timesteps,
-            cond=cond,
-        ).squeeze(1)  # [B, dim]
+        We go from t=0 (noisy) to t=1 (clean) in n_timesteps steps.
+        At each step, we predict x from the current noisy estimate.
+        """
+        # Start from noise (t=0 means gamma=0, pure noise)
+        x = torch.randn(batch_size, dim, device=device, dtype=dtype)
         
-        # Sample unconditioned - returns [n_samples, dim] without cond
-        uncond_sample = self.bfn.sample(
-            n_samples=batch_size,
-            sigma_1=cfg.sigma_1,
-            n_timesteps=cfg.n_timesteps,
-            cond=None,
-        )  # [B, dim]
+        # Time steps from 0 to 1
+        timesteps = torch.linspace(0, 1, n_steps + 1, device=device, dtype=dtype)
         
-        # Apply guidance
-        return uncond_sample + cond_scale * (cond_sample - uncond_sample)
+        for i in range(n_steps):
+            t_curr = timesteps[i]
+            t_next = timesteps[i + 1]
+            
+            # Current noise level
+            gamma_curr = 1.0 - (sigma_1 ** (2.0 * t_curr))
+            gamma_next = 1.0 - (sigma_1 ** (2.0 * t_next))
+            
+            # Predict clean x from current noisy x
+            t_batch = torch.full((batch_size,), t_curr, device=device, dtype=dtype)
+            x_pred = self.unet_wrapper(x, t_batch, cond=cond)
+            
+            # If not at the last step, add noise for next level
+            if i < n_steps - 1:
+                # Compute the noisy version at t_next
+                gamma_next_safe = max(gamma_next, 1e-8)
+                noise_scale = (gamma_next_safe * (1.0 - gamma_next_safe)) ** 0.5
+                noise = torch.randn_like(x)
+                x = gamma_next_safe * x_pred + noise_scale * noise
+            else:
+                # Last step: use the prediction directly
+                x = x_pred
+        
+        return x
     
     # ==================== Training ====================
     
     def compute_loss(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
-        """Compute BFN continuous-time loss for training with conditioning dropout.
+        """Compute BFN loss for training with conditioning dropout.
         
-        Implements the official BFN loss from NNAISENSE:
-        loss = C * MSE / posterior_var
-        where C = -log(sigma_1) and posterior_var = sigma_1^(2t)
+        Uses simple MSE loss between predicted and target data.
+        Network directly predicts clean x from noisy mu.
         
         Args:
             batch: Dictionary containing 'obs' and 'action' tensors
@@ -507,35 +511,24 @@ class ConditionalBFNUnetHybridImagePolicy(BasePolicy):
         # Sample time uniformly in [0, 1]
         t = torch.rand(B, device=device, dtype=dtype)
         
-        # BFN forward pass: sample input parameters at time t
-        # Following official implementation from torch_bfn
+        # BFN noise schedule: gamma = 1 - sigma_1^(2t)
         sigma_1 = self.bfn_config.sigma_1
-        s1 = torch.tensor([sigma_1], device=device, dtype=dtype)
-        t_expanded = t.unsqueeze(-1)  # [B, 1]
+        gamma = 1.0 - (sigma_1 ** (2.0 * t.unsqueeze(-1)))  # [B, 1]
         
-        # gamma = 1 - sigma_1^(2t)
-        gamma = 1.0 - s1.pow(2.0 * t_expanded)
+        # Noise scale for this time step
+        noise_scale = (gamma * (1.0 - gamma)).sqrt()
         
-        # Sample mu from N(gamma * x, sqrt(gamma * (1 - gamma)))
-        # std = sqrt(gamma * (1 - gamma) + eps) for numerical stability
-        std = (gamma * (1.0 - gamma) + 1e-9).sqrt()
-        mu = gamma * x + std * torch.randn_like(x)
+        # Sample noisy input: mu = gamma * x + noise_scale * noise
+        noise = torch.randn_like(x)
+        mu = gamma * x + noise_scale * noise
         
-        # Forward through network to get eps prediction
-        eps_pred = self.unet_wrapper(mu, t, cond=cond)
+        # Predict clean x from noisy mu
+        x_pred = self.unet_wrapper(mu, t, cond=cond)
         
-        # Convert noise prediction to data prediction: x = (mu / gamma) - sqrt((1-gamma)/gamma) * eps
-        # Handle gamma=0 case (t=0) by using zeros
-        gamma_safe = gamma.clamp(min=1e-8)
-        x_pred = (mu / gamma_safe) - ((1.0 - gamma) / gamma_safe).sqrt() * eps_pred
+        # Simple MSE loss
+        loss = (x - x_pred).square().mean()
         
-        # Compute continuous-time loss following official BFN:
-        # diff = ||x - x_pred||_2 (L2 norm)
-        # loss = -log(sigma_1) * diff / sigma_1^(2t)
-        diff = (x - x_pred).pow(2.0).sum(-1).sqrt()  # [B] L2 norm
-        loss = -(s1.log() * diff / s1.pow(2.0 * t))  # [B]
-        
-        return loss.mean()
+        return loss
     
     def set_actions(self, action: torch.Tensor):
         """Set actions for inpainting (not used with BFN)."""
