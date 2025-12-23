@@ -457,6 +457,10 @@ class BFNUnetHybridImagePolicy(BasePolicy):
         """Set actions for inpainting (not used with BFN)."""
         pass
     
+    def reset(self):
+        """Reset policy state between episodes."""
+        pass
+    
     # ==================== State Dict ====================
     
     def state_dict(self):
