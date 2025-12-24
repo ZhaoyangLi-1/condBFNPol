@@ -10,3 +10,5 @@ diffusion_policy
 checkpoints*
 .DS_Store
 logs
+cluster_checkpoints
+figures

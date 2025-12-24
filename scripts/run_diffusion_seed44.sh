@@ -27,6 +27,9 @@ export WANDB_API_KEY='d47c0bfd84b46e8364f863f142e4fa03c425500e'
 export PYTHONPATH=.
 export HYDRA_FULL_ERROR=1
 
+# Use offline mode to avoid disk issues during training
+export WANDB_MODE=offline
+
 # WandB directories
 export WANDB_DIR="$HOME/condBFNPol/wandb"
 export WANDB_CACHE_DIR="$HOME/condBFNPol/wandb_cache"
@@ -44,12 +47,17 @@ python scripts/train_workspace.py \
     training.device=cuda:0 \
     training.num_epochs=300 \
     training.checkpoint_every=100 \
+    training.rollout_every=100 \
     checkpoint.save_last_ckpt=false \
-    checkpoint.topk.k=2 \
+    checkpoint.topk.k=1 \
     dataloader.num_workers=8 \
     val_dataloader.num_workers=8 \
+    task.env_runner.n_train=0 \
+    task.env_runner.n_train_vis=0 \
+    task.env_runner.n_test=20 \
+    task.env_runner.n_test_vis=0 \
     logging.project=pusht-benchmark \
-    logging.mode=online \
+    logging.mode=offline \
     +logging.entity=aleyna-research
 
 echo "======================================"
