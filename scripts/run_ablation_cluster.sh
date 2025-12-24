@@ -128,10 +128,49 @@ main() {
         exit 1
     fi
     
-    # Check if checkpoints exist
+    # Check if checkpoints exist, search if not found
     if [ ! -d "$CHECKPOINT_DIR" ]; then
-        log "ERROR: Checkpoint directory not found: $CHECKPOINT_DIR"
-        exit 1
+        log "WARNING: Checkpoint directory not found: $CHECKPOINT_DIR"
+        log "Searching for checkpoints from benchmark runs..."
+        
+        # Try to find checkpoints in outputs (from run_pusht_benchmark.sh)
+        if [ -d "outputs" ]; then
+            local ckpt_count=$(find outputs -name "*.ckpt" 2>/dev/null | wc -l)
+            if [ "$ckpt_count" -gt 0 ]; then
+                log "Found $ckpt_count checkpoints in outputs/"
+                log "Organizing them for ablation study..."
+                
+                # Use the new preparation script
+                if bash scripts/prepare_ablation_from_outputs.sh --symlink 2>&1 | tee -a "$LOG_FILE"; then
+                    log "✓ Checkpoints organized! Continuing with ablation..."
+                else
+                    log "Could not automatically organize. Please run manually:"
+                    log "  bash scripts/prepare_ablation_from_outputs.sh"
+                    log "  # Then re-run this script"
+                    exit 1
+                fi
+            else
+                log "No checkpoints found in outputs/"
+                log ""
+                log "You need to run the benchmark first:"
+                log "  sbatch scripts/run_pusht_benchmark.sh"
+                log ""
+                log "Or if you have checkpoints elsewhere:"
+                log "  export CHECKPOINT_DIR=/path/to/checkpoints"
+                log "  bash scripts/run_ablation_cluster.sh"
+                log ""
+                exit 1
+            fi
+        else
+            log "No outputs directory found."
+            log ""
+            log "You need to run the benchmark first:"
+            log "  sbatch scripts/run_pusht_benchmark.sh"
+            log ""
+            log "After benchmark completes, this script will automatically find and use the checkpoints."
+            log ""
+            exit 1
+        fi
     fi
     
     # Pre-cleanup

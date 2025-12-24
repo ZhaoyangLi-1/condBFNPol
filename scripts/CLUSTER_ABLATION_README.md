@@ -4,23 +4,62 @@ This document explains how to run the ablation study on your cluster while manag
 
 ## Quick Start
 
-### Option 1: Standard Script (Recommended)
+### If You Have Checkpoints on Cluster
+
+#### Option 1: Standard Script (Recommended)
 ```bash
 bash scripts/run_ablation_cluster.sh
 ```
 
-### Option 2: Space-Efficient Script (Minimal Disk Usage)
+#### Option 2: Space-Efficient Script (Minimal Disk Usage)
 ```bash
 bash scripts/run_ablation_space_efficient.sh
 ```
 
-### Option 3: SLURM Job
+#### Option 3: SLURM Job
 ```bash
 # Generate SLURM script
 bash scripts/run_ablation_cluster.sh --generate-slurm
 
 # Submit job
 sbatch run_ablation_slurm.sh
+```
+
+### If You DON'T Have Checkpoints on Cluster
+
+#### Option A: Transfer from Local Machine
+```bash
+# From your local machine (with checkpoints)
+bash scripts/transfer_checkpoints_to_cluster.sh \
+    --cluster-host login.cluster.edu \
+    --cluster-user your_username
+```
+
+#### Option B: Find Checkpoints in outputs/
+```bash
+# If you've already trained but checkpoints are in outputs/
+bash scripts/find_and_link_checkpoints.sh
+
+# Then run ablation
+bash scripts/run_ablation_cluster.sh
+```
+
+#### Option C: Train on Cluster First
+```bash
+# Set up training scripts
+bash scripts/transfer_checkpoints_to_cluster.sh --setup-training
+
+# Submit training job
+sbatch scripts/train_ablation_slurm.sh
+
+# After training completes, run ablation
+bash scripts/run_ablation_cluster.sh
+```
+
+#### Option D: Interactive Setup Helper
+```bash
+# Get guided help
+bash scripts/setup_cluster_for_ablation.sh
 ```
 
 ## Environment Variables

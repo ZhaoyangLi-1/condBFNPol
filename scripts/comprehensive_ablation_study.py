@@ -51,54 +51,89 @@ from diffusion_policy.env_runner.pusht_image_runner import PushTImageRunner
 # CHECKPOINT DISCOVERY
 # =============================================================================
 
-def find_all_checkpoints(base_dir: str = "cluster_checkpoints/benchmarkresults") -> Dict[str, Dict[int, str]]:
+def find_all_checkpoints(base_dir: str = None) -> Dict[str, Dict[int, str]]:
     """Find all benchmark checkpoints organized by method and seed.
+    
+    Searches in:
+    1. cluster_checkpoints/benchmarkresults (organized format)
+    2. outputs/YYYY.MM.DD/HH.MM.SS_method_seed*/checkpoints (benchmark format)
     
     Returns:
         Dict with structure: {'bfn': {seed: best_ckpt_path}, 'diffusion': {seed: best_ckpt_path}}
     """
-    base_path = Path(base_dir)
-    if not base_path.exists():
-        print(f"Warning: {base_dir} not found")
-        return {'bfn': {}, 'diffusion': {}}
-    
     checkpoints = {'bfn': {}, 'diffusion': {}}
     
-    # Search through all date directories
-    for date_dir in base_path.iterdir():
-        if not date_dir.is_dir():
-            continue
-        
-        for run_dir in date_dir.iterdir():
-            if not run_dir.is_dir():
+    # Try organized format first
+    if base_dir is None:
+        base_dir = "cluster_checkpoints/benchmarkresults"
+    
+    base_path = Path(base_dir)
+    
+    if base_path.exists():
+        # Search through all date directories in organized format
+        for date_dir in base_path.iterdir():
+            if not date_dir.is_dir():
                 continue
             
-            # Parse method and seed from directory name
-            dir_name = run_dir.name
-            method = None
-            if "bfn" in dir_name.lower():
-                method = "bfn"
-            elif "diffusion" in dir_name.lower():
-                method = "diffusion"
-            else:
+            for run_dir in date_dir.iterdir():
+                if not run_dir.is_dir():
+                    continue
+                
+                found = _process_run_directory(run_dir, checkpoints)
+    
+    # Also search in outputs/ directory (benchmark format)
+    outputs_path = Path("outputs")
+    if outputs_path.exists():
+        # Search through date directories: outputs/YYYY.MM.DD/
+        for date_dir in outputs_path.iterdir():
+            if not date_dir.is_dir():
                 continue
             
-            # Extract seed
-            seed = None
-            for part in dir_name.split("_"):
-                if part.startswith("seed"):
-                    try:
-                        seed = int(part.replace("seed", ""))
-                    except ValueError:
-                        pass
-            
-            if seed is None:
+            # Check if it looks like a date directory (YYYY.MM.DD)
+            if not date_dir.name.replace(".", "").isdigit() or date_dir.name.count(".") != 2:
                 continue
             
-            # Find best checkpoint (highest score)
-            ckpt_dir = run_dir / "checkpoints"
-            if not ckpt_dir.exists():
-                continue
+            # Search for run directories: HH.MM.SS_method_seed*
+            for run_dir in date_dir.iterdir():
+                if not run_dir.is_dir():
+                    continue
+                
+                _process_run_directory(run_dir, checkpoints)
+    
+    return checkpoints
+
+
+def _process_run_directory(run_dir: Path, checkpoints: Dict[str, Dict[int, str]]) -> bool:
+    """Process a single run directory to extract checkpoint info.
+    
+    Returns True if a checkpoint was found and added.
+    """
+    # Parse method and seed from directory name
+    dir_name = run_dir.name
+    method = None
+    if "bfn" in dir_name.lower():
+        method = "bfn"
+    elif "diffusion" in dir_name.lower():
+        method = "diffusion"
+    else:
+        return False
+    
+    # Extract seed
+    seed = None
+    for part in dir_name.split("_"):
+        if part.startswith("seed"):
+            try:
+                seed = int(part.replace("seed", ""))
+            except ValueError:
+                pass
+    
+    if seed is None:
+        return False
+    
+    # Find best checkpoint (highest score)
+    ckpt_dir = run_dir / "checkpoints"
+    if not ckpt_dir.exists():
+        return False
             
             best_score = -1
             best_ckpt = None
