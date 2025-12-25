@@ -1,10 +1,11 @@
 #!/bin/bash
 #SBATCH --job-name=pusht_benchmark
 #SBATCH --partition=lrz-hgx-h100-94x4,lrz-hgx-a100-80x4,lrz-dgx-a100-80x8
+#SBATCH --qos=gpu
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=64G
-#SBATCH --time=48:00:00
+#SBATCH --time=47:00:00
 #SBATCH --output=logs/benchmark-%j.out
 #SBATCH --chdir=/dss/dsshome1/0D/ge87gob2/condBFNPol
 
