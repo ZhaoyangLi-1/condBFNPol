@@ -1,7 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=pusht_benchmark
-#SBATCH --partition=lrz-hgx-h100-94x4,lrz-hgx-a100-80x4,lrz-dgx-a100-80x8,mcml-hgx-h100-94x4,mcml-hgx-a100-80x4
-#SBATCH --qos=gpu
+#SBATCH --partition=lrz-hgx-h100-94x4,lrz-hgx-a100-80x4,lrz-dgx-a100-80x8
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=64G
