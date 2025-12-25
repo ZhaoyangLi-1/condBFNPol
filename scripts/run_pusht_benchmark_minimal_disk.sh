@@ -4,7 +4,7 @@
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=64G
-#SBATCH --time=72:00:00
+#SBATCH --time=48:00:00
 #SBATCH --output=logs/benchmark-%j.out
 #SBATCH --chdir=/dss/dsshome1/0D/ge87gob2/condBFNPol
 
