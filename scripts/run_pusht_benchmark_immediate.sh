@@ -93,7 +93,7 @@ fi
 SEEDS="${SEEDS:-42 43 44}"
 EPOCHS="${EPOCHS:-300}"
 DEVICE="${DEVICE:-cuda:0}"
-PROJECT="${PROJECT:-pusht-benchmark}"
+PROJECT="${PROJECT:-ablation-benchmark}"
 ENTITY="${ENTITY:-aleyna-research}"
 NUM_WORKERS="${NUM_WORKERS:-8}"
 
