@@ -38,11 +38,12 @@ def run_script(
             cmd.extend(extra_args)
         
         # Use stdout/stderr instead of capture_output for Python < 3.7 compatibility
+        # Use universal_newlines instead of text for Python < 3.7 compatibility
         result = subprocess.run(
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True,
+            universal_newlines=True,
             cwd=Path(__file__).parent.parent
         )
         
