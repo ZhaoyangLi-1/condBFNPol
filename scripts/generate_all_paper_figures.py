@@ -18,7 +18,7 @@ import argparse
 import subprocess
 import sys
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 import time
 
 
@@ -26,7 +26,7 @@ def run_script(
     script_path: Path,
     description: str,
     check_exists: bool = True,
-    extra_args: List[str] = None
+    extra_args: Optional[List[str]] = None
 ) -> Tuple[bool, str]:
     """Run a Python script and return success status and output."""
     if check_exists and not script_path.exists():
@@ -37,9 +37,11 @@ def run_script(
         if extra_args:
             cmd.extend(extra_args)
         
+        # Use stdout/stderr instead of capture_output for Python < 3.7 compatibility
         result = subprocess.run(
             cmd,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
             cwd=Path(__file__).parent.parent
         )
@@ -47,7 +49,9 @@ def run_script(
         if result.returncode == 0:
             return True, result.stdout
         else:
-            return False, result.stderr
+            # Return stderr if available, otherwise stdout
+            error_output = result.stderr if result.stderr else result.stdout
+            return False, error_output
     except Exception as e:
         return False, str(e)
 
