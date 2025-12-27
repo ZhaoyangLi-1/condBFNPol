@@ -124,6 +124,7 @@ Examples:
             'script': scripts_dir / 'generate_publication_figures.py',
             'description': 'Main publication figures (results, per-seed, efficiency, training curves, pareto)',
             'required': True,
+            'args': ['--checkpoint-dir', args.checkpoint_dir],
         },
         
         # Training metrics plots
@@ -131,12 +132,14 @@ Examples:
             'script': scripts_dir / 'plot_training_loss.py',
             'description': 'Training loss curves',
             'required': True,
+            'args': ['--base-dir', args.checkpoint_dir],
         },
         
         {
             'script': scripts_dir / 'plot_action_mse_error.py',
             'description': 'Action prediction MSE error',
             'required': True,
+            'args': ['--base-dir', args.checkpoint_dir],
         },
         
         # Analysis and tables
@@ -144,6 +147,7 @@ Examples:
             'script': scripts_dir / 'analyze_local_results.py',
             'description': 'Analysis tables and comparison figures',
             'required': True,
+            'args': ['--checkpoint-dir', args.checkpoint_dir],
         },
         
         {
@@ -164,6 +168,7 @@ Examples:
             'script': scripts_dir / 'analyze_loss_performance_relationship.py',
             'description': 'Loss vs performance relationship analysis',
             'required': False,
+            'args': ['--base-dir', args.checkpoint_dir],
         },
         
         # Multimodal figures (optional - may require additional data)

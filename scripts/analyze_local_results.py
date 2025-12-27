@@ -6,6 +6,7 @@ Usage:
     python scripts/analyze_local_results.py
 """
 
+import argparse
 import json
 import re
 from pathlib import Path
@@ -314,23 +315,46 @@ def plot_per_seed_comparison(results: Dict, output_dir: Path):
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Analyze BFN vs Diffusion benchmark results")
+    parser.add_argument(
+        '--checkpoint-dir',
+        type=str,
+        default=None,
+        help='Directory containing benchmark results (default: auto-detect)'
+    )
+    parser.add_argument(
+        '--output-dir',
+        type=str,
+        default='figures',
+        help='Output directory for figures and tables (default: figures)'
+    )
+    
+    args = parser.parse_args()
+    
     # Find the benchmark results directory
-    base_paths = [
-        Path("cluster_checkpoints/benchmarkresults"),
-        Path("cluster_checkpoints"),
-        Path("outputs"),
-    ]
-    
-    base_dir = None
-    for path in base_paths:
-        if path.exists():
-            base_dir = path
-            break
-    
-    if base_dir is None:
-        print("ERROR: Could not find benchmark results directory")
-        print("Expected one of:", base_paths)
-        return
+    if args.checkpoint_dir:
+        base_dir = Path(args.checkpoint_dir)
+        if not base_dir.exists():
+            print(f"ERROR: Specified checkpoint directory not found: {base_dir}")
+            return
+    else:
+        base_paths = [
+            Path("cluster_checkpoints/benchmarkresults"),
+            Path("cluster_checkpoints"),
+            Path("outputs"),
+        ]
+        
+        base_dir = None
+        for path in base_paths:
+            if path.exists():
+                base_dir = path
+                break
+        
+        if base_dir is None:
+            print("ERROR: Could not find benchmark results directory")
+            print("Expected one of:", base_paths)
+            print("Use --checkpoint-dir to specify the directory")
+            return
     
     print(f"Analyzing results in: {base_dir}")
     print("-" * 70)
@@ -342,8 +366,8 @@ def main():
     print_comparison_table(results)
     
     # Create output directory
-    output_dir = Path("figures")
-    output_dir.mkdir(exist_ok=True)
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
     
     # Generate LaTeX table
     generate_latex_table(results, output_dir / "results_table.tex")

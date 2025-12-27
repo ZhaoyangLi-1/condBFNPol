@@ -4,6 +4,7 @@ Publication-Quality Figures for BFN vs Diffusion Policy Comparison
 Style: Google Research / NeurIPS / ICML format
 """
 
+import argparse
 import numpy as np
 from pathlib import Path
 import json
@@ -536,8 +537,24 @@ def plot_pareto(runs: dict, output_dir: Path):
 # =============================================================================
 
 def main():
-    base_dir = Path("cluster_checkpoints/benchmarkresults")
-    output_dir = Path("figures/publication")
+    parser = argparse.ArgumentParser(description="Generate publication-quality figures")
+    parser.add_argument(
+        '--checkpoint-dir',
+        type=str,
+        default='cluster_checkpoints/benchmarkresults',
+        help='Directory containing benchmark results (default: cluster_checkpoints/benchmarkresults)'
+    )
+    parser.add_argument(
+        '--output-dir',
+        type=str,
+        default='figures/publication',
+        help='Output directory for figures (default: figures/publication)'
+    )
+    
+    args = parser.parse_args()
+    
+    base_dir = Path(args.checkpoint_dir)
+    output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     
     print("=" * 60)
