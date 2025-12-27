@@ -228,8 +228,8 @@ def plot_loss_vs_success_rate(bfn_runs: Dict, diffusion_runs: Dict, output_dir: 
     plt.tight_layout()
     
     output_dir.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output_dir / 'loss_performance_paradox.pdf')
-    fig.savefig(output_dir / 'loss_performance_paradox.png', dpi=300)
+    fig.savefig(str(output_dir / 'loss_performance_paradox.pdf')
+    fig.savefig(str(output_dir / 'loss_performance_paradox.png', dpi=300)
     plt.close(fig)
     print(f"Saved: {output_dir / 'loss_performance_paradox.pdf'}")
 

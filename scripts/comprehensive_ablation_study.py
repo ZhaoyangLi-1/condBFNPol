@@ -134,9 +134,9 @@ def _process_run_directory(run_dir: Path, checkpoints: Dict[str, Dict[int, str]]
     ckpt_dir = run_dir / "checkpoints"
     if not ckpt_dir.exists():
         return False
-            
-            best_score = -1
-            best_ckpt = None
+    
+    best_score = -1
+    best_ckpt = None
             for ckpt_file in ckpt_dir.glob("*.ckpt"):
                 # Parse score from filename: epoch=0200-test_mean_score=0.877.ckpt
                 name = ckpt_file.stem

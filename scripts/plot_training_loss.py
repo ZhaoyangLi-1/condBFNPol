@@ -252,8 +252,8 @@ def plot_training_loss_comparison(
     
     # Save
     output_dir.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output_dir / 'training_loss_comparison.pdf')
-    fig.savefig(output_dir / 'training_loss_comparison.png', dpi=300)
+    fig.savefig(str(output_dir / 'training_loss_comparison.pdf')
+    fig.savefig(str(output_dir / 'training_loss_comparison.png', dpi=300)
     plt.close(fig)
     print(f"Saved: {output_dir / 'training_loss_comparison.pdf'}")
 
@@ -311,8 +311,8 @@ def plot_individual_seeds(
     
     # Save
     output_dir.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output_dir / 'training_loss_per_seed.pdf')
-    fig.savefig(output_dir / 'training_loss_per_seed.png', dpi=300)
+    fig.savefig(str(output_dir / 'training_loss_per_seed.pdf')
+    fig.savefig(str(output_dir / 'training_loss_per_seed.png', dpi=300)
     plt.close(fig)
     print(f"Saved: {output_dir / 'training_loss_per_seed.pdf'}")
 
@@ -372,8 +372,8 @@ def plot_loss_vs_performance(
     
     # Save
     output_dir.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output_dir / 'loss_vs_performance.pdf')
-    fig.savefig(output_dir / 'loss_vs_performance.png', dpi=300)
+    fig.savefig(str(output_dir / 'loss_vs_performance.pdf')
+    fig.savefig(str(output_dir / 'loss_vs_performance.png', dpi=300)
     plt.close(fig)
     print(f"Saved: {output_dir / 'loss_vs_performance.pdf'}")
 
