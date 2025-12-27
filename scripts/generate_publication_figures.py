@@ -231,8 +231,8 @@ def plot_per_seed(runs: dict, output_dir: Path):
     ax.legend(loc='lower right', framealpha=0.9)
     
     plt.tight_layout()
-    fig.savefig(str(output_dir / 'fig2_per_seed.pdf')
-    fig.savefig(str(output_dir / 'fig2_per_seed.png', dpi=300)
+    fig.savefig(str(output_dir / 'fig2_per_seed.pdf'))
+    fig.savefig(str(output_dir / 'fig2_per_seed.png'), dpi=300)
     plt.close(fig)
     print(f"  ✓ Figure 2: Per-seed comparison")
 
@@ -295,7 +295,7 @@ def plot_efficiency(runs: dict, output_dir: Path):
     
     plt.tight_layout()
     fig.savefig(str(output_dir / 'fig3_efficiency.pdf')
-    fig.savefig(str(output_dir / 'fig3_efficiency.png', dpi=300)
+    fig.savefig(str(output_dir / 'fig3_efficiency.png'), dpi=300)
     plt.close(fig)
     print(f"  ✓ Figure 3: Computational efficiency")
 
@@ -350,7 +350,7 @@ def plot_training_curves(runs: dict, output_dir: Path):
     
     plt.tight_layout()
     fig.savefig(str(output_dir / 'fig4_training_curves.pdf')
-    fig.savefig(str(output_dir / 'fig4_training_curves.png', dpi=300)
+    fig.savefig(str(output_dir / 'fig4_training_curves.png'), dpi=300)
     plt.close(fig)
     print(f"  ✓ Figure 4: Training curves")
 
@@ -480,7 +480,7 @@ def plot_combined_figure(runs: dict, output_dir: Path):
     ax.text(-0.2, 1.08, '(d)', transform=ax.transAxes, fontsize=10, fontweight='bold')
     
     fig.savefig(str(output_dir / 'fig_combined.pdf')
-    fig.savefig(str(output_dir / 'fig_combined.png', dpi=300)
+    fig.savefig(str(output_dir / 'fig_combined.png'), dpi=300)
     plt.close(fig)
     print(f"  ✓ Figure (combined): Publication-ready 4-panel figure")
 
@@ -527,7 +527,7 @@ def plot_pareto(runs: dict, output_dir: Path):
     
     plt.tight_layout()
     fig.savefig(str(output_dir / 'fig5_pareto.pdf')
-    fig.savefig(str(output_dir / 'fig5_pareto.png', dpi=300)
+    fig.savefig(str(output_dir / 'fig5_pareto.png'), dpi=300)
     plt.close(fig)
     print(f"  ✓ Figure 5: Pareto frontier")
 

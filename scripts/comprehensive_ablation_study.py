@@ -137,18 +137,18 @@ def _process_run_directory(run_dir: Path, checkpoints: Dict[str, Dict[int, str]]
     
     best_score = -1
     best_ckpt = None
-            for ckpt_file in ckpt_dir.glob("*.ckpt"):
-                # Parse score from filename: epoch=0200-test_mean_score=0.877.ckpt
-                name = ckpt_file.stem
-                if "test_mean_score=" in name:
-                    try:
-                        score_str = name.split("test_mean_score=")[1]
-                        score = float(score_str)
-                        if score > best_score:
-                            best_score = score
-                            best_ckpt = str(ckpt_file)
-                    except (IndexError, ValueError):
-                        pass
+    for ckpt_file in ckpt_dir.glob("*.ckpt"):
+        # Parse score from filename: epoch=0200-test_mean_score=0.877.ckpt
+        name = ckpt_file.stem
+        if "test_mean_score=" in name:
+            try:
+                score_str = name.split("test_mean_score=")[1]
+                score = float(score_str)
+                if score > best_score:
+                    best_score = score
+                    best_ckpt = str(ckpt_file)
+            except (IndexError, ValueError):
+                pass
             
             # If no score-based checkpoint, use most recent
             if best_ckpt is None:

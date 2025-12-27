@@ -197,7 +197,7 @@ def plot_training_stability(output_dir: Path):
                  color=COLORS['gray'], style='italic')
     
     fig.savefig(str(output_dir / 'fig_training_stability.pdf')
-    fig.savefig(str(output_dir / 'fig_training_stability.png', dpi=300)
+    fig.savefig(str(output_dir / 'fig_training_stability.png'), dpi=300)
     plt.close(fig)
     print("  - Training stability (2-panel)")
 
@@ -299,7 +299,7 @@ def plot_training_stability_with_ibc(output_dir: Path):
                           edgecolor=COLORS['gray'], alpha=0.8))
     
     fig.savefig(str(output_dir / 'fig_training_stability_with_ibc.pdf')
-    fig.savefig(str(output_dir / 'fig_training_stability_with_ibc.png', dpi=300)
+    fig.savefig(str(output_dir / 'fig_training_stability_with_ibc.png'), dpi=300)
     plt.close(fig)
     print("  - Training stability with IBC comparison (2-panel)")
 
@@ -378,7 +378,7 @@ def plot_checkpoint_selection(output_dir: Path):
         ax.grid(True, alpha=0.3, linestyle='-', linewidth=0.5)
     
     fig.savefig(str(output_dir / 'fig_checkpoint_selection.pdf')
-    fig.savefig(str(output_dir / 'fig_checkpoint_selection.png', dpi=300)
+    fig.savefig(str(output_dir / 'fig_checkpoint_selection.png'), dpi=300)
     plt.close(fig)
     print("  - Checkpoint selection comparison (3-panel)")
 
@@ -461,7 +461,7 @@ def plot_loss_vs_performance_correlation(output_dir: Path):
     
     plt.tight_layout()
     fig.savefig(str(output_dir / 'fig_loss_performance_correlation.pdf')
-    fig.savefig(str(output_dir / 'fig_loss_performance_correlation.png', dpi=300)
+    fig.savefig(str(output_dir / 'fig_loss_performance_correlation.png'), dpi=300)
     plt.close(fig)
     print("  - Loss-performance correlation scatter")
 
