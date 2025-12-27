@@ -294,7 +294,7 @@ def plot_efficiency(runs: dict, output_dir: Path):
     axes[1].text(-0.15, 1.05, '(b)', transform=axes[1].transAxes, fontsize=10, fontweight='bold')
     
     plt.tight_layout()
-    fig.savefig(str(output_dir / 'fig3_efficiency.pdf')
+    fig.savefig(str(output_dir / 'fig3_efficiency.pdf'))
     fig.savefig(str(output_dir / 'fig3_efficiency.png'), dpi=300)
     plt.close(fig)
     print(f"  ✓ Figure 3: Computational efficiency")
@@ -349,7 +349,7 @@ def plot_training_curves(runs: dict, output_dir: Path):
     ax.xaxis.set_major_formatter(ticker.FuncFormatter(lambda x, p: f'{int(x/1000)}K' if x >= 1000 else str(int(x))))
     
     plt.tight_layout()
-    fig.savefig(str(output_dir / 'fig4_training_curves.pdf')
+    fig.savefig(str(output_dir / 'fig4_training_curves.pdf'))
     fig.savefig(str(output_dir / 'fig4_training_curves.png'), dpi=300)
     plt.close(fig)
     print(f"  ✓ Figure 4: Training curves")
@@ -479,7 +479,7 @@ def plot_combined_figure(runs: dict, output_dir: Path):
     ax.xaxis.set_major_formatter(ticker.FuncFormatter(lambda x, p: f'{int(x/1000)}K'))
     ax.text(-0.2, 1.08, '(d)', transform=ax.transAxes, fontsize=10, fontweight='bold')
     
-    fig.savefig(str(output_dir / 'fig_combined.pdf')
+    fig.savefig(str(output_dir / 'fig_combined.pdf'))
     fig.savefig(str(output_dir / 'fig_combined.png'), dpi=300)
     plt.close(fig)
     print(f"  ✓ Figure (combined): Publication-ready 4-panel figure")
@@ -526,7 +526,7 @@ def plot_pareto(runs: dict, output_dir: Path):
     ax.fill_between([0, 25], [1.0, 1.0], [bfn_mean, bfn_mean], alpha=0.1, color=COLORS['bfn'])
     
     plt.tight_layout()
-    fig.savefig(str(output_dir / 'fig5_pareto.pdf')
+    fig.savefig(str(output_dir / 'fig5_pareto.pdf'))
     fig.savefig(str(output_dir / 'fig5_pareto.png'), dpi=300)
     plt.close(fig)
     print(f"  ✓ Figure 5: Pareto frontier")

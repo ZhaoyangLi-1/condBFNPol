@@ -294,7 +294,7 @@ def plot_action_mse_error_comparison(
     
     # Save
     output_dir.mkdir(parents=True, exist_ok=True)
-    fig.savefig(str(output_dir / 'action_mse_error.pdf')
+    fig.savefig(str(output_dir / 'action_mse_error.pdf'))
     fig.savefig(str(output_dir / 'action_mse_error.png'), dpi=300)
     plt.close(fig)
     print(f"Saved: {output_dir / 'action_mse_error.pdf'}")
@@ -385,7 +385,7 @@ def plot_action_mse_with_training_loss(
                edgecolor=COLORS['light_gray'], fontsize=8)
     ax2.grid(True, alpha=0.3, linestyle='-', linewidth=0.5)
     
-    fig.savefig(str(output_dir / 'action_mse_and_training_loss.pdf')
+    fig.savefig(str(output_dir / 'action_mse_and_training_loss.pdf'))
     fig.savefig(str(output_dir / 'action_mse_and_training_loss.png'), dpi=300)
     plt.close(fig)
     print(f"Saved: {output_dir / 'action_mse_and_training_loss.pdf'}")
@@ -443,7 +443,7 @@ def plot_per_seed_comparison(
     plt.tight_layout()
     
     output_dir.mkdir(parents=True, exist_ok=True)
-    fig.savefig(str(output_dir / 'action_mse_per_seed.pdf')
+    fig.savefig(str(output_dir / 'action_mse_per_seed.pdf'))
     fig.savefig(str(output_dir / 'action_mse_per_seed.png'), dpi=300)
     plt.close(fig)
     print(f"Saved: {output_dir / 'action_mse_per_seed.pdf'}")

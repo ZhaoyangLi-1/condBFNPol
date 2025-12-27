@@ -323,7 +323,7 @@ def plot_multimodal_comparison(output_dir: Path):
     fig.legend(handles=legend_elements, loc='lower center', ncol=2, 
                frameon=False, fontsize=8, bbox_to_anchor=(0.5, 0.02))
     
-    fig.savefig(str(output_dir / 'fig_multimodal_comparison.pdf')
+    fig.savefig(str(output_dir / 'fig_multimodal_comparison.pdf'))
     fig.savefig(str(output_dir / 'fig_multimodal_comparison.png'), dpi=300)
     plt.close(fig)
     print("  ✓ Multimodal comparison (5-panel)")
@@ -391,7 +391,7 @@ def plot_multimodal_grid(output_dir: Path):
     fig.legend(handles=legend_elements, loc='lower center', ncol=3,
                frameon=False, fontsize=8, bbox_to_anchor=(0.5, 0.0))
     
-    fig.savefig(str(output_dir / 'fig_multimodal_grid.pdf')
+    fig.savefig(str(output_dir / 'fig_multimodal_grid.pdf'))
     fig.savefig(str(output_dir / 'fig_multimodal_grid.png'), dpi=300)
     plt.close(fig)
     print("  ✓ Multimodal comparison (2x3 grid)")
@@ -438,7 +438,7 @@ def plot_bfn_vs_diffusion_multimodal(output_dir: Path):
             fontsize=7, color=COLORS['gray'], transform=ax.transAxes)
     
     plt.tight_layout()
-    fig.savefig(str(output_dir / 'fig_bfn_diffusion_multimodal.pdf')
+    fig.savefig(str(output_dir / 'fig_bfn_diffusion_multimodal.pdf'))
     fig.savefig(str(output_dir / 'fig_bfn_diffusion_multimodal.png'), dpi=300)
     plt.close(fig)
     print("  ✓ BFN vs Diffusion multimodal")
@@ -484,7 +484,7 @@ def plot_mode_distribution(output_dir: Path):
                     color=COLORS['target'], fontweight='bold')
     
     plt.tight_layout()
-    fig.savefig(str(output_dir / 'fig_mode_distribution.pdf')
+    fig.savefig(str(output_dir / 'fig_mode_distribution.pdf'))
     fig.savefig(str(output_dir / 'fig_mode_distribution.png'), dpi=300)
     plt.close(fig)
     print("  ✓ Mode distribution histogram")
@@ -548,7 +548,7 @@ def plot_temporal_consistency(output_dir: Path):
         ax.text(timesteps + 1, -0.5, 'Left', fontsize=6, color=COLORS['trajectory_left'], va='center')
     
     plt.tight_layout()
-    fig.savefig(str(output_dir / 'fig_temporal_consistency.pdf')
+    fig.savefig(str(output_dir / 'fig_temporal_consistency.pdf'))
     fig.savefig(str(output_dir / 'fig_temporal_consistency.png'), dpi=300)
     plt.close(fig)
     print("  ✓ Temporal consistency")
