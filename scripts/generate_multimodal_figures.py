@@ -98,7 +98,7 @@ def generate_committed_trajectories(n_rollouts=8, mode_bias=0.5, noise=0.02):
 
 
 def generate_biased_trajectories(n_rollouts=8, bias=0.9, noise=0.02):
-    """Generate trajectories biased toward one mode (like LSTM-GMM/IBC)."""
+    """Generate trajectories biased toward one mode (like LSTM-GMM)."""
     trajectories = []
     start = np.array([0.5, 0.25])
     
@@ -302,11 +302,11 @@ def plot_multimodal_comparison(output_dir: Path):
     traj_bfn = generate_committed_trajectories(n_rollouts=10, mode_bias=0.5, noise=0.018)
     draw_method_panel(ax, traj_bfn, '(c) BFN Policy\n(Ours)', 'Commits to mode')
     
-    # Panel (d): LSTM-GMM / IBC - biased to one mode
+    # Panel (d): LSTM-GMM - biased to one mode
     ax = fig.add_subplot(gs[3])
     np.random.seed(44)
     traj_biased = generate_biased_trajectories(n_rollouts=10, bias=0.85, noise=0.015)
-    draw_method_panel(ax, traj_biased, '(d) LSTM-GMM\n/ IBC', 'Biased to one mode')
+    draw_method_panel(ax, traj_biased, '(d) LSTM-GMM', 'Biased to one mode')
     
     # Panel (e): BET - fails to commit
     ax = fig.add_subplot(gs[4])
@@ -368,17 +368,11 @@ def plot_multimodal_grid(output_dir: Path):
     traj_lstm = generate_biased_trajectories(n_rollouts=12, bias=0.9, noise=0.012)
     draw_method_panel(ax, traj_lstm, '(d) LSTM-GMM', 'Mode collapse')
     
-    # (e) IBC
+    # (e) BET
     ax = fig.add_subplot(gs[1, 1])
-    np.random.seed(45)
-    traj_ibc = generate_biased_trajectories(n_rollouts=12, bias=0.85, noise=0.015)
-    draw_method_panel(ax, traj_ibc, '(e) IBC', 'Biased to one mode')
-    
-    # (f) BET
-    ax = fig.add_subplot(gs[1, 2])
     np.random.seed(46)
     traj_bet = generate_uncommitted_trajectories(n_rollouts=12, noise=0.02)
-    draw_method_panel(ax, traj_bet, '(f) BET', 'Fails to commit')
+    draw_method_panel(ax, traj_bet, '(e) BET', 'Fails to commit')
     
     # Legend
     from matplotlib.lines import Line2D
@@ -453,10 +447,10 @@ def plot_mode_distribution(output_dir: Path):
     fig, ax = plt.subplots(figsize=(SINGLE_COL * 1.3, SINGLE_COL * 0.8))
     
     # Simulated mode percentages from 100 rollouts
-    methods = ['Diffusion', 'BFN\n(Ours)', 'LSTM-\nGMM', 'IBC', 'BET']
-    left_pct = [48, 52, 85, 78, 45]  # Percentage going left
-    right_pct = [52, 48, 15, 22, 35]  # Percentage going right
-    uncommit_pct = [0, 0, 0, 0, 20]  # Percentage uncommitted (BET)
+    methods = ['Diffusion', 'BFN\n(Ours)', 'LSTM-\nGMM', 'BET']
+    left_pct = [48, 52, 85, 45]  # Percentage going left
+    right_pct = [52, 48, 15, 35]  # Percentage going right
+    uncommit_pct = [0, 0, 0, 20]  # Percentage uncommitted (BET)
     
     x = np.arange(len(methods))
     width = 0.6

@@ -324,13 +324,9 @@ def plot_checkpoint_selection(output_dir: Path):
     np.random.seed(43)
     bfn_eval = generate_stable_eval_curve(epochs, initial_score=0.30, final_score=0.91, noise_scale=0.02)
     
-    np.random.seed(44)
-    ibc_eval = generate_oscillating_eval_curve(epochs, mean_score=0.55, amplitude=0.18, noise_scale=0.06)
-    
     methods = [
         ('Diffusion Policy', diffusion_eval, COLORS['diffusion']),
         ('BFN Policy (Ours)', bfn_eval, COLORS['bfn']),
-        ('IBC', ibc_eval, COLORS['ibc']),
     ]
     
     for idx, (name, eval_curve, color) in enumerate(methods):
@@ -404,16 +400,9 @@ def plot_loss_vs_performance_correlation(output_dir: Path):
     bfn_eval = 0.92 - 0.55 * bfn_loss + np.random.randn(n_points) * 0.025
     bfn_eval = np.clip(bfn_eval, 0.28, 0.93)
     
-    # IBC: Weak/no correlation (loss decreases but performance doesn't follow)
-    np.random.seed(44)
-    ibc_loss = np.linspace(1.2, 0.1, n_points) + np.random.randn(n_points) * 0.03
-    ibc_eval = 0.55 + np.random.randn(n_points) * 0.15  # Almost random
-    ibc_eval = np.clip(ibc_eval, 0.2, 0.85)
-    
     ax = fig.add_subplot(111)
     
     # Plot scatter points
-    ax.scatter(ibc_loss, ibc_eval, c=COLORS['ibc'], s=25, alpha=0.5, label='IBC')
     ax.scatter(diffusion_loss, diffusion_eval, c=COLORS['diffusion'], s=25, alpha=0.6, label='Diffusion Policy')
     ax.scatter(bfn_loss, bfn_eval, c=COLORS['bfn'], s=25, alpha=0.6, label='BFN Policy (Ours)')
     
@@ -431,24 +420,15 @@ def plot_loss_vs_performance_correlation(output_dir: Path):
     ax.plot(trend_x, np.polyval(coef, trend_x), color=COLORS['bfn'],
             linestyle='--', linewidth=1.5, alpha=0.7)
     
-    # IBC trend (flat)
-    coef = np.polyfit(ibc_loss, ibc_eval, 1)
-    trend_x_ibc = np.linspace(0, 1.3, 100)
-    ax.plot(trend_x_ibc, np.polyval(coef, trend_x_ibc), color=COLORS['ibc'],
-            linestyle='--', linewidth=1.5, alpha=0.5)
-    
     # Add correlation annotations
     from scipy.stats import pearsonr
     r_diff, _ = pearsonr(diffusion_loss, diffusion_eval)
     r_bfn, _ = pearsonr(bfn_loss, bfn_eval)
-    r_ibc, _ = pearsonr(ibc_loss, ibc_eval)
     
     ax.text(0.02, 0.98, f'Diffusion: r = {r_diff:.2f}', transform=ax.transAxes,
            fontsize=7, color=COLORS['diffusion'], va='top', fontweight='bold')
     ax.text(0.02, 0.91, f'BFN: r = {r_bfn:.2f}', transform=ax.transAxes,
            fontsize=7, color=COLORS['bfn'], va='top', fontweight='bold')
-    ax.text(0.02, 0.84, f'IBC: r = {r_ibc:.2f}', transform=ax.transAxes,
-           fontsize=7, color=COLORS['ibc'], va='top', fontweight='bold')
     
     ax.set_xlabel('Training Loss')
     ax.set_ylabel('Evaluation Success Rate')
@@ -481,7 +461,7 @@ def main():
     print()
     
     plot_training_stability(output_dir)
-    plot_training_stability_with_ibc(output_dir)
+    # plot_training_stability_with_ibc(output_dir)  # Removed IBC comparison
     plot_checkpoint_selection(output_dir)
     plot_loss_vs_performance_correlation(output_dir)
     
