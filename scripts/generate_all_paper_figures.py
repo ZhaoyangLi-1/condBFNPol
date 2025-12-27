@@ -50,11 +50,21 @@ def run_script(
         if result.returncode == 0:
             return True, result.stdout
         else:
-            # Return stderr if available, otherwise stdout
-            error_output = result.stderr if result.stderr else result.stdout
+            # Combine stderr and stdout for better error reporting
+            error_parts = []
+            if result.stderr:
+                error_parts.append("STDERR:")
+                error_parts.append(result.stderr)
+            if result.stdout:
+                error_parts.append("STDOUT:")
+                error_parts.append(result.stdout)
+            if not error_parts:
+                error_parts.append(f"Script failed with exit code {result.returncode} (no output)")
+            error_output = "\n".join(error_parts)
             return False, error_output
     except Exception as e:
-        return False, str(e)
+        import traceback
+        return False, f"Exception running script: {str(e)}\n{traceback.format_exc()}"
 
 
 def main():
@@ -253,8 +263,24 @@ Examples:
                         print(f"    {line}")
             results['success'].append((script_path.name, description))
         else:
-            error_msg = output.split('\n')[-1] if output else "Unknown error"
-            print(f"  ❌ FAILED: {error_msg}")
+            # Show more error details
+            if output:
+                error_lines = output.strip().split('\n')
+                if len(error_lines) > 10:
+                    print(f"  ❌ FAILED (showing last 10 lines):")
+                    for line in error_lines[-10:]:
+                        if line.strip():
+                            print(f"    {line}")
+                else:
+                    print(f"  ❌ FAILED:")
+                    for line in error_lines:
+                        if line.strip():
+                            print(f"    {line}")
+                error_msg = '\n'.join([l for l in error_lines[-5:] if l.strip()])  # Last 5 non-empty lines
+            else:
+                error_msg = "Unknown error (no output captured)"
+                print(f"  ❌ FAILED: {error_msg}")
+            
             if required:
                 print(f"  ⚠️  WARNING: This is a required script!")
             results['failed'].append((script_path.name, description, error_msg))
