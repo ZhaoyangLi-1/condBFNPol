@@ -212,6 +212,179 @@ Results show test success rate averaged over 3 random seeds.}
     print("\n" + latex)
 
 
+def generate_main_results_table(results: Dict, output_dir: Path):
+    """Generate main results table in figures/tables/ format."""
+    bfn_scores = results['BFN']['scores']
+    diff_scores = results['Diffusion']['scores']
+    
+    bfn_mean = np.mean(bfn_scores) if bfn_scores else 0
+    bfn_std = np.std(bfn_scores) if bfn_scores else 0
+    diff_mean = np.mean(diff_scores) if diff_scores else 0
+    diff_std = np.std(diff_scores) if diff_scores else 0
+    
+    latex = r"""% Main Results Table - Performance Comparison
+% Style: Google Research / NeurIPS format
+
+\begin{table}[t]
+\centering
+\caption{\textbf{Push-T Task Performance.} We compare Bayesian Flow Networks (BFN) against Diffusion Policy on the Push-T manipulation benchmark. Results are averaged over 3 random seeds with standard deviation reported. Both methods use identical ConditionalUnet1D architectures for fair comparison.}
+\label{tab:main_results}
+\vspace{0.5em}
+\small
+\begin{tabular}{@{}lcccc@{}}
+\toprule
+\textbf{Method} & \textbf{Success Rate} $\uparrow$ & \textbf{Inference Steps} $\downarrow$ & \textbf{Training Epochs} \\
+\midrule
+"""
+    
+    latex += f"Diffusion Policy & $\\mathbf{{{diff_mean:.3f} \\pm {diff_std:.3f}}}$ & 100 & 300 \\\\\n"
+    latex += f"BFN Policy (Ours) & ${bfn_mean:.3f} \\pm {bfn_std:.3f}$ & \\textbf{{20}} & 300 \\\\\n"
+    
+    rel_diff = ((bfn_mean - diff_mean) / diff_mean * 100) if diff_mean > 0 else 0
+    latex += r"""\midrule
+\textit{Relative} & """
+    latex += f"${rel_diff:+.1f}\\%$ & $\\mathbf{{5\\times}}$ \\textit{{faster}} & -- \\\\\n"
+    latex += r"""\bottomrule
+\end{tabular}
+\vspace{-1em}
+\end{table}
+"""
+    
+    output_path = output_dir / "main_results.tex"
+    with open(output_path, 'w') as f:
+        f.write(latex)
+    print(f"✓ Main results table saved to: {output_path}")
+
+
+def generate_per_seed_table(results: Dict, output_dir: Path):
+    """Generate per-seed results table."""
+    bfn_scores = results['BFN']['scores']
+    diff_scores = results['Diffusion']['scores']
+    
+    latex = r"""% Per-Seed Results Table
+% Style: Google Research / NeurIPS format
+
+\begin{table}[t]
+\centering
+\caption{\textbf{Per-Seed Performance Breakdown.} Individual results for each random seed, showing the variability across different training runs.}
+\label{tab:per_seed_results}
+\vspace{0.5em}
+\small
+\begin{tabular}{@{}lccccc@{}}
+\toprule
+\textbf{Method} & \textbf{Seed 42} & \textbf{Seed 43} & \textbf{Seed 44} & \textbf{Mean} & \textbf{Std} \\
+\midrule
+"""
+    
+    if len(bfn_scores) >= 3:
+        latex += f"BFN & {bfn_scores[0]:.3f} & {bfn_scores[1]:.3f} & {bfn_scores[2]:.3f} "
+        latex += f"& ${np.mean(bfn_scores):.3f} \\pm {np.std(bfn_scores):.3f}$ \\\\\n"
+    
+    if len(diff_scores) >= 3:
+        latex += f"Diffusion & {diff_scores[0]:.3f} & {diff_scores[1]:.3f} & {diff_scores[2]:.3f} "
+        latex += f"& ${np.mean(diff_scores):.3f} \\pm {np.std(diff_scores):.3f}$ \\\\\n"
+    
+    latex += r"""\bottomrule
+\end{tabular}
+\vspace{-1em}
+\end{table}
+"""
+    
+    output_path = output_dir / "per_seed_results.tex"
+    with open(output_path, 'w') as f:
+        f.write(latex)
+    print(f"✓ Per-seed results table saved to: {output_path}")
+
+
+def generate_efficiency_table(results: Dict, output_dir: Path):
+    """Generate efficiency comparison table."""
+    bfn_scores = results['BFN']['scores']
+    diff_scores = results['Diffusion']['scores']
+    
+    bfn_mean = np.mean(bfn_scores) if bfn_scores else 0
+    diff_mean = np.mean(diff_scores) if diff_scores else 0
+    
+    # Efficiency = score per step
+    bfn_steps = 20
+    diff_steps = 100
+    bfn_efficiency = bfn_mean / bfn_steps * 100  # Normalized to per 100 steps
+    diff_efficiency = diff_mean / diff_steps * 100
+    efficiency_ratio = bfn_efficiency / diff_efficiency if diff_efficiency > 0 else 0
+    
+    latex = r"""% Computational Efficiency Table
+% Style: Google Research / NeurIPS format
+
+\begin{table}[t]
+\centering
+\caption{\textbf{Computational Efficiency Analysis.} We normalize performance by inference cost to evaluate efficiency. BFN achieves significantly better efficiency per inference step, making it more suitable for real-time robotics applications where latency is critical.}
+\label{tab:efficiency}
+\vspace{0.5em}
+\small
+\begin{tabular}{@{}lccc@{}}
+\toprule
+\textbf{Method} & \textbf{Success Rate} & \textbf{Inference Steps} & \textbf{Efficiency}$^\dagger$ \\
+\midrule
+"""
+    
+    latex += f"Diffusion Policy & ${diff_mean:.3f}$ & 100 & ${diff_efficiency:.2f}$ \\\\\n"
+    latex += f"BFN Policy (Ours) & ${bfn_mean:.3f}$ & \\textbf{{20}} & \\textbf{{${bfn_efficiency:.2f}$}} \\\\\n"
+    latex += r"""\midrule
+\textit{BFN Advantage} & -- & $5\times$ faster & $\mathbf{"""
+    latex += f"{efficiency_ratio:.1f}\\times$}} better \\\\\n"
+    latex += r"""\bottomrule
+\end{tabular}
+\vspace{0.3em}
+\raggedright
+\footnotesize{$^\dagger$Efficiency = (Success Rate / Inference Steps) $\times$ 100. Higher is better.}
+\end{table}
+"""
+    
+    output_path = output_dir / "efficiency.tex"
+    with open(output_path, 'w') as f:
+        f.write(latex)
+    print(f"✓ Efficiency table saved to: {output_path}")
+
+
+def generate_bfn_diffusion_comparison_table(results: Dict, output_dir: Path):
+    """Generate detailed BFN vs Diffusion comparison table."""
+    bfn_scores = results['BFN']['scores']
+    diff_scores = results['Diffusion']['scores']
+    
+    latex = r"""% BFN vs Diffusion Detailed Comparison Table
+% Style: Google Research / NeurIPS format
+
+\begin{table}[t]
+\centering
+\caption{\textbf{BFN vs Diffusion Policy Comparison.} Detailed performance metrics comparing Bayesian Flow Networks and Diffusion Policy on the Push-T manipulation task. Results show test success rate averaged over 3 random seeds with standard deviation.}
+\label{tab:bfn_vs_diffusion}
+\vspace{0.5em}
+\small
+\begin{tabular}{@{}lccccc@{}}
+\toprule
+\textbf{Method} & \textbf{Seed 42} & \textbf{Seed 43} & \textbf{Seed 44} & \textbf{Mean} & \textbf{Std} \\
+\midrule
+"""
+    
+    if len(bfn_scores) >= 3:
+        latex += f"BFN & {bfn_scores[0]:.3f} & {bfn_scores[1]:.3f} & {bfn_scores[2]:.3f} "
+        latex += f"& ${np.mean(bfn_scores):.3f} \\pm {np.std(bfn_scores):.3f}$ \\\\\n"
+    
+    if len(diff_scores) >= 3:
+        latex += f"Diffusion & {diff_scores[0]:.3f} & {diff_scores[1]:.3f} & {diff_scores[2]:.3f} "
+        latex += f"& ${np.mean(diff_scores):.3f} \\pm {np.std(diff_scores):.3f}$ \\\\\n"
+    
+    latex += r"""\bottomrule
+\end{tabular}
+\vspace{-1em}
+\end{table}
+"""
+    
+    output_path = output_dir / "table_bfn_diffusion_comparison.tex"
+    with open(output_path, 'w') as f:
+        f.write(latex)
+    print(f"✓ BFN vs Diffusion comparison table saved to: {output_path}")
+
+
 def plot_training_curves(results: Dict, output_dir: Path):
     """Plot training curves comparison."""
     if not HAS_MATPLOTLIB:
@@ -369,8 +542,16 @@ def main():
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     
-    # Generate LaTeX table
+    # Create tables subdirectory
+    tables_dir = output_dir / "tables"
+    tables_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Generate LaTeX tables
     generate_latex_table(results, output_dir / "results_table.tex")
+    generate_main_results_table(results, tables_dir)
+    generate_per_seed_table(results, tables_dir)
+    generate_efficiency_table(results, tables_dir)
+    generate_bfn_diffusion_comparison_table(results, tables_dir)
     
     # Generate plots
     plot_training_curves(results, output_dir)
@@ -380,9 +561,13 @@ def main():
     print("ANALYSIS COMPLETE!")
     print("="*70)
     print(f"\nOutput files:")
-    print(f"  - figures/results_table.tex (LaTeX table for thesis)")
-    print(f"  - figures/benchmark_comparison.pdf (Training curves)")
-    print(f"  - figures/per_seed_comparison.pdf (Per-seed bars)")
+    print(f"  - {output_dir}/results_table.tex (LaTeX table for thesis)")
+    print(f"  - {tables_dir}/main_results.tex (Main results table)")
+    print(f"  - {tables_dir}/per_seed_results.tex (Per-seed breakdown)")
+    print(f"  - {tables_dir}/efficiency.tex (Efficiency metrics)")
+    print(f"  - {tables_dir}/table_bfn_diffusion_comparison.tex (Detailed comparison)")
+    print(f"  - {output_dir}/benchmark_comparison.pdf (Training curves)")
+    print(f"  - {output_dir}/per_seed_comparison.pdf (Per-seed bars)")
 
 
 if __name__ == '__main__':

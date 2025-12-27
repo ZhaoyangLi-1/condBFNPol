@@ -157,13 +157,20 @@ Examples:
             'script': scripts_dir / 'analyze_local_results.py',
             'description': 'Analysis tables and comparison figures',
             'required': True,
-            'args': ['--checkpoint-dir', args.checkpoint_dir],
+            'args': ['--checkpoint-dir', args.checkpoint_dir, '--output-dir', args.output_dir],
         },
         
         {
             'script': scripts_dir / 'extract_scores_from_logs.py',
             'description': 'Extract scores from logs and generate tables',
             'required': True,
+            'args': ['--checkpoint-dir', args.checkpoint_dir],
+        },
+        
+        {
+            'script': scripts_dir / 'statistical_analysis.py',
+            'description': 'Statistical analysis and tables',
+            'required': False,
             'args': ['--checkpoint-dir', args.checkpoint_dir],
         },
         
