@@ -17,38 +17,19 @@ import matplotlib.gridspec as gridspec
 from scipy.ndimage import gaussian_filter1d
 
 # =============================================================================
-# GOOGLE RESEARCH STYLE
+# ANTHROPIC RESEARCH STYLE
 # =============================================================================
 
+from colors import COLORS as _BASE_COLORS, setup_matplotlib_style, SINGLE_COL, DOUBLE_COL
+
+# Setup matplotlib style
+setup_matplotlib_style()
+
+# Extend colors with IBC (use neutral tan for third method)
 COLORS = {
-    'bfn': '#4285F4',           # Google Blue
-    'diffusion': '#EA4335',     # Google Red
-    'ibc': '#FBBC04',           # Google Yellow (for comparison)
-    'gray': '#5F6368',
-    'light_gray': '#E8EAED',
-    'black': '#202124',
+    **_BASE_COLORS,
+    'ibc': '#C4A77D',  # Anthropic Tan for IBC comparison
 }
-
-plt.rcParams.update({
-    'font.family': 'serif',
-    'font.serif': ['Times New Roman', 'DejaVu Serif'],
-    'mathtext.fontset': 'stix',
-    'font.size': 9,
-    'axes.titlesize': 10,
-    'axes.labelsize': 9,
-    'xtick.labelsize': 8,
-    'ytick.labelsize': 8,
-    'legend.fontsize': 8,
-    'figure.dpi': 150,
-    'savefig.dpi': 300,
-    'savefig.bbox': 'tight',
-    'axes.linewidth': 0.8,
-    'axes.spines.top': False,
-    'axes.spines.right': False,
-})
-
-SINGLE_COL = 3.5
-DOUBLE_COL = 7.16
 
 
 # =============================================================================
@@ -148,7 +129,7 @@ def plot_training_stability(output_dir: Path):
     
     ax1.set_xlabel('Epoch')
     ax1.set_ylabel('Training Loss')
-    ax1.set_title('(a) Training Loss', fontweight='bold', pad=8)
+    ax1.set_title('(a) Training Loss', fontweight='bold')
     ax1.set_xlim(0, epochs)
     ax1.set_ylim(0, 1.0)
     ax1.legend(loc='upper right', frameon=True, fancybox=False, 
@@ -185,7 +166,7 @@ def plot_training_stability(output_dir: Path):
     
     ax2.set_xlabel('Epoch')
     ax2.set_ylabel('Success Rate')
-    ax2.set_title('(b) Evaluation Performance', fontweight='bold', pad=8)
+    ax2.set_title('(b) Evaluation Performance', fontweight='bold')
     ax2.set_xlim(0, epochs)
     ax2.set_ylim(0, 1.05)
     ax2.legend(loc='lower right', frameon=True, fancybox=False,
@@ -242,7 +223,7 @@ def plot_training_stability_with_ibc(output_dir: Path):
     
     ax1.set_xlabel('Epoch')
     ax1.set_ylabel('Training Loss')
-    ax1.set_title('(a) Training Loss', fontweight='bold', pad=8)
+    ax1.set_title('(a) Training Loss', fontweight='bold')
     ax1.set_xlim(0, epochs)
     ax1.set_ylim(0, 1.6)
     ax1.legend(loc='upper right', frameon=True, fancybox=False,
@@ -275,7 +256,7 @@ def plot_training_stability_with_ibc(output_dir: Path):
     
     ax2.set_xlabel('Epoch')
     ax2.set_ylabel('Success Rate')
-    ax2.set_title('(b) Evaluation Performance', fontweight='bold', pad=8)
+    ax2.set_title('(b) Evaluation Performance', fontweight='bold')
     ax2.set_xlim(0, epochs)
     ax2.set_ylim(0, 1.05)
     ax2.legend(loc='lower right', frameon=True, fancybox=False,
@@ -368,7 +349,7 @@ def plot_checkpoint_selection(output_dir: Path):
         ax.set_xlabel('Epoch')
         if idx == 0:
             ax.set_ylabel('Success Rate')
-        ax.set_title(f'({chr(97+idx)}) {name}', fontweight='bold', pad=8, fontsize=9)
+        ax.set_title(f'({chr(97+idx)}) {name}', fontweight='bold', fontsize=9)
         ax.set_xlim(0, epochs)
         ax.set_ylim(0, 1.1)
         ax.grid(True, alpha=0.3, linestyle='-', linewidth=0.5)
@@ -432,7 +413,7 @@ def plot_loss_vs_performance_correlation(output_dir: Path):
     
     ax.set_xlabel('Training Loss')
     ax.set_ylabel('Evaluation Success Rate')
-    ax.set_title('Loss-Performance Correlation', fontweight='bold', pad=10)
+    ax.set_title('Loss-Performance Correlation', fontweight='bold')
     ax.legend(loc='lower left', frameon=True, fancybox=False,
               edgecolor=COLORS['light_gray'], fontsize=7)
     ax.grid(True, alpha=0.3, linestyle='-', linewidth=0.5)

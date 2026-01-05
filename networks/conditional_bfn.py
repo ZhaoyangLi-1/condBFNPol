@@ -259,6 +259,306 @@ class ContinuousBFN(nn.Module):
         return outputs
 
 
+class HybridBFN(nn.Module):
+    """
+    Hybrid Bayesian Flow Network for mixed continuous-discrete action spaces.
+    
+    This is the key contribution for robotic manipulation tasks where actions
+    consist of continuous arm joints (7D) and discrete gripper commands (binary).
+    
+    Key insight: BFN transmits CONTINUOUS messages for both modalities, maintaining
+    end-to-end differentiability unlike diffusion models which require relaxations.
+    
+    - Continuous dimensions: Gaussian-Gaussian conjugacy (mean, precision)
+    - Discrete dimensions: Dirichlet-Categorical conjugacy (concentration params)
+    """
+    
+    def __init__(
+        self,
+        continuous_dim: int,
+        discrete_dims: list,  # List of (dim_idx, n_classes) tuples
+        net: BFNetwork,
+        *,
+        sigma_1: float = 0.001,  # Continuous schedule param
+        beta_1: float = 0.2,     # Discrete schedule param  
+        device_str: str = "cpu",
+        dtype_str: str = "float32",
+        eps: float = 1e-9,
+    ):
+        """
+        Args:
+            continuous_dim: Number of continuous action dimensions (e.g., 7 for arm)
+            discrete_dims: List of tuples (dim_idx, n_classes) for discrete dims
+                          e.g., [(7, 2)] for binary gripper at index 7
+            net: Network that takes (x, t, cond) -> (continuous_pred, discrete_logits)
+            sigma_1: Final noise level for continuous (smaller = more precise)
+            beta_1: Final accuracy for discrete
+        """
+        super().__init__()
+        self.device = t.device(device_str)
+        self.dtype = str_to_torch_dtype(dtype_str)
+        self.continuous_dim = continuous_dim
+        self.discrete_dims = discrete_dims  # [(dim_idx, n_classes), ...]
+        self.sigma_1 = sigma_1
+        self.beta_1 = beta_1
+        
+        dtype_eps = t.finfo(self.dtype).eps
+        self.eps = eps if eps < dtype_eps else dtype_eps
+        
+        self.net = net.to(self.device, self.dtype)
+        self.net.train()
+        
+        # Total output dimension
+        self.total_dim = continuous_dim + len(discrete_dims)
+        
+    def _pad_to_dim(self, a: Tensor["B"]) -> Tensor["B", 1]:
+        return a.view(a.shape[0], 1)
+    
+    def continuous_output_prediction(
+        self,
+        mu: Tensor["B", "D_cont"],
+        time: Tensor["B", 1],
+        gamma: Tensor["B", 1],
+        cond: Optional[Tensor["B", "C"]] = None,
+        x_min: float = -1.0,
+        x_max: float = 1.0,
+    ) -> Tensor["B", "D_cont"]:
+        """Get continuous output prediction from network."""
+        # Combine continuous mu with discrete theta for network input
+        # Network outputs both continuous and discrete predictions
+        out = self.net(mu, time.view(-1), cond)
+        
+        # Extract continuous part
+        x = out[:, :self.continuous_dim]
+        x = t.clip(x, x_min, x_max)
+        
+        zeros = t.zeros_like(x)
+        return t.where(time < 1e-10, zeros, x)
+    
+    def discrete_output_probs(
+        self,
+        theta: Tensor["B", "K"],  # Softmax probabilities for discrete dim
+        time: Tensor["B"],
+        cond: Optional[Tensor["B", "C"]] = None,
+        discrete_idx: int = 0,
+    ) -> Tensor["B", "K"]:
+        """Get discrete output probabilities from network."""
+        # For discrete, we need to get logits and convert to probs
+        # Network outputs logits for discrete dimensions
+        # This is handled in the hybrid forward pass
+        pass  # Implemented in loss and sample methods
+    
+    def loss(
+        self,
+        x_cont: Tensor["B", "D_cont"],  # Continuous actions
+        x_disc: Tensor["B", "N_disc"],  # Discrete actions (class indices)
+        cond: Optional[Tensor["B", "C"]] = None,
+    ) -> Tensor["B"]:
+        """
+        Combined loss for hybrid action space.
+        
+        Args:
+            x_cont: Continuous actions [B, D_cont] in [-1, 1]
+            x_disc: Discrete actions [B, N_disc] as class indices (0, 1, ...)
+            cond: Conditioning vector
+            
+        Returns:
+            Batch loss combining continuous MSE and discrete cross-entropy
+        """
+        B = x_cont.size(0)
+        device = x_cont.device
+        
+        # Sample time uniformly
+        time = t.rand((B,), device=device, dtype=self.dtype)
+        time_expanded = self._pad_to_dim(time)
+        
+        # ============ Continuous Loss ============
+        # gamma = 1 - sigma_1^(2t)
+        gamma = 1.0 - (self.sigma_1 ** (2.0 * time_expanded))
+        
+        # Sample noisy mean: mu ~ N(gamma * x, sqrt(gamma * (1-gamma)))
+        var = gamma * (1.0 - gamma)
+        std = (var + self.eps).sqrt()
+        mu_cont = gamma * x_cont + std * t.randn_like(x_cont)
+        
+        # ============ Discrete Loss ============
+        # beta = beta_1 * t^2
+        beta = self.beta_1 * time_expanded.pow(2.0)
+        
+        # For each discrete dimension, compute theta (softmax probs)
+        theta_list = []
+        for dim_idx, n_classes in self.discrete_dims:
+            # One-hot encode the true class
+            x_d = x_disc[:, dim_idx - self.continuous_dim].long()
+            e_x = F.one_hot(x_d, num_classes=n_classes).float()
+            
+            # Sample y: mean = beta * (K * e_x - 1), var = beta * K
+            mean = beta * (n_classes * e_x - 1)
+            std_disc = (beta * n_classes + self.eps).sqrt()
+            y_samples = mean + std_disc * t.randn_like(mean)
+            
+            # theta = softmax(y)
+            theta = t.softmax(y_samples, -1)
+            theta_list.append(theta)
+        
+        # ============ Network Forward ============
+        # Concatenate mu_cont and theta for network input
+        if len(theta_list) > 0:
+            theta_concat = t.cat(theta_list, dim=-1)
+            net_input = t.cat([mu_cont, theta_concat], dim=-1)
+        else:
+            net_input = mu_cont
+        
+        # Network predicts clean data
+        out = self.net(net_input, time, cond)
+        
+        # ============ Compute Losses ============
+        # Continuous: MSE weighted by gamma
+        x_cont_pred = out[:, :self.continuous_dim]
+        cont_loss = gamma.squeeze(-1) * (x_cont - x_cont_pred).pow(2.0).sum(-1)
+        
+        # Discrete: Cross-entropy for each discrete dimension
+        disc_loss = t.zeros(B, device=device, dtype=self.dtype)
+        offset = self.continuous_dim
+        for i, (dim_idx, n_classes) in enumerate(self.discrete_dims):
+            logits = out[:, offset:offset + n_classes]
+            x_d = x_disc[:, i].long()
+            disc_loss = disc_loss + F.cross_entropy(logits, x_d, reduction='none')
+            offset += n_classes
+        
+        # Combined loss
+        total_loss = cont_loss + disc_loss
+        return total_loss
+    
+    @t.inference_mode()
+    def sample(
+        self,
+        n_samples: int = 1,
+        n_timesteps: int = 20,
+        cond: Optional[Tensor["Y", "C"]] = None,
+    ) -> Tuple[Tensor["B", "D_cont"], Tensor["B", "N_disc"]]:
+        """
+        Sample from hybrid BFN using Bayesian updates.
+        
+        Returns:
+            Tuple of (continuous_actions, discrete_actions)
+        """
+        if exists(cond):
+            if cond.ndim == 1:
+                cond = cond.unsqueeze(0)
+            n_cond = cond.size(0)
+            cond = cond.repeat_interleave(n_samples, 0)
+            batch = cond.size(0)
+        else:
+            batch = n_samples
+            n_cond = 1
+        
+        self.net.eval()
+        tkwargs = {"device": self.device, "dtype": self.dtype}
+        
+        # ============ Initialize Beliefs ============
+        # Continuous: mu=0, rho=1 (uninformative prior)
+        mu_cont = t.zeros((batch, self.continuous_dim), **tkwargs)
+        rho_cont = 1.0
+        
+        # Discrete: uniform theta (1/K for each class)
+        theta_list = []
+        for _, n_classes in self.discrete_dims:
+            theta = t.full((batch, n_classes), 1.0 / n_classes, **tkwargs)
+            theta_list.append(theta)
+        
+        # ============ Iterative Refinement ============
+        for i in range(1, n_timesteps + 1):
+            time_val = (i - 1) / n_timesteps
+            time = t.tensor([time_val], **tkwargs).expand(batch)
+            
+            # Concatenate current beliefs for network input
+            if len(theta_list) > 0:
+                theta_concat = t.cat(theta_list, dim=-1)
+                net_input = t.cat([mu_cont, theta_concat], dim=-1)
+            else:
+                net_input = mu_cont
+            
+            # Network prediction
+            out = self.net(net_input, time, cond)
+            
+            # ============ Continuous Update ============
+            x_cont_pred = out[:, :self.continuous_dim]
+            
+            # alpha_i for continuous
+            alpha_cont = (self.sigma_1 ** (-2.0 * i / n_timesteps)) * \
+                        (1.0 - self.sigma_1 ** (2.0 / n_timesteps))
+            
+            # Sample message y ~ N(x_pred, 1/sqrt(alpha))
+            sender_std = 1.0 / (alpha_cont ** 0.5 + self.eps)
+            y_cont = x_cont_pred + sender_std * t.randn_like(x_cont_pred)
+            
+            # Bayesian update
+            new_rho = rho_cont + alpha_cont
+            mu_cont = (rho_cont * mu_cont + alpha_cont * y_cont) / new_rho
+            rho_cont = new_rho
+            
+            # ============ Discrete Update ============
+            # alpha_i for discrete: beta_1 * (2i - 1) / n^2
+            alpha_disc = self.beta_1 * (2 * i - 1) / (n_timesteps ** 2)
+            
+            offset = self.continuous_dim
+            new_theta_list = []
+            for j, (_, n_classes) in enumerate(self.discrete_dims):
+                logits = out[:, offset:offset + n_classes]
+                probs = t.softmax(logits, -1)
+                
+                # Sample k from predicted distribution
+                k_samples = Categorical(probs=probs).sample()
+                e_k = F.one_hot(k_samples, num_classes=n_classes).float()
+                
+                # Sample y from sender: y ~ N(alpha * (K*e_k - 1), sqrt(alpha*K))
+                y_mean = alpha_disc * (n_classes * e_k - 1)
+                y_std = (alpha_disc * n_classes + self.eps).sqrt()
+                y_disc = y_mean + y_std * t.randn_like(y_mean)
+                
+                # Update theta: theta' = softmax(log(theta) + y)
+                log_theta = t.log(theta_list[j] + self.eps)
+                theta_new = t.softmax(log_theta + y_disc, -1)
+                new_theta_list.append(theta_new)
+                
+                offset += n_classes
+            
+            theta_list = new_theta_list
+        
+        # ============ Final Prediction ============
+        time_final = t.ones(batch, **tkwargs)
+        if len(theta_list) > 0:
+            theta_concat = t.cat(theta_list, dim=-1)
+            net_input = t.cat([mu_cont, theta_concat], dim=-1)
+        else:
+            net_input = mu_cont
+        
+        out_final = self.net(net_input, time_final, cond)
+        
+        # Extract final predictions
+        x_cont_final = out_final[:, :self.continuous_dim].clamp(-1.0, 1.0)
+        
+        # Discrete: argmax of final logits
+        x_disc_list = []
+        offset = self.continuous_dim
+        for _, n_classes in self.discrete_dims:
+            logits = out_final[:, offset:offset + n_classes]
+            x_disc_list.append(logits.argmax(dim=-1, keepdim=True))
+            offset += n_classes
+        
+        x_disc_final = t.cat(x_disc_list, dim=-1) if x_disc_list else t.empty(batch, 0, **tkwargs)
+        
+        self.net.train()
+        
+        # Reshape if we had multiple conditions
+        if exists(cond) and n_cond > 1:
+            x_cont_final = x_cont_final.view(n_cond, n_samples, -1)
+            x_disc_final = x_disc_final.view(n_cond, n_samples, -1)
+        
+        return x_cont_final, x_disc_final
+
+
 class DiscreteBFN(nn.Module):
     """
     A discrete Bayesian flow network, where every dimension of your problem

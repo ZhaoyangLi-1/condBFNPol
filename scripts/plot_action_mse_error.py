@@ -20,37 +20,13 @@ from typing import Dict, List, Tuple, Optional
 import argparse
 
 # =============================================================================
-# GOOGLE RESEARCH STYLE
+# ANTHROPIC RESEARCH STYLE
 # =============================================================================
 
-COLORS = {
-    'bfn': '#4285F4',           # Google Blue
-    'diffusion': '#EA4335',     # Google Red
-    'gray': '#5F6368',
-    'light_gray': '#E8EAED',
-    'black': '#202124',
-}
+from colors import COLORS, setup_matplotlib_style, SINGLE_COL, DOUBLE_COL
 
-plt.rcParams.update({
-    'font.family': 'serif',
-    'font.serif': ['Times New Roman', 'DejaVu Serif'],
-    'mathtext.fontset': 'stix',
-    'font.size': 9,
-    'axes.titlesize': 10,
-    'axes.labelsize': 9,
-    'xtick.labelsize': 8,
-    'ytick.labelsize': 8,
-    'legend.fontsize': 8,
-    'figure.dpi': 150,
-    'savefig.dpi': 300,
-    'savefig.bbox': 'tight',
-    'axes.linewidth': 0.8,
-    'axes.spines.top': False,
-    'axes.spines.right': False,
-})
-
-SINGLE_COL = 3.5
-DOUBLE_COL = 7.16
+# Setup matplotlib style
+setup_matplotlib_style()
 
 
 # =============================================================================
@@ -263,7 +239,7 @@ def plot_action_mse_error_comparison(
     # Styling
     ax.set_xlabel('Epoch', fontsize=9)
     ax.set_ylabel('Action Prediction MSE Error', fontsize=9)
-    ax.set_title('Action Prediction Error During Training', fontweight='bold', pad=10)
+    ax.set_title('Action Prediction Error During Training', fontweight='bold')
     ax.legend(loc='upper right', frameon=True, fancybox=False,
               edgecolor=COLORS['light_gray'], fontsize=8)
     ax.grid(True, alpha=0.3, linestyle='-', linewidth=0.5)
@@ -312,7 +288,7 @@ def plot_action_mse_with_training_loss(
     """
     fig = plt.figure(figsize=(DOUBLE_COL, SINGLE_COL * 0.75))
     
-    gs = gridspec.GridSpec(1, 2, figure=fig, wspace=0.35,
+    gs = gridspec.GridSpec(1, 2, wspace=0.35,
                            left=0.08, right=0.98, top=0.90, bottom=0.18)
     
     # ===================
@@ -345,7 +321,7 @@ def plot_action_mse_with_training_loss(
     
     ax1.set_xlabel('Epoch', fontsize=9)
     ax1.set_ylabel('Action Prediction MSE Error', fontsize=9)
-    ax1.set_title('(a) Action Prediction Error', fontweight='bold', pad=8)
+    ax1.set_title('(a) Action Prediction Error', fontweight='bold')
     ax1.legend(loc='upper right', frameon=True, fancybox=False,
                edgecolor=COLORS['light_gray'], fontsize=8)
     ax1.grid(True, alpha=0.3, linestyle='-', linewidth=0.5)
@@ -380,7 +356,7 @@ def plot_action_mse_with_training_loss(
     
     ax2.set_xlabel('Epoch', fontsize=9)
     ax2.set_ylabel('Training Loss', fontsize=9)
-    ax2.set_title('(b) Training Loss', fontweight='bold', pad=8)
+    ax2.set_title('(b) Training Loss', fontweight='bold')
     ax2.legend(loc='upper right', frameon=True, fancybox=False,
                edgecolor=COLORS['light_gray'], fontsize=8)
     ax2.grid(True, alpha=0.3, linestyle='-', linewidth=0.5)
@@ -417,7 +393,7 @@ def plot_per_seed_comparison(
     
     ax1.set_xlabel('Epoch', fontsize=9)
     ax1.set_ylabel('Action Prediction MSE Error', fontsize=9)
-    ax1.set_title('BFN Policy', fontweight='bold', pad=8)
+    ax1.set_title('BFN Policy', fontweight='bold')
     ax1.legend(loc='upper right', fontsize=7)
     ax1.grid(True, alpha=0.3)
     
@@ -436,7 +412,7 @@ def plot_per_seed_comparison(
     
     ax2.set_xlabel('Epoch', fontsize=9)
     ax2.set_ylabel('Action Prediction MSE Error', fontsize=9)
-    ax2.set_title('Diffusion Policy', fontweight='bold', pad=8)
+    ax2.set_title('Diffusion Policy', fontweight='bold')
     ax2.legend(loc='upper right', fontsize=7)
     ax2.grid(True, alpha=0.3)
     

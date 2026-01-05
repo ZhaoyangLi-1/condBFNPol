@@ -12,7 +12,6 @@ Generates:
 
 import numpy as np
 from pathlib import Path
-import torch
 import json
 import re
 
@@ -26,48 +25,21 @@ import matplotlib.gridspec as gridspec
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 
 # =============================================================================
-# GOOGLE RESEARCH STYLE CONFIGURATION
+# ANTHROPIC RESEARCH STYLE CONFIGURATION
 # =============================================================================
 
-COLORS = {
-    'bfn': '#4285F4',           # Google Blue
-    'diffusion': '#EA4335',     # Google Red
-    'ground_truth': '#34A853',  # Google Green
-    'gray': '#5F6368',
-    'black': '#202124',
-    'light_blue': '#E8F0FE',
-    'light_red': '#FCE8E6',
-    'light_green': '#E6F4EA',
-    'purple': '#9334E6',
-    'orange': '#FA7B17',
-}
+from colors import COLORS, setup_matplotlib_style, SINGLE_COL, DOUBLE_COL, ANTHROPIC_CMAP
 
-# Create custom colormaps
-CMAP_BFN = LinearSegmentedColormap.from_list('bfn', ['#E8F0FE', '#4285F4', '#1A73E8'])
-CMAP_DIFF = LinearSegmentedColormap.from_list('diff', ['#FCE8E6', '#EA4335', '#C5221F'])
-CMAP_TIME = LinearSegmentedColormap.from_list('time', ['#FEF7E0', '#FBBC04', '#F9AB00'])
+# Setup matplotlib style
+setup_matplotlib_style()
 
-plt.rcParams.update({
-    'font.family': 'serif',
-    'font.serif': ['Times New Roman', 'DejaVu Serif'],
-    'mathtext.fontset': 'stix',
-    'font.size': 9,
-    'axes.titlesize': 10,
-    'axes.labelsize': 9,
-    'xtick.labelsize': 8,
-    'ytick.labelsize': 8,
-    'legend.fontsize': 8,
-    'figure.dpi': 150,
-    'savefig.dpi': 300,
-    'savefig.bbox': 'tight',
-    'axes.linewidth': 0.8,
-    'axes.spines.top': False,
-    'axes.spines.right': False,
-    'axes.grid': False,
-})
+# Override grid for visualization figures
+plt.rcParams['axes.grid'] = False
 
-SINGLE_COL = 3.5
-DOUBLE_COL = 7.0
+# Use Anthropic colormaps
+CMAP_BFN = ANTHROPIC_CMAP['bfn']
+CMAP_DIFF = ANTHROPIC_CMAP['diffusion']
+CMAP_TIME = ANTHROPIC_CMAP['time']
 
 
 # =============================================================================
@@ -138,7 +110,14 @@ def generate_multiple_samples(gt, n_samples=5, method='bfn', seed=42):
 
 def plot_trajectory_comparison(output_dir: Path):
     """Compare predicted trajectories: BFN vs Diffusion vs Ground Truth."""
-    fig, axes = plt.subplots(1, 3, figsize=(DOUBLE_COL, SINGLE_COL * 0.7))
+    # Create figure with extra space for colorbar on the right
+    fig = plt.figure(figsize=(DOUBLE_COL + 0.5, SINGLE_COL * 0.7))
+    
+    # Use GridSpec to control layout: 3 equal panels + 1 narrow colorbar
+    gs = gridspec.GridSpec(1, 4, width_ratios=[1, 1, 1, 0.05], wspace=0.25)
+    
+    axes = [fig.add_subplot(gs[0, i]) for i in range(3)]
+    cax = fig.add_subplot(gs[0, 3])  # Dedicated colorbar axis
     
     # Generate data
     gt = generate_synthetic_trajectory(T=16, seed=42)
@@ -150,6 +129,8 @@ def plot_trajectory_comparison(output_dir: Path):
         ('BFN (Ours)', bfn_pred, COLORS['bfn'], 's'),
         ('Diffusion', diff_pred, COLORS['diffusion'], '^'),
     ]
+    
+    scatter = None  # Will store the last scatter for colorbar
     
     for ax, (title, traj, color, marker) in zip(axes, configs):
         # Draw trajectory with time coloring
@@ -180,13 +161,15 @@ def plot_trajectory_comparison(output_dir: Path):
         if ax == axes[0]:
             ax.set_ylabel('Position Y')
     
-    # Add colorbar for time
-    cbar = fig.colorbar(scatter, ax=axes, orientation='vertical', 
-                        fraction=0.02, pad=0.02, label='Time Step')
+    # Add colorbar to dedicated axis (no overlap with panels)
+    cbar = fig.colorbar(scatter, cax=cax, orientation='vertical')
+    cbar.set_label('Time Step', fontsize=8)
+    cbar.ax.tick_params(labelsize=7)
     
-    plt.tight_layout()
-    fig.savefig(output_dir / 'fig_trajectory_comparison.pdf')
-    fig.savefig(output_dir / 'fig_trajectory_comparison.png', dpi=300)
+    # Adjust subplot spacing (don't use tight_layout with GridSpec)
+    plt.subplots_adjust(left=0.08, right=0.92, bottom=0.15, top=0.88, wspace=0.25)
+    fig.savefig(str(output_dir / 'fig_trajectory_comparison.pdf'))
+    fig.savefig(str(output_dir / 'fig_trajectory_comparison.png'), dpi=300)
     plt.close(fig)
     print("  ✓ Trajectory comparison")
 
@@ -199,7 +182,7 @@ def plot_denoising_process(output_dir: Path):
     """Visualize the denoising/sampling process for both methods."""
     fig = plt.figure(figsize=(DOUBLE_COL, SINGLE_COL * 1.1))
     
-    gs = gridspec.GridSpec(2, 6, figure=fig, hspace=0.4, wspace=0.15,
+    gs = gridspec.GridSpec(2, 6, hspace=0.4, wspace=0.15,
                            height_ratios=[1, 1])
     
     gt = generate_synthetic_trajectory(T=16, seed=42)
@@ -257,8 +240,8 @@ def plot_denoising_process(output_dir: Path):
     fig.text(0.5, 0.48, '← Denoising Direction →', ha='center', fontsize=9,
              style='italic', color=COLORS['gray'])
     
-    fig.savefig(output_dir / 'fig_denoising_process.pdf')
-    fig.savefig(output_dir / 'fig_denoising_process.png', dpi=300)
+    fig.savefig(str(output_dir / 'fig_denoising_process.pdf'))
+    fig.savefig(str(output_dir / 'fig_denoising_process.png'), dpi=300)
     plt.close(fig)
     print("  ✓ Denoising process")
 
@@ -316,8 +299,8 @@ def plot_prediction_variance(output_dir: Path):
     axes[1].text(-0.15, 1.05, '(b)', transform=axes[1].transAxes, fontsize=10, fontweight='bold')
     
     plt.tight_layout()
-    fig.savefig(output_dir / 'fig_prediction_variance.pdf')
-    fig.savefig(output_dir / 'fig_prediction_variance.png', dpi=300)
+    fig.savefig(str(output_dir / 'fig_prediction_variance.pdf'))
+    fig.savefig(str(output_dir / 'fig_prediction_variance.png'), dpi=300)
     plt.close(fig)
     print("  ✓ Prediction variance")
 
@@ -361,8 +344,8 @@ def plot_action_dimensions(output_dir: Path):
     axes[1].set_xlabel('Time Step')
     
     plt.tight_layout()
-    fig.savefig(output_dir / 'fig_action_dimensions.pdf')
-    fig.savefig(output_dir / 'fig_action_dimensions.png', dpi=300)
+    fig.savefig(str(output_dir / 'fig_action_dimensions.pdf'))
+    fig.savefig(str(output_dir / 'fig_action_dimensions.png'), dpi=300)
     plt.close(fig)
     print("  ✓ Action dimensions")
 
@@ -458,8 +441,8 @@ def plot_pusht_visualization(output_dir: Path):
             spine.set_linewidth(0.5)
     
     plt.tight_layout()
-    fig.savefig(output_dir / 'fig_pusht_visualization.pdf')
-    fig.savefig(output_dir / 'fig_pusht_visualization.png', dpi=300)
+    fig.savefig(str(output_dir / 'fig_pusht_visualization.pdf'))
+    fig.savefig(str(output_dir / 'fig_pusht_visualization.png'), dpi=300)
     plt.close(fig)
     print("  ✓ Push-T visualization")
 
@@ -472,7 +455,7 @@ def plot_combined_qualitative(output_dir: Path):
     """Combined qualitative results figure for main paper."""
     fig = plt.figure(figsize=(DOUBLE_COL, DOUBLE_COL * 0.65))
     
-    gs = gridspec.GridSpec(2, 3, figure=fig, hspace=0.3, wspace=0.25,
+    gs = gridspec.GridSpec(2, 3, hspace=0.3, wspace=0.25,
                            height_ratios=[1, 1])
     
     gt = generate_synthetic_trajectory(T=16, seed=42)
@@ -597,8 +580,8 @@ def plot_combined_qualitative(output_dir: Path):
     ax.text(-0.15, 1.08, '(f)', transform=ax.transAxes, fontsize=10, fontweight='bold')
     
     plt.tight_layout()
-    fig.savefig(output_dir / 'fig_qualitative_combined.pdf')
-    fig.savefig(output_dir / 'fig_qualitative_combined.png', dpi=300)
+    fig.savefig(str(output_dir / 'fig_qualitative_combined.pdf'))
+    fig.savefig(str(output_dir / 'fig_qualitative_combined.png'), dpi=300)
     plt.close(fig)
     print("  ✓ Combined qualitative figure")
 
@@ -641,13 +624,13 @@ def plot_method_diagram(output_dir: Path):
                 ax.annotate('', xy=(positions[i+1] - 0.5, 0.5), xytext=(x + 0.5, 0.5),
                            arrowprops=dict(arrowstyle='->', color=COLORS['gray'], lw=1.5))
         
-        ax.set_title(title, fontweight='bold', color=color, pad=10)
+        ax.set_title(title, fontweight='bold', color=color)
         ax.text(2.5, -0.3, f'{n_steps} steps', ha='center', fontsize=8, 
                 style='italic', color=COLORS['gray'])
     
     plt.tight_layout()
-    fig.savefig(output_dir / 'fig_method_diagram.pdf')
-    fig.savefig(output_dir / 'fig_method_diagram.png', dpi=300)
+    fig.savefig(str(output_dir / 'fig_method_diagram.pdf'))
+    fig.savefig(str(output_dir / 'fig_method_diagram.png'), dpi=300)
     plt.close(fig)
     print("  ✓ Method diagram")
 

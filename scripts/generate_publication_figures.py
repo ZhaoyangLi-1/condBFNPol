@@ -13,84 +13,22 @@ import re
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
 from matplotlib.patches import Patch
 from matplotlib.lines import Line2D
 import matplotlib.ticker as ticker
 
 # =============================================================================
-# GOOGLE RESEARCH STYLE CONFIGURATION
+# ANTHROPIC RESEARCH STYLE CONFIGURATION
 # =============================================================================
 
-# Color palette (Google Research style - muted, professional)
-COLORS = {
-    'bfn': '#4285F4',        # Google Blue
-    'diffusion': '#EA4335',  # Google Red
-    'bfn_light': '#A8C7FA',  # Light blue
-    'diff_light': '#F6AEA9', # Light red
-    'gray': '#5F6368',       # Google Gray
-    'black': '#202124',      # Near black
-}
+from colors import COLORS, setup_matplotlib_style, SINGLE_COL, DOUBLE_COL
 
-# Publication-quality settings
-plt.rcParams.update({
-    # Font settings (use serif for papers)
-    'font.family': 'serif',
-    'font.serif': ['Times New Roman', 'DejaVu Serif', 'Palatino', 'Georgia'],
-    'mathtext.fontset': 'stix',
-    
-    # Font sizes (adjusted for paper columns)
-    'font.size': 9,
-    'axes.titlesize': 10,
-    'axes.labelsize': 9,
-    'xtick.labelsize': 8,
-    'ytick.labelsize': 8,
-    'legend.fontsize': 8,
-    'figure.titlesize': 11,
-    
-    # Figure settings
-    'figure.dpi': 150,
-    'savefig.dpi': 300,
-    'savefig.bbox': 'tight',
-    'savefig.pad_inches': 0.02,
-    
-    # Axes settings
-    'axes.linewidth': 0.8,
-    'axes.edgecolor': COLORS['gray'],
-    'axes.labelcolor': COLORS['black'],
-    'axes.spines.top': False,
-    'axes.spines.right': False,
-    
-    # Grid settings
-    'axes.grid': True,
-    'grid.alpha': 0.3,
-    'grid.linewidth': 0.5,
-    'grid.linestyle': '--',
-    
-    # Tick settings
-    'xtick.direction': 'out',
-    'ytick.direction': 'out',
-    'xtick.major.width': 0.8,
-    'ytick.major.width': 0.8,
-    'xtick.major.size': 3,
-    'ytick.major.size': 3,
-    'xtick.color': COLORS['gray'],
-    'ytick.color': COLORS['gray'],
-    
-    # Legend settings
-    'legend.frameon': True,
-    'legend.framealpha': 0.9,
-    'legend.edgecolor': 'none',
-    'legend.fancybox': False,
-    
-    # Line settings
-    'lines.linewidth': 1.5,
-    'lines.markersize': 5,
-})
+# Setup matplotlib style
+setup_matplotlib_style()
 
-# Figure sizes (in inches) - standard paper column widths
-SINGLE_COL = 3.5    # Single column width
-DOUBLE_COL = 7.0    # Double column width
-ASPECT = 0.75       # Height/Width ratio
+# Height/Width ratio for figures
+ASPECT = 0.75
 
 
 # =============================================================================
@@ -309,7 +247,7 @@ def plot_training_curves(runs: dict, output_dir: Path):
     fig, ax = plt.subplots(figsize=(SINGLE_COL * 1.2, SINGLE_COL * 0.8))
     
     for policy, color, light in [('BFN', COLORS['bfn'], COLORS['bfn_light']),
-                                  ('Diffusion', COLORS['diffusion'], COLORS['diff_light'])]:
+                                  ('Diffusion', COLORS['diffusion'], COLORS['diffusion_light'])]:
         all_losses = []
         all_steps = []
         
@@ -363,8 +301,8 @@ def plot_combined_figure(runs: dict, output_dir: Path):
     """Publication-ready 4-panel combined figure."""
     fig = plt.figure(figsize=(DOUBLE_COL, DOUBLE_COL * 0.55))
     
-    # Create 2x2 grid with custom spacing
-    gs = fig.add_gridspec(2, 2, hspace=0.35, wspace=0.3,
+    # Create 2x2 grid with custom spacing (compatible with matplotlib 2.x)
+    gs = gridspec.GridSpec(2, 2, hspace=0.35, wspace=0.3,
                           left=0.08, right=0.98, top=0.95, bottom=0.1)
     
     bfn_scores = [max(r['data']['ckpt_scores'].values()) for r in runs['BFN']]

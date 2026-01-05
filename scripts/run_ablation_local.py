@@ -412,7 +412,7 @@ def generate_plots(results: Dict, output_dir: str = "figures/publication"):
     
     # Combined 2-panel figure
     fig = plt.figure(figsize=(7.16, 3.0))
-    gs = gridspec.GridSpec(1, 2, figure=fig, wspace=0.35)
+    gs = gridspec.GridSpec(1, 2, wspace=0.35)
     
     # Panel A: Score vs Steps
     ax1 = fig.add_subplot(gs[0])

@@ -583,7 +583,7 @@ def generate_ablation_plots(results: Dict, output_dir: str = "figures/publicatio
     
     # ==================== FIGURE 4: Combined 2-panel ====================
     fig = plt.figure(figsize=(DOUBLE_COL, SINGLE_COL * 0.85))
-    gs = gridspec.GridSpec(1, 2, figure=fig, wspace=0.35)
+    gs = gridspec.GridSpec(1, 2, wspace=0.35)
     
     # Panel A: Score vs Steps
     ax1 = fig.add_subplot(gs[0])

@@ -19,45 +19,26 @@ from matplotlib.colors import LinearSegmentedColormap
 import matplotlib.gridspec as gridspec
 
 # =============================================================================
-# GOOGLE RESEARCH STYLE
+# ANTHROPIC RESEARCH STYLE
 # =============================================================================
 
+from colors import COLORS as _BASE_COLORS, setup_matplotlib_style, SINGLE_COL, DOUBLE_COL
+
+# Setup matplotlib style
+setup_matplotlib_style()
+
+# Extended colors for multimodal visualization
 COLORS = {
-    'bfn': '#4285F4',           # Google Blue
-    'diffusion': '#34A853',     # Google Green (success color for committing)
-    'lstm_gmm': '#FBBC04',      # Google Yellow
-    'ibc': '#EA4335',           # Google Red
-    'bet': '#9334E6',           # Purple
-    'agent': '#4285F4',         # Blue agent
-    'block': '#5F6368',         # Gray block
-    'target': '#34A853',        # Green target
-    'trajectory_left': '#4285F4',   # Blue for left mode
-    'trajectory_right': '#EA4335',  # Red for right mode
-    'gray': '#5F6368',
-    'light_gray': '#E8EAED',
-    'black': '#202124',
+    **_BASE_COLORS,
+    'lstm_gmm': '#C4A77D',          # Anthropic Tan for LSTM-GMM
+    'ibc': '#C4A77D',               # Anthropic Tan for IBC
+    'bet': '#4A4A4A',               # Slate for BET
+    'agent': _BASE_COLORS['bfn'],   # Teal agent
+    'block': _BASE_COLORS['gray'],  # Slate block
+    'target': _BASE_COLORS['diffusion'],  # Coral target
+    'trajectory_left': _BASE_COLORS['bfn'],       # Teal for left mode
+    'trajectory_right': _BASE_COLORS['diffusion'], # Coral for right mode
 }
-
-plt.rcParams.update({
-    'font.family': 'serif',
-    'font.serif': ['Times New Roman', 'DejaVu Serif'],
-    'mathtext.fontset': 'stix',
-    'font.size': 9,
-    'axes.titlesize': 10,
-    'axes.labelsize': 9,
-    'xtick.labelsize': 8,
-    'ytick.labelsize': 8,
-    'legend.fontsize': 8,
-    'figure.dpi': 150,
-    'savefig.dpi': 300,
-    'savefig.bbox': 'tight',
-    'axes.linewidth': 0.8,
-    'axes.spines.top': False,
-    'axes.spines.right': False,
-})
-
-SINGLE_COL = 3.5
-DOUBLE_COL = 7.16  # Exact NeurIPS double column
 
 
 # =============================================================================
@@ -263,7 +244,7 @@ def draw_method_panel(ax, trajectories, title, subtitle='', show_modes=False):
     draw_trajectories(ax, trajectories)
     
     # Title with method name
-    ax.set_title(title, fontweight='bold', pad=8, fontsize=10)
+    ax.set_title(title, fontweight='bold', fontsize=10)
     if subtitle:
         ax.text(0.5, -0.08, subtitle, ha='center', va='top', fontsize=7,
                 color=COLORS['gray'], transform=ax.transAxes, style='italic')

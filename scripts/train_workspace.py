@@ -28,10 +28,14 @@ sys.path.insert(0, project_root)
 import hydra
 from omegaconf import OmegaConf, DictConfig
 
+# Register custom resolver for eval expressions (used in diffusion_policy configs)
+OmegaConf.register_new_resolver("eval", eval, replace=True)
+
 
 @hydra.main(
     version_base=None,
-    config_path='../config'
+    config_path='../config',
+    config_name=None,
 )
 def main(cfg: DictConfig):
     """

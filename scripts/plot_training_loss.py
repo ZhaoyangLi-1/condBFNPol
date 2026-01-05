@@ -17,37 +17,13 @@ from typing import Dict, List, Tuple, Optional
 import argparse
 
 # =============================================================================
-# STYLING (Google Research / Diffusion Policy Paper Style)
+# STYLING (Anthropic Research Palette)
 # =============================================================================
 
-COLORS = {
-    'bfn': '#4285F4',           # Google Blue
-    'diffusion': '#EA4335',     # Google Red
-    'gray': '#5F6368',
-    'light_gray': '#E8EAED',
-    'black': '#202124',
-}
+from colors import COLORS, setup_matplotlib_style, SINGLE_COL, DOUBLE_COL
 
-plt.rcParams.update({
-    'font.family': 'serif',
-    'font.serif': ['Times New Roman', 'DejaVu Serif'],
-    'mathtext.fontset': 'stix',
-    'font.size': 10,
-    'axes.titlesize': 11,
-    'axes.labelsize': 10,
-    'xtick.labelsize': 9,
-    'ytick.labelsize': 9,
-    'legend.fontsize': 9,
-    'figure.dpi': 150,
-    'savefig.dpi': 300,
-    'savefig.bbox': 'tight',
-    'axes.linewidth': 0.8,
-    'axes.spines.top': False,
-    'axes.spines.right': False,
-})
-
-SINGLE_COL = 3.5
-DOUBLE_COL = 7.16
+# Setup matplotlib style
+setup_matplotlib_style()
 
 
 # =============================================================================
@@ -234,7 +210,7 @@ def plot_training_loss_comparison(
     
     ax.set_xlabel('Epoch', fontsize=10)
     ax.set_ylabel('Training Loss', fontsize=10)
-    ax.set_title('Training Loss Comparison', fontweight='bold', pad=10)
+    ax.set_title('Training Loss Comparison', fontweight='bold')
     ax.legend(loc='upper right', frameon=True, fancybox=False,
               edgecolor=COLORS['light_gray'], fontsize=9)
     ax.grid(True, alpha=0.3, linestyle='-', linewidth=0.5)

@@ -79,7 +79,7 @@ def find_all_checkpoints(base_dir: str = None) -> Dict[str, Dict[int, str]]:
                 if not run_dir.is_dir():
                     continue
                 
-                found = _process_run_directory(run_dir, checkpoints)
+                _process_run_directory(run_dir, checkpoints)
     
     # Also search in outputs/ directory (benchmark format)
     outputs_path = Path("outputs")
@@ -100,7 +100,22 @@ def find_all_checkpoints(base_dir: str = None) -> Dict[str, Dict[int, str]]:
                 
                 _process_run_directory(run_dir, checkpoints)
     
-    return checkpoints
+    # Also search directly in the base_dir (if it's a date directory itself)
+    if base_path.exists() and base_path.is_dir():
+        for run_dir in base_path.iterdir():
+            if run_dir.is_dir():
+                _process_run_directory(run_dir, checkpoints)
+    
+    # Convert to simple dict structure (extract 'path' from dict values)
+    result = {'bfn': {}, 'diffusion': {}}
+    for method in ['bfn', 'diffusion']:
+        for seed, data in checkpoints[method].items():
+            if isinstance(data, dict):
+                result[method][seed] = data['path']
+            else:
+                result[method][seed] = data
+    
+    return result
 
 
 def _process_run_directory(run_dir: Path, checkpoints: Dict[str, Dict[int, str]]) -> bool:
@@ -137,6 +152,8 @@ def _process_run_directory(run_dir: Path, checkpoints: Dict[str, Dict[int, str]]
     
     best_score = -1
     best_ckpt = None
+    
+    # First pass: find checkpoint with highest score in filename
     for ckpt_file in ckpt_dir.glob("*.ckpt"):
         # Parse score from filename: epoch=0200-test_mean_score=0.877.ckpt
         name = ckpt_file.stem
@@ -149,37 +166,33 @@ def _process_run_directory(run_dir: Path, checkpoints: Dict[str, Dict[int, str]]
                     best_ckpt = str(ckpt_file)
             except (IndexError, ValueError):
                 pass
-            
-            # If no score-based checkpoint, use most recent
-            if best_ckpt is None:
-                ckpts = sorted(ckpt_dir.glob("*.ckpt"), key=lambda x: x.stat().st_mtime)
-                if ckpts:
-                    best_ckpt = str(ckpts[-1])
-                    # Try to extract score from filename or default
-                    name = Path(best_ckpt).stem
-                    if "test_mean_score=" in name:
-                        try:
-                            score_str = name.split("test_mean_score=")[1]
-                            best_score = float(score_str)
-                        except (IndexError, ValueError):
-                            pass
-            
-            if best_ckpt:
-                # Only keep if we don't have this seed yet, or if this score is better
-                if seed not in checkpoints[method] or best_score > checkpoints[method].get(seed, {}).get('score', -1):
-                    checkpoints[method][seed] = {
-                        'path': best_ckpt,
-                        'score': best_score,
-                        'dir': str(run_dir)
-                    }
-                print(f"Found {method} seed {seed}: {Path(best_ckpt).name} (score={best_score:.3f})")
     
-    # Convert to simple dict structure for compatibility
-    result = {
-        'bfn': {seed: data['path'] for seed, data in checkpoints['bfn'].items()},
-        'diffusion': {seed: data['path'] for seed, data in checkpoints['diffusion'].items()}
-    }
-    return result
+    # Fallback: if no score-based checkpoint, use most recent
+    if best_ckpt is None:
+        ckpts = sorted(ckpt_dir.glob("*.ckpt"), key=lambda x: x.stat().st_mtime)
+        if ckpts:
+            best_ckpt = str(ckpts[-1])
+            best_score = 0.0  # Unknown score
+    
+    if best_ckpt:
+        # Get existing score for comparison
+        existing_score = -1
+        if seed in checkpoints[method]:
+            existing_data = checkpoints[method][seed]
+            if isinstance(existing_data, dict):
+                existing_score = existing_data.get('score', -1)
+        
+        # Only keep if we don't have this seed yet, or if this score is better
+        if seed not in checkpoints[method] or best_score > existing_score:
+            checkpoints[method][seed] = {
+                'path': best_ckpt,
+                'score': best_score,
+                'dir': str(run_dir)
+            }
+            print(f"Found {method} seed {seed}: {Path(best_ckpt).name} (score={best_score:.3f})")
+            return True
+    
+    return False
 
 
 # =============================================================================
@@ -209,7 +222,15 @@ def load_bfn_policy_from_checkpoint(checkpoint_path: str, device: str = "cuda"):
     
     try:
         workspace = TrainBFNWorkspace.create_from_checkpoint(checkpoint_path)
-        policy = workspace.policy
+        # Workspace stores policy as 'model' (or 'ema_model' for EMA version)
+        # Use EMA model if available, otherwise use main model
+        if hasattr(workspace, 'ema_model') and workspace.ema_model is not None:
+            policy = workspace.ema_model
+        elif hasattr(workspace, 'model'):
+            policy = workspace.model
+        else:
+            raise AttributeError("Workspace has no 'model' or 'ema_model' attribute")
+        
         cfg = workspace.cfg
         
         policy.to(device)
@@ -245,7 +266,15 @@ def load_diffusion_policy_from_checkpoint(checkpoint_path: str, device: str = "c
     
     try:
         workspace = TrainDiffusionUnetHybridWorkspace.create_from_checkpoint(checkpoint_path)
-        policy = workspace.policy
+        # Workspace stores policy as 'model' (or 'ema_model' for EMA version)
+        # Use EMA model if available, otherwise use main model
+        if hasattr(workspace, 'ema_model') and workspace.ema_model is not None:
+            policy = workspace.ema_model
+        elif hasattr(workspace, 'model'):
+            policy = workspace.model
+        else:
+            raise AttributeError("Workspace has no 'model' or 'ema_model' attribute")
+        
         cfg = workspace.cfg
         
         policy.to(device)
@@ -290,7 +319,12 @@ def evaluate_policy_at_steps(
     n_obs_steps = getattr(policy, 'n_obs_steps', 2)
     n_action_steps = getattr(policy, 'n_action_steps', 16)
     
+    # Create temp output dir for runner (required parameter)
+    import tempfile
+    output_dir = tempfile.mkdtemp(prefix='ablation_eval_')
+    
     runner = PushTImageRunner(
+        output_dir=output_dir,
         n_train=0,
         n_train_vis=0,
         train_start_seed=0,
@@ -310,6 +344,13 @@ def evaluate_policy_at_steps(
     policy.eval()
     with torch.no_grad():
         result = runner.run(policy)
+    
+    # Cleanup temp directory
+    import shutil
+    try:
+        shutil.rmtree(output_dir)
+    except Exception:
+        pass  # Ignore cleanup errors
     
     # Restore original steps
     if original_steps is not None:
@@ -821,7 +862,7 @@ def generate_ablation_figures(results: Dict, output_dir: str = "figures/publicat
     
     # Figure 3: Combined 2-panel figure
     fig = plt.figure(figsize=(DOUBLE_COL, SINGLE_COL * 0.85))
-    gs = gridspec.GridSpec(1, 2, figure=fig, wspace=0.35, hspace=0.3)
+    gs = gridspec.GridSpec(1, 2, wspace=0.35, hspace=0.3)
     
     # Panel A: Score vs Steps
     ax1 = fig.add_subplot(gs[0])

@@ -135,7 +135,7 @@ def plot_loss_vs_success_rate(bfn_runs: Dict, diffusion_runs: Dict, output_dir: 
     
     ax1.set_xlabel('Final Training Loss (MSE)', fontsize=10)
     ax1.set_ylabel('Success Rate', fontsize=10)
-    ax1.set_title('(a) Loss vs Performance Paradox', fontweight='bold', pad=10)
+    ax1.set_title('(a) Loss vs Performance Paradox', fontweight='bold')
     ax1.legend(loc='best', fontsize=9)
     ax1.grid(True, alpha=0.3)
     ax1.set_ylim(0.8, 0.98)
@@ -221,7 +221,7 @@ def plot_loss_vs_success_rate(bfn_runs: Dict, diffusion_runs: Dict, output_dir: 
     
     ax2.set_xlabel('Epoch', fontsize=10)
     ax2.set_ylabel('Training Loss', fontsize=10)
-    ax2.set_title('(b) Loss Trajectories', fontweight='bold', pad=10)
+    ax2.set_title('(b) Loss Trajectories', fontweight='bold')
     ax2.legend(loc='upper right', fontsize=9)
     ax2.grid(True, alpha=0.3)
     
