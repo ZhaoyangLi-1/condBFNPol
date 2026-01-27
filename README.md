@@ -36,6 +36,15 @@ conda deactivate
 conda activate bfn
 ```
 
+### Training Data Download
+```bash
+git lfs install
+# relance my_pusht_data to your local folder
+git clone https://huggingface.co/datasets/cadene/pusht_raw my_pusht_data
+cd pusht_raw
+git lfs pull
+```
+
 ## Usage
 
 ```bash
