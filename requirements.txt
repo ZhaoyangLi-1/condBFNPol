@@ -2,17 +2,16 @@ absl-py==2.3.1
 annotated-types==0.7.0
 antlr4-python3-runtime==4.9.3
 attrs==25.4.0
-av==14.4.0
 black==23.3.0
-Brotli @ file:///Users/runner/miniforge3/conda-bld/brotli-split_1761592052300/work
-certifi @ file:///opt/miniconda3/conda-bld/certifi_1763135328017/work/certifi
-cffi @ file:///Users/runner/miniforge3/conda-bld/cffi_1725560551097/work
+brotli
+certifi
+cffi
 cfgv==3.4.0
 charset-normalizer==3.4.2
 click==8.1.8
 cloudpickle==3.1.1
 cmake==4.1.2
-colorama @ file:///home/conda/feedstock_root/build_artifacts/colorama_1733218098505/work
+colorama
 contourpy==1.3.2
 crc32c==2.7.1
 cycler==0.12.1
@@ -27,8 +26,7 @@ dm-tree==0.1.9
 dm_control==1.0.34
 docker-pycreds==0.4.0
 donfig==0.8.1.post1
-# Editable install with no version control (egl_probe==1.0.1)
--e /Users/aleynakara/Documents/diffusion_policy_gpt/egl_probe
+egl-probe>=1.0.2
 einops==0.8.1
 etils==1.13.0
 Farama-Notifications==0.0.4
@@ -40,19 +38,19 @@ fsspec==2025.3.2
 gitdb==4.0.12
 GitPython==3.1.44
 glfw==2.10.0
-gmpy2 @ file:///Users/runner/miniforge3/conda-bld/gmpy2_1762946971328/work
+gmpy2
 grpcio==1.76.0
-gym==0.24.1
+gym==0.23.1
 gym-notices==0.0.8
 gym-pusht==0.1.0
 gymnasium==0.29.1
-gymnasium-robotics==1.4.1
-h2 @ file:///home/conda/feedstock_root/build_artifacts/bld/rattler-build_h2_1756364871/work
+gymnasium-robotics>=1.2.0,<1.3.0
+h2
 h5py==3.15.1
-hpack @ file:///home/conda/feedstock_root/build_artifacts/hpack_1737618293087/work
+hpack
 huggingface-hub==0.31.2
 hydra-core==1.3.2
-hyperframe @ file:///home/conda/feedstock_root/build_artifacts/hyperframe_1737618333194/work
+hyperframe
 identify==2.6.10
 idna==3.10
 imageio==2.37.0
@@ -61,45 +59,44 @@ importlib_metadata==8.7.0
 importlib_resources==6.5.2
 iniconfig==2.1.0
 isort==5.12.0
-Jinja2 @ file:///home/conda/feedstock_root/build_artifacts/jinja2_1741263328855/work
+jinja2
 kiwisolver==1.4.8
 labmaze==1.0.6
 lazy_loader==0.4
-lightning @ file:///home/conda/feedstock_root/build_artifacts/lightning_1762382029606/work
-lightning-utilities @ file:///home/conda/feedstock_root/build_artifacts/lightning-utilities_1754515506335/work
+lightning
+lightning-utilities
 llvmlite==0.44.0
 lxml==6.0.2
 Markdown==3.10
-MarkupSafe @ file:///Users/runner/miniforge3/conda-bld/markupsafe_1759055254345/work
+markupsafe
 matplotlib==3.10.3
 mccabe==0.7.0
-mpmath @ file:///home/conda/feedstock_root/build_artifacts/mpmath_1733302684489/work
+mpmath
 mujoco==3.3.7
 mujoco-py==2.1.2.14
 mypy_extensions==1.1.0
 networkx==3.4.2
 nodeenv==1.9.1
 numba==0.61.2
-numcodecs==0.16.0
+numcodecs<=0.13.1
 numpy==1.26.4
 omegaconf==2.3.0
 opencv-python==4.11.0.86
-optree @ file:///Users/runner/miniforge3/conda-bld/optree_1763124456296/work
-packaging @ file:///home/conda/feedstock_root/build_artifacts/bld/rattler-build_packaging_1745345660/work
+optree
+packaging
 pandas==2.2.3
 pathspec==0.12.1
-pettingzoo==1.25.0
 pillow==11.2.1
 platformdirs==4.3.8
 pluggy==1.6.0
 pre_commit==4.2.0
 protobuf==6.31.0
 psutil==7.0.0
-pybind11 @ file:///D:/bld/pybind11-split_1747934313674/work
-pybind11_global @ file:///home/conda/feedstock_root/build_artifacts/pybind11-split_1747934270866/work
+pybind11
+pybind11_global
 pybullet==3.2.7
 pycodestyle==2.11.1
-pycparser @ file:///home/conda/feedstock_root/build_artifacts/bld/rattler-build_pycparser_1733195786/work
+pycparser
 pydantic==2.11.4
 pydantic_core==2.33.2
 pyflakes==3.1.0
@@ -108,14 +105,14 @@ Pygments==2.19.1
 pymunk==6.11.1
 PyOpenGL==3.1.10
 pyparsing==3.2.3
-PySocks @ file:///home/conda/feedstock_root/build_artifacts/pysocks_1733217236728/work
+pysocks
 pytest==8.4.0
 python-dateutil==2.9.0.post0
-pytorch-lightning @ file:///home/conda/feedstock_root/build_artifacts/pytorch-lightning_1757101900503/work
+pytorch-lightning
 pytz==2025.2
-PyYAML @ file:///Users/runner/miniforge3/conda-bld/pyyaml_1758891744044/work
+pyyaml
 regex==2024.11.6
-requests @ file:///home/conda/feedstock_root/build_artifacts/requests_1755614211359/work
+requests
 robomimic==0.3.0
 safetensors==0.5.3
 scikit-image==0.22.0
@@ -126,27 +123,29 @@ setproctitle==1.3.6
 shapely==2.1.2
 six==1.17.0
 smmap==5.0.2
-sympy @ file:///home/conda/feedstock_root/build_artifacts/sympy_1745946051654/work
+sympy
 tensorboard==2.20.0
 tensorboard-data-server==0.7.2
 tensorboardX==2.6.4
 termcolor==3.2.0
 tifffile==2025.5.10
-torch @ file:///Users/runner/miniforge3/conda-bld/libtorch_1762088913073/work
+torch
 torchaudio==2.1.2
-torchmetrics @ file:///home/conda/feedstock_root/build_artifacts/torchmetrics_1756932631856/work
+torchmetrics
 torchtyping==0.1.5
 torchvision==0.16.2
-tqdm @ file:///home/conda/feedstock_root/build_artifacts/tqdm_1735661334605/work
+tqdm
 typeguard==2.13.3
 typing-inspection==0.4.0
 typing_extensions==4.13.2
 tzdata==2025.2
-urllib3 @ file:///home/conda/feedstock_root/build_artifacts/urllib3_1750271362675/work
+urllib3
 virtualenv==20.31.2
 wandb==0.19.11
 Werkzeug==3.1.3
 wrapt==2.0.1
-zarr==3.0.7
+zarr<3.5
 zipp==3.21.0
 zstandard==0.25.0
+av
+pettingzoo

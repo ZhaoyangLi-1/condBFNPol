@@ -29,6 +29,9 @@ BFN-Policy reformulates action generation as continuous-time Bayesian inference,
 ```bash
 conda create -n bfn python=3.10 && conda activate bfn
 pip install -r requirements.txt
+conda env config vars set PYTHONPATH="/scr/zhaoyang/condBFNPol/src/diffusion-policy:$PYTHONPATH"
+conda deactivate
+conda activate bfn
 ```
 
 ## Usage
