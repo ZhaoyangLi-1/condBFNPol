@@ -13,3 +13,4 @@ logs
 cluster_checkpoints
 figures
 .cursor
+src
