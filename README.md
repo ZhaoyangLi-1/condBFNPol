@@ -50,7 +50,7 @@ git lfs pull
 # Merge data for all demenstation we collection (see code to more detail)
 python dataset/merge_demos.py
 
-# Formolize data to be conssitent with diffusion policy paper
+# Formalize data to be conssitent with diffusion policy paper
 python dataset/formalize_data.py --dst /scr2/zhaoyang/BFN_data/pusht_real --overwrite --num-videos 2
 ```
 
