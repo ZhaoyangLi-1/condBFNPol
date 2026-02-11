@@ -315,6 +315,9 @@ class TrainDiffusionUnetHybridWorkspace(BaseWorkspace):
                             lambda x: x.to(device, non_blocking=True)
                         )
                         obs_dict = batch['obs']
+                        # Lowdim datasets return tensor obs; wrap to match policy API.
+                        if not isinstance(obs_dict, dict):
+                            obs_dict = {'obs': obs_dict}
                         gt_action = batch['action']
                         
                         result = policy.predict_action(obs_dict)

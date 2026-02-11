@@ -36,13 +36,22 @@ conda deactivate
 conda activate bfn
 ```
 
-### Training Data Download
+### Simulation Training Data Download
 ```bash
 git lfs install
 # relance my_pusht_data to your local folder
 git clone https://huggingface.co/datasets/cadene/pusht_raw my_pusht_data
 cd pusht_raw
 git lfs pull
+```
+
+### Real Robot Preprocessing
+```bash
+# Merge data for all demenstation we collection (see code to more detail)
+python dataset/merge_demos.py
+
+# Formolize data to be conssitent with diffusion policy paper
+python dataset/formalize_data.py --dst /scr2/zhaoyang/BFN_data/pusht_real --overwrite --num-videos 2
 ```
 
 ## Usage
