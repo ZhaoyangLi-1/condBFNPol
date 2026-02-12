@@ -100,6 +100,28 @@ def compute_pose_vel(T: np.ndarray, timestamps: np.ndarray) -> np.ndarray:
     return vel.astype(np.float64)
 
 
+def estimate_hz(timestamps: np.ndarray) -> float:
+    timestamps = np.asarray(timestamps, dtype=np.float64)
+    if timestamps.size < 2:
+        return float("nan")
+    diffs = np.diff(timestamps)
+    diffs = diffs[np.isfinite(diffs) & (diffs > 0)]
+    if diffs.size == 0:
+        return float("nan")
+    dt = np.median(diffs)
+    if dt <= 0 or not np.isfinite(dt):
+        return float("nan")
+    return 1.0 / dt
+
+
+def make_downsample_indices(length: int, factor: int) -> np.ndarray:
+    if length <= 0:
+        return np.zeros((0,), dtype=np.int64)
+    if factor <= 1:
+        return np.arange(length, dtype=np.int64)
+    return np.arange(0, length, factor, dtype=np.int64)
+
+
 def extract_action(policy_out, target_len: int) -> np.ndarray:
     """
     Build action array of shape (target_len, 6).
@@ -147,20 +169,37 @@ def detect_image_ext(img_dir: Path) -> str:
     raise FileNotFoundError(f"No images found in {img_dir}")
 
 
-def make_video_from_images(img_dir: Path, out_path: Path, fps: int) -> None:
+def make_video_from_images(
+    img_dir: Path,
+    out_path: Path,
+    fps: int,
+    frame_stride: int = 1,
+    input_fps: float | None = None,
+) -> None:
     ext = detect_image_ext(img_dir)
     pattern = str(img_dir / f"im_%d.{ext}")
+    src_fps = fps
+    if frame_stride > 1:
+        if input_fps is not None and np.isfinite(input_fps):
+            src_fps = input_fps
+        else:
+            src_fps = fps * frame_stride
     cmd = [
         "ffmpeg",
         "-y",
         "-loglevel",
         "error",
         "-framerate",
-        str(fps),
+        str(src_fps),
         "-start_number",
         "0",
         "-i",
         pattern,
+    ]
+    if frame_stride > 1:
+        vf = f"select='not(mod(n\\,{frame_stride}))',setpts=N*{frame_stride}/FRAME_RATE/TB"
+        cmd += ["-vf", vf, "-r", str(fps)]
+    cmd += [
         "-c:v",
         "libx264",
         "-pix_fmt",
@@ -178,6 +217,8 @@ def build_videos(
     fps: int,
     num_videos: int | None,
     duplicate_with_symlink: bool,
+    frame_stride: int = 1,
+    input_fps: float | None = None,
 ) -> None:
     for ep_idx, traj_dir in enumerate(tqdm(traj_dirs, desc="Videos", unit="traj")):
         ep_out = out_videos_dir / str(ep_idx)
@@ -192,7 +233,13 @@ def build_videos(
             out_path = ep_out / f"{cam_idx}.mp4"
             if out_path.exists():
                 continue
-            make_video_from_images(img_dir, out_path, fps)
+            make_video_from_images(
+                img_dir,
+                out_path,
+                fps,
+                frame_stride=frame_stride,
+                input_fps=input_fps,
+            )
 
         # If fewer cameras than requested, duplicate camera 0 (or last available)
         if num_videos is not None and len(img_dirs) < num_videos:
@@ -240,7 +287,7 @@ def main() -> None:
     )
     parser.add_argument("--overwrite", action="store_true", help="Overwrite output directory if exists")
     parser.add_argument("--no-videos", action="store_true", help="Skip video generation")
-    parser.add_argument("--fps", type=int, default=30, help="Video FPS")
+    parser.add_argument("--fps", type=int, default=None, help="Video FPS (default: match data rate after downsampling)")
     parser.add_argument(
         "--num-videos",
         type=int,
@@ -258,8 +305,31 @@ def main() -> None:
         default=None,
         help="Zarr chunk length (time dimension). Defaults to max episode length.",
     )
+    parser.add_argument(
+        "--downsample",
+        type=int,
+        default=1,
+        help="Downsample factor (keep every Nth frame).",
+    )
+    parser.add_argument(
+        "--target-hz",
+        type=float,
+        default=None,
+        help="Target sampling rate in Hz. Overrides --downsample by computing a factor from timestamps (first trajectory).",
+    )
+    parser.add_argument(
+        "--check-existing-hz",
+        action="store_true",
+        help="If output exists, report its estimated Hz and exit.",
+    )
 
     args = parser.parse_args()
+    if args.downsample < 1:
+        raise ValueError("--downsample must be >= 1")
+    if args.target_hz is not None and args.target_hz <= 0:
+        raise ValueError("--target-hz must be > 0")
+    if args.target_hz is not None and args.downsample != 1:
+        raise ValueError("Use either --target-hz or --downsample, not both")
 
     src_root: Path = args.src
     if args.dst is None:
@@ -268,10 +338,27 @@ def main() -> None:
         dst_root = args.dst
 
     if dst_root.exists():
+        replay_path = dst_root / "replay_buffer.zarr"
+        existing_hz = None
+        if replay_path.exists():
+            try:
+                root = zarr.open(str(replay_path), mode="r")
+                existing_hz = estimate_hz(root["data"]["timestamp"][:])
+            except Exception:
+                existing_hz = None
+        if args.check_existing_hz:
+            msg = f"Existing output: {dst_root}"
+            if existing_hz is not None and np.isfinite(existing_hz):
+                msg += f" (estimated {existing_hz:.2f} Hz)"
+            print(msg)
+            return
         if args.overwrite:
             shutil.rmtree(dst_root)
         else:
-            raise FileExistsError(f"Output directory exists: {dst_root}")
+            hz_msg = ""
+            if existing_hz is not None and np.isfinite(existing_hz):
+                hz_msg = f" (estimated {existing_hz:.2f} Hz)"
+            raise FileExistsError(f"Output directory exists: {dst_root}{hz_msg}")
 
     traj_dirs = find_traj_dirs(src_root)
     if not traj_dirs:
@@ -287,6 +374,9 @@ def main() -> None:
     episode_ends = []
 
     total = 0
+    resolved_downsample = None
+    resolved_src_hz = None
+    resolved_eff_hz = None
 
     for traj_dir in tqdm(traj_dirs, desc="Trajs", unit="traj"):
         obs_path = traj_dir / "obs_dict.pkl"
@@ -295,25 +385,63 @@ def main() -> None:
         obs = load_pickle(obs_path)
         policy_out = load_policy_out(pol_path) if pol_path.exists() else None
 
-        timestamps = np.asarray(obs["time_stamp"], dtype=np.float64)
+        timestamps_full = np.asarray(obs["time_stamp"], dtype=np.float64)
         qpos = np.asarray(obs["qpos"], dtype=np.float64)
         qvel = np.asarray(obs["qvel"], dtype=np.float64)
-        stage = np.asarray(obs.get("task_stage", np.zeros(len(timestamps))), dtype=np.int64)
+        stage = np.asarray(obs.get("task_stage", np.zeros(len(timestamps_full))), dtype=np.int64)
         if stage.ndim == 0:
-            stage = np.full(len(timestamps), int(stage), dtype=np.int64)
+            stage = np.full(len(timestamps_full), int(stage), dtype=np.int64)
         eef_T = np.asarray(obs["eef_transform"], dtype=np.float64)
 
-        if len(timestamps) != len(eef_T):
-            raise ValueError(f"Length mismatch in {traj_dir}: timestamps {len(timestamps)} vs eef_transform {len(eef_T)}")
-        if len(qpos) != len(timestamps) or len(qvel) != len(timestamps) or len(stage) != len(timestamps):
+        if len(timestamps_full) != len(eef_T):
+            raise ValueError(
+                f"Length mismatch in {traj_dir}: timestamps {len(timestamps_full)} vs eef_transform {len(eef_T)}"
+            )
+        if len(qpos) != len(timestamps_full) or len(qvel) != len(timestamps_full) or len(stage) != len(timestamps_full):
             raise ValueError(
                 f"Length mismatch in {traj_dir}: "
-                f"timestamps {len(timestamps)} qpos {len(qpos)} qvel {len(qvel)} stage {len(stage)}"
+                f"timestamps {len(timestamps_full)} qpos {len(qpos)} qvel {len(qvel)} stage {len(stage)}"
             )
+
+        if resolved_src_hz is None:
+            resolved_src_hz = estimate_hz(timestamps_full)
+
+        if resolved_downsample is None:
+            if args.target_hz is not None:
+                if resolved_src_hz is None or not np.isfinite(resolved_src_hz):
+                    raise ValueError("Unable to estimate source Hz for --target-hz")
+                resolved_downsample = max(1, int(round(resolved_src_hz / args.target_hz)))
+                resolved_eff_hz = resolved_src_hz / resolved_downsample
+                if resolved_downsample == 1:
+                    print(
+                        f"Target Hz {args.target_hz:.2f} ~ source {resolved_src_hz:.2f} Hz, no downsampling needed."
+                    )
+                else:
+                    print(
+                        f"Target Hz {args.target_hz:.2f} -> downsample {resolved_downsample} "
+                        f"(source {resolved_src_hz:.2f} Hz -> {resolved_eff_hz:.2f} Hz)"
+                    )
+            else:
+                resolved_downsample = args.downsample
+                if resolved_src_hz is not None and np.isfinite(resolved_src_hz):
+                    resolved_eff_hz = resolved_src_hz / resolved_downsample
+                    if resolved_downsample > 1:
+                        print(
+                            f"Downsample {resolved_downsample}x "
+                            f"(source {resolved_src_hz:.2f} Hz -> {resolved_eff_hz:.2f} Hz)"
+                        )
+
+        action_full = extract_action(policy_out, target_len=len(timestamps_full))
+        idx = make_downsample_indices(len(timestamps_full), resolved_downsample)
+        timestamps = timestamps_full[idx]
+        qpos = qpos[idx]
+        qvel = qvel[idx]
+        stage = stage[idx]
+        eef_T = eef_T[idx]
+        action = action_full[idx]
 
         eef_pose = transform_to_pose(eef_T)
         eef_pose_vel = compute_pose_vel(eef_T, timestamps)
-        action = extract_action(policy_out, target_len=len(timestamps))
 
         all_timestamp.append(timestamps)
         all_joint.append(qpos)
@@ -365,14 +493,24 @@ def main() -> None:
 
     # videos
     if not args.no_videos:
+        video_fps = args.fps
+        if video_fps is None:
+            if resolved_eff_hz is not None and np.isfinite(resolved_eff_hz):
+                video_fps = int(round(resolved_eff_hz))
+            elif resolved_src_hz is not None and np.isfinite(resolved_src_hz):
+                video_fps = int(round(resolved_src_hz))
+            else:
+                video_fps = 30
         videos_dir = dst_root / "videos"
         videos_dir.mkdir(parents=True, exist_ok=True)
         build_videos(
             traj_dirs,
             videos_dir,
-            fps=args.fps,
+            fps=video_fps,
             num_videos=args.num_videos,
             duplicate_with_symlink=not args.no_symlink,
+            frame_stride=resolved_downsample,
+            input_fps=resolved_src_hz,
         )
 
     print(f"Done. Output written to {dst_root}")
@@ -380,4 +518,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-    # python formalize_data.py --dst /scr2/zhaoyang/BFN_data/pusht_real --overwrite --num-videos 2
+    # python /scr2/zhaoyang/formalize_data.py --src /scr2/zhaoyang/BFN_data/pusht_real_raw --dst /scr2/zhaoyang/BFN_data/pusht_real_10hz --overwrite --target-hz 10

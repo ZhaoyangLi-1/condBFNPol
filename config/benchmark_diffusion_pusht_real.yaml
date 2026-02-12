@@ -1,16 +1,14 @@
-# Benchmark Configuration: Diffusion on real PushT with image + lowdim obs
-#
-# This config trains an image-conditioned diffusion policy that also uses
-# low-dimensional robot_eef_pose observations.
+# ==========================================================
+# Diffusion on real PushT (your data: 480x640) + lowdim eef_pose
+# Align method/timebase with paper, keep your image resolution
+# ==========================================================
 
 defaults:
   - _self_
 
-# Workspace target
 _target_: workspaces.train_diffusion_unet_hybrid_workspace.TrainDiffusionUnetHybridWorkspace
 
-# Experiment info
-name: benchmark_diffusion_pusht_real_image
+name: benchmark_diffusion_pusht_real_image_480x640
 exp_name: bfn_vs_diffusion
 
 # ================== Horizons ==================
@@ -22,8 +20,9 @@ dataset_obs_steps: ${n_obs_steps}
 obs_as_global_cond: true
 
 # ================== Shape Meta ==================
-# channel, height, width (C,H,W)。
+# Your collected data resolution (C,H,W)
 image_shape: [3, 480, 640]
+
 shape_meta:
   action:
     shape: [6]
@@ -60,9 +59,14 @@ policy:
       _target_: diffusion_policy.model.vision.model_getter.get_resnet
       name: resnet18
       weights: null
+
+    # keep your native resolution
     resize_shape: [480, 640]
+
+    # 0.9 ratio crop of (480,640) -> (432,576)
     crop_shape: [432, 576]
     random_crop: true
+
     use_group_norm: true
     share_rgb_model: false
     imagenet_norm: true
@@ -103,7 +107,7 @@ training:
   resume: true
   lr_scheduler: cosine
   lr_warmup_steps: 500
-  num_epochs: 300
+  num_epochs: 3000
   gradient_accumulate_every: 1
   rollout_every: 50
   checkpoint_every: 100
@@ -116,14 +120,14 @@ training:
 
 # ================== Dataloader ==================
 dataloader:
-  batch_size: 16
+  batch_size: 64
   shuffle: true
   num_workers: 8
   pin_memory: true
   persistent_workers: false
 
 val_dataloader:
-  batch_size: 16
+  batch_size: 64
   shuffle: false
   num_workers: 8
   pin_memory: true
@@ -148,8 +152,14 @@ task:
     seed: 42
     val_ratio: 0.02
     max_train_episodes: null
+
+    # IMPORTANT:
+    # false if actions are absolute eef pose; true if dataset stores delta pose.
     delta_action: false
 
+  # NOTE:
+  # Paper runs policy at 10Hz and interpolates commands in controller.
+  # Make sure your real-robot runner uses the same timebase (10Hz).
   env_runner: null
 
 # ================== Checkpoint ==================
@@ -173,6 +183,7 @@ logging:
     - pusht_real
     - diffusion
     - image_lowdim
+    - res_480x640
     - seed_${training.seed}
   id: null
   group: bfn_vs_diffusion_benchmark
