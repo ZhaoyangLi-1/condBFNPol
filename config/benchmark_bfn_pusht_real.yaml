@@ -1,14 +1,14 @@
 # ==========================================================
-# Diffusion on real PushT (your data: 480x640) + lowdim eef_pose
-# Align method/timebase with paper, keep your image resolution
+# BFN on real PushT (data: 480x640) + lowdim eef_pose
+# Benchmark aligned with benchmark_diffusion_pusht_real
 # ==========================================================
 
 defaults:
   - _self_
 
-_target_: workspaces.train_diffusion_unet_hybrid_workspace.TrainDiffusionUnetHybridWorkspace
+_target_: workspaces.train_bfn_workspace.TrainBFNWorkspace
 
-name: benchmark_diffusion_pusht_real_image_480x640
+name: benchmark_bfn_pusht_real_image_480x640
 exp_name: bfn_vs_diffusion
 
 # ================== Horizons ==================
@@ -17,12 +17,13 @@ n_obs_steps: 2
 n_action_steps: 8
 n_latency_steps: 0
 dataset_obs_steps: ${n_obs_steps}
-obs_as_global_cond: true
+
+# ================== Shared Task Params ==================
+image_shape: [3, 480, 640]
+crop_shape: [432, 576]
+dataset_path: /scr2/zhaoyang/BFN_data/pusht_real
 
 # ================== Shape Meta ==================
-# Your collected data resolution (C,H,W)
-image_shape: [3, 480, 640]
-
 shape_meta:
   action:
     shape: [6]
@@ -39,43 +40,22 @@ shape_meta:
 
 # ================== Policy ==================
 policy:
-  _target_: diffusion_policy.policy.diffusion_unet_image_policy.DiffusionUnetImagePolicy
+  _target_: policies.bfn_unet_hybrid_image_policy.BFNUnetHybridImagePolicy
   shape_meta: ${shape_meta}
-
-  noise_scheduler:
-    _target_: diffusers.schedulers.scheduling_ddpm.DDPMScheduler
-    num_train_timesteps: 100
-    beta_start: 0.0001
-    beta_end: 0.02
-    beta_schedule: squaredcos_cap_v2
-    variance_type: fixed_small
-    clip_sample: true
-    prediction_type: epsilon
-
-  obs_encoder:
-    _target_: diffusion_policy.model.vision.multi_image_obs_encoder.MultiImageObsEncoder
-    shape_meta: ${shape_meta}
-    rgb_model:
-      _target_: diffusion_policy.model.vision.model_getter.get_resnet
-      name: resnet18
-      weights: null
-
-    # keep your native resolution
-    resize_shape: [480, 640]
-
-    # 0.9 ratio crop of (480,640) -> (432,576)
-    crop_shape: [432, 576]
-    random_crop: true
-
-    use_group_norm: true
-    share_rgb_model: false
-    imagenet_norm: true
-
   horizon: ${horizon}
-  n_action_steps: ${eval:'${n_action_steps}+${n_latency_steps}'}
   n_obs_steps: ${n_obs_steps}
-  num_inference_steps: 100
-  obs_as_global_cond: ${obs_as_global_cond}
+  n_action_steps: ${eval:'${n_action_steps}+${n_latency_steps}'}
+
+  # BFN-specific config
+  sigma_1: 0.001
+  n_timesteps: 20
+
+  # Vision encoder config (match diffusion preprocessing crop)
+  crop_shape: ${crop_shape}
+  obs_encoder_group_norm: true
+  eval_fixed_crop: true
+
+  # U-Net config (matched with diffusion benchmark)
   diffusion_step_embed_dim: 128
   down_dims: [512, 1024, 2048]
   kernel_size: 5
@@ -142,7 +122,7 @@ task:
   dataset:
     _target_: diffusion_policy.dataset.real_pusht_image_dataset.RealPushTImageDataset
     shape_meta: ${shape_meta}
-    dataset_path: /scr2/zhaoyang/BFN_data/pusht_real
+    dataset_path: ${dataset_path}
     horizon: ${horizon}
     pad_before: ${eval:'${n_obs_steps}-1+${n_latency_steps}'}
     pad_after: ${eval:'${n_action_steps}-1'}
@@ -152,14 +132,8 @@ task:
     seed: 42
     val_ratio: 0.02
     max_train_episodes: null
-
-    # IMPORTANT:
-    # false if actions are absolute eef pose; true if dataset stores delta pose.
     delta_action: false
 
-  # NOTE:
-  # Paper runs policy at 10Hz and interpolates commands in controller.
-  # Make sure your real-robot runner uses the same timebase (10Hz).
   env_runner: null
 
 # ================== Checkpoint ==================
@@ -177,11 +151,11 @@ logging:
   project: pusht_bfn_vs_diffusion
   resume: true
   mode: online
-  name: ${now:%Y.%m.%d-%H.%M.%S}_diffusion_real_image_seed${training.seed}
+  name: ${now:%Y.%m.%d-%H.%M.%S}_bfn_real_image_seed${training.seed}
   tags:
     - benchmark
     - pusht_real
-    - diffusion
+    - bfn
     - image_lowdim
     - res_480x640
     - pusht_real
@@ -192,7 +166,7 @@ logging:
 # ================== Hydra ==================
 hydra:
   run:
-    dir: "/scr2/zhaoyang/bfn/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_diffusion_real_image_seed${training.seed}"
+    dir: "/scr2/zhaoyang/bfn/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_bfn_real_image_seed${training.seed}"
   sweep:
     dir: outputs/benchmark/${now:%Y-%m-%d}
-    subdir: diffusion_real_image_seed${training.seed}
+    subdir: bfn_real_image_seed${training.seed}
