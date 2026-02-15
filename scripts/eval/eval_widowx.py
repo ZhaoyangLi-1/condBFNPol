@@ -2,7 +2,7 @@
 python eval/eval_widowx.py \
   --checkpoint_path /path/to/your_model.ckpt \
   --device cuda \
-  --im_size 96 \
+  --im_size 480 \
   --num_timesteps 120 \
   --video_save_path /tmp/widowx_eval
 """
