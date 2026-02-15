@@ -22,6 +22,8 @@ obs_as_global_cond: true
 # ================== Shape Meta ==================
 # Your collected data resolution (C,H,W)
 image_shape: [3, 480, 640]
+crop_shape: [384, 512]
+dataset_path: /scr2/zhaoyang/BFN_data/pusht_real
 
 shape_meta:
   action:
@@ -63,8 +65,8 @@ policy:
     # keep your native resolution
     resize_shape: [480, 640]
 
-    # 0.9 ratio crop of (480,640) -> (432,576)
-    crop_shape: [432, 576]
+    # 0.8 ratio crop of (480,640) -> (384,512)
+    crop_shape: ${crop_shape}
     random_crop: true
 
     use_group_norm: true
@@ -77,7 +79,7 @@ policy:
   num_inference_steps: 100
   obs_as_global_cond: ${obs_as_global_cond}
   diffusion_step_embed_dim: 128
-  down_dims: [512, 1024, 2048]
+  down_dims: [256, 512, 1024]
   kernel_size: 5
   n_groups: 8
   cond_predict_scale: true
@@ -94,20 +96,20 @@ ema:
 # ================== Optimizer ==================
 optimizer:
   _target_: torch.optim.AdamW
-  lr: 1.0e-4
+  lr: 5.0e-5
   betas: [0.95, 0.999]
   eps: 1.0e-8
-  weight_decay: 1.0e-6
+  weight_decay: 1.0e-4
 
 # ================== Training ==================
 training:
   device: cuda
   seed: 42
   debug: false
-  resume: true
+  resume: false
   lr_scheduler: cosine
   lr_warmup_steps: 500
-  num_epochs: 300
+  num_epochs: 150
   gradient_accumulate_every: 1
   rollout_every: 50
   checkpoint_every: 50
@@ -142,7 +144,7 @@ task:
   dataset:
     _target_: diffusion_policy.dataset.real_pusht_image_dataset.RealPushTImageDataset
     shape_meta: ${shape_meta}
-    dataset_path: /scr2/zhaoyang/BFN_data/pusht_real
+    dataset_path: ${dataset_path}
     horizon: ${horizon}
     pad_before: ${eval:'${n_obs_steps}-1+${n_latency_steps}'}
     pad_after: ${eval:'${n_action_steps}-1'}
@@ -150,7 +152,7 @@ task:
     n_latency_steps: ${n_latency_steps}
     use_cache: true
     seed: 42
-    val_ratio: 0.02
+    val_ratio: 0.1
     max_train_episodes: null
 
     # IMPORTANT:
