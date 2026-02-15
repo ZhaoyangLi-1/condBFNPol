@@ -14,6 +14,7 @@ Example:
         --num_timesteps 120 \
         --action_horizon 4
 """
+# python eval_widowx.py --checkpoint_path /data/BFN_data/checkpoints/diffusion_real_pusht.ckpt --ip localhost --port 5556 --device cuda:0 --num_timesteps 120 --action_horizon 4 --video_save_path /data/BFN_data/diffusion_results
 
 from __future__ import annotations
 
@@ -33,17 +34,17 @@ from omegaconf import OmegaConf
 
 try:
     import imageio
-except ImportError:  # optional; only needed when saving videos
+except ImportError:
     imageio = None
 
 try:
     import dill
-except ImportError:  # fallback for environments without dill
+except ImportError:
     import pickle as dill
 
 try:
     import cv2
-except ImportError:  # optional dependency
+except ImportError:
     cv2 = None
 
 
@@ -57,11 +58,6 @@ if str(PROJECT_ROOT) not in sys.path:
 DIFFUSION_POLICY_ROOT = PROJECT_ROOT / "src" / "diffusion-policy"
 if DIFFUSION_POLICY_ROOT.exists() and str(DIFFUSION_POLICY_ROOT) not in sys.path:
     sys.path.insert(0, str(DIFFUSION_POLICY_ROOT))
-
-# Optional local Octo examples path (for envs.widowx_env import)
-DEFAULT_OCTO_EXAMPLES = PROJECT_ROOT.parent / "octo" / "examples"
-if DEFAULT_OCTO_EXAMPLES.exists() and str(DEFAULT_OCTO_EXAMPLES) not in sys.path:
-    sys.path.append(str(DEFAULT_OCTO_EXAMPLES))
 
 
 # ---------------------------------------------------------------------------
@@ -87,18 +83,15 @@ flags.DEFINE_integer("action_horizon", 4, "How many predicted actions to execute
 flags.DEFINE_bool("interactive", True, "Wait for keyboard input before each episode.")
 
 flags.DEFINE_integer("policy_n_timesteps", -1, "Override BFN sampling steps (>0 enables).")
-flags.DEFINE_integer(
-    "policy_num_inference_steps",
-    -1,
-    "Override diffusion num_inference_steps (>0 enables).",
-)
+flags.DEFINE_integer("policy_num_inference_steps", -1, "Override diffusion num_inference_steps (>0 enables).")
 
 flags.DEFINE_bool("show_image", False, "Show camera image during rollout.")
 flags.DEFINE_string("video_save_path", None, "Directory to save rollout videos.")
 
+# Added "external_img" because your service prints that key.
 flags.DEFINE_spaceseplist(
     "image_obs_source_keys",
-    ["image_primary", "image", "camera_0", "camera_1"],
+    ["image_primary", "external_img", "image", "camera_0", "camera_1"],
     "Prioritized raw obs keys for image observations.",
 )
 flags.DEFINE_spaceseplist(
@@ -123,17 +116,17 @@ ENV_PARAMS = {
     "override_workspace_boundaries": WORKSPACE_BOUNDS,
 }
 
-
-# Resolver used by some saved OmegaConf configs.
 OmegaConf.register_new_resolver("eval", eval, replace=True)
 
 
+# ---------------------------------------------------------------------------
+# Loading
+# ---------------------------------------------------------------------------
 def _load_workspace_and_policy(
     checkpoint_path: Path,
     device: str,
     use_ema: bool,
 ) -> Tuple[Any, Any, Any]:
-    """Load workspace + policy from checkpoint payload."""
     payload = torch.load(
         checkpoint_path.open("rb"),
         map_location="cpu",
@@ -141,7 +134,6 @@ def _load_workspace_and_policy(
         weights_only=False,
     )
 
-    # Snapshot path fallback: payload is already a workspace object.
     if not isinstance(payload, dict) or "cfg" not in payload:
         workspace = payload
         cfg = workspace.cfg
@@ -185,13 +177,27 @@ def _get_shape_meta(cfg: Any) -> Dict[str, Any]:
     return shape_meta
 
 
+# ---------------------------------------------------------------------------
+# Obs helpers (FIXED: accept flattened images)
+# ---------------------------------------------------------------------------
 def _is_image_like(x: Any) -> bool:
     arr = np.asarray(x)
     if arr.ndim == 4:
         arr = arr[-1]
-    if arr.ndim != 3:
-        return False
-    return (arr.shape[-1] in (1, 3)) or (arr.shape[0] in (1, 3))
+
+    # Standard HWC/CHW
+    if arr.ndim == 3:
+        return (arr.shape[-1] in (1, 3)) or (arr.shape[0] in (1, 3))
+
+    # Flattened image seen in your logs: (1, 196608) where 196608 = 256*256*3
+    if arr.ndim == 2 and arr.shape[0] == 1:
+        n = int(arr.shape[1])
+        # Try common square RGB sizes
+        for s in (64, 96, 112, 128, 160, 192, 224, 256, 320):
+            if n == s * s * 3 or n == s * s:  # RGB or grayscale flattened
+                return True
+
+    return False
 
 
 def _is_vector_like(x: Any) -> bool:
@@ -207,21 +213,49 @@ def _is_vector_like(x: Any) -> bool:
 
 def _extract_latest_image(raw_value: Any) -> np.ndarray:
     arr = np.asarray(raw_value)
+
     if arr.ndim == 4:
         arr = arr[-1]
+
+    # Handle flattened (1, N)
+    if arr.ndim == 2 and arr.shape[0] == 1:
+        flat = arr.reshape(-1)
+        n = int(flat.shape[0])
+
+        # Infer size
+        inferred = None
+        for s in (64, 96, 112, 128, 160, 192, 224, 256, 320):
+            if n == s * s * 3:
+                inferred = (s, s, 3)
+                break
+            if n == s * s:
+                inferred = (s, s, 1)
+                break
+        if inferred is None:
+            raise ValueError(f"Flattened image has unknown length n={n}")
+
+        arr = flat.reshape(*inferred)
+
+    # CHW -> HWC
     if arr.ndim == 3 and arr.shape[0] in (1, 3) and arr.shape[-1] not in (1, 3):
         arr = np.transpose(arr, (1, 2, 0))
+
+    # HW -> HWC
     if arr.ndim == 2:
         arr = np.repeat(arr[..., None], 3, axis=-1)
+
     if arr.ndim != 3:
         raise ValueError(f"Unexpected image ndim={arr.ndim}")
+
     if arr.shape[-1] == 1:
         arr = np.repeat(arr, 3, axis=-1)
+
     if arr.dtype != np.uint8:
         arr = arr.astype(np.float32)
         if arr.max() <= 1.0:
             arr = arr * 255.0
         arr = np.clip(arr, 0, 255).astype(np.uint8)
+
     return arr
 
 
@@ -231,9 +265,8 @@ def _to_policy_image(image_hwc: np.ndarray, target_shape: Tuple[int, int, int]) 
         if cv2 is not None:
             image_hwc = cv2.resize(image_hwc, (w, h), interpolation=cv2.INTER_AREA)
         else:
-            image_hwc = np.asarray(
-                Image.fromarray(image_hwc).resize((w, h), resample=Image.BILINEAR)
-            )
+            image_hwc = np.asarray(Image.fromarray(image_hwc).resize((w, h), resample=Image.BILINEAR))
+
     if c == 1 and image_hwc.shape[-1] == 3:
         if cv2 is not None:
             image_hwc = cv2.cvtColor(image_hwc, cv2.COLOR_RGB2GRAY)[..., None]
@@ -241,6 +274,7 @@ def _to_policy_image(image_hwc: np.ndarray, target_shape: Tuple[int, int, int]) 
             image_hwc = np.mean(image_hwc.astype(np.float32), axis=-1, keepdims=True).astype(np.uint8)
     elif c == 3 and image_hwc.shape[-1] == 1:
         image_hwc = np.repeat(image_hwc, 3, axis=-1)
+
     image = image_hwc.astype(np.float32) / 255.0
     return np.transpose(image, (2, 0, 1)).astype(np.float32)
 
@@ -252,12 +286,7 @@ def _extract_latest_vector(raw_value: Any) -> np.ndarray:
     return arr.reshape(-1).astype(np.float32)
 
 
-def _choose_image_source(
-    raw_obs: Dict[str, Any],
-    policy_key: str,
-    prioritized_keys: List[str],
-    used_sources: set,
-) -> str:
+def _choose_image_source(raw_obs: Dict[str, Any], policy_key: str, prioritized_keys: List[str], used_sources: set) -> str:
     candidates = [policy_key] + list(prioritized_keys)
     candidates += [k for k in raw_obs.keys() if "image" in k.lower()]
     for key in candidates:
@@ -269,11 +298,7 @@ def _choose_image_source(
     raise KeyError(f"No image source found for policy key `{policy_key}`. Raw keys: {list(raw_obs.keys())}")
 
 
-def _choose_lowdim_source(
-    raw_obs: Dict[str, Any],
-    policy_key: str,
-    prioritized_keys: List[str],
-) -> str:
+def _choose_lowdim_source(raw_obs: Dict[str, Any], policy_key: str, prioritized_keys: List[str]) -> str:
     candidates = [policy_key] + list(prioritized_keys)
     candidates += [
         k
@@ -281,15 +306,12 @@ def _choose_lowdim_source(
         if any(token in k.lower() for token in ("state", "pose", "eef", "proprio", "joint"))
     ]
     for key in candidates:
-        if key in raw_obs and _is_vector_like(raw_obs[key]):
+        if key in raw_obs and _is_vector_like(raw_obs[key]) and not _is_image_like(raw_obs[key]):
             return key
     raise KeyError(f"No low-dim source found for policy key `{policy_key}`. Raw keys: {list(raw_obs.keys())}")
 
 
-def _build_obs_source_map(
-    raw_obs: Dict[str, Any],
-    obs_shape_meta: Dict[str, Any],
-) -> Dict[str, str]:
+def _build_obs_source_map(raw_obs: Dict[str, Any], obs_shape_meta: Dict[str, Any]) -> Dict[str, str]:
     source_map: Dict[str, str] = {}
     used_image_sources: set = set()
     for key, attr in obs_shape_meta.items():
@@ -303,11 +325,7 @@ def _build_obs_source_map(
     return source_map
 
 
-def _convert_raw_obs_to_policy_obs(
-    raw_obs: Dict[str, Any],
-    obs_shape_meta: Dict[str, Any],
-    source_map: Dict[str, str],
-) -> Dict[str, np.ndarray]:
+def _convert_raw_obs_to_policy_obs(raw_obs: Dict[str, Any], obs_shape_meta: Dict[str, Any], source_map: Dict[str, str]) -> Dict[str, np.ndarray]:
     out: Dict[str, np.ndarray] = {}
     for key, attr in obs_shape_meta.items():
         source = source_map[key]
@@ -331,14 +349,11 @@ def _convert_raw_obs_to_policy_obs(
     return out
 
 
-def _history_to_torch_obs(
-    obs_history: Dict[str, Deque[np.ndarray]],
-    device: torch.device,
-) -> Dict[str, torch.Tensor]:
+def _history_to_torch_obs(obs_history: Dict[str, Deque[np.ndarray]], device: torch.device) -> Dict[str, torch.Tensor]:
     obs_batch: Dict[str, torch.Tensor] = {}
     for key, dq in obs_history.items():
-        arr = np.stack(list(dq), axis=0)  # [T, ...]
-        arr = np.expand_dims(arr, axis=0)  # [1, T, ...]
+        arr = np.stack(list(dq), axis=0)       # [T, ...]
+        arr = np.expand_dims(arr, axis=0)      # [1, T, ...]
         obs_batch[key] = torch.from_numpy(arr).to(device=device, dtype=torch.float32)
     return obs_batch
 
@@ -350,30 +365,61 @@ def _extract_display_image(raw_obs: Dict[str, Any], source_map: Dict[str, str]) 
     for key in FLAGS.image_obs_source_keys:
         if key in raw_obs and _is_image_like(raw_obs[key]):
             return _extract_latest_image(raw_obs[key])
-    for key, value in raw_obs.items():
+    for _, value in raw_obs.items():
         if _is_image_like(value):
             return _extract_latest_image(value)
     return None
 
 
+# ---------------------------------------------------------------------------
+# Env interaction (FIXED: merge info into obs)
+# ---------------------------------------------------------------------------
+def _merge_obs_info(obs: Any, info: Any) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    if isinstance(obs, dict):
+        out.update(obs)
+    if isinstance(info, dict):
+        # Don't clobber existing obs keys unless obs is missing them
+        for k, v in info.items():
+            if k not in out:
+                out[k] = v
+    return out
+
+
 def _reset_env(env: Any) -> Dict[str, Any]:
     out = env.reset()
+    # Common Gym patterns: obs or (obs, info)
     if isinstance(out, tuple):
-        return out[0]
-    return out
+        if len(out) == 2:
+            obs, info = out
+            return _merge_obs_info(obs, info)
+        # Some older wrappers return (obs, reward, done, info) on reset (rare)
+        if len(out) >= 2:
+            obs, info = out[0], out[-1]
+            return _merge_obs_info(obs, info)
+    if isinstance(out, dict):
+        return out
+    raise RuntimeError(f"Unexpected env.reset() output type: {type(out)}")
 
 
 def _step_env(env: Any, action: np.ndarray) -> Tuple[Dict[str, Any], bool]:
     out = env.step(action)
-    if isinstance(out, tuple):
-        if len(out) == 5:
-            obs, _, terminated, truncated, _ = out
-            done = bool(terminated) or bool(truncated)
-            return obs, done
-        if len(out) == 4:
-            obs, _, done, _ = out
-            return obs, bool(done)
-    raise RuntimeError("Unexpected env.step output format.")
+
+    if not isinstance(out, tuple):
+        raise RuntimeError("Unexpected env.step output format (non-tuple).")
+
+    # Gymnasium: (obs, reward, terminated, truncated, info)
+    if len(out) == 5:
+        obs, _, terminated, truncated, info = out
+        done = bool(terminated) or bool(truncated)
+        return _merge_obs_info(obs, info), done
+
+    # Gym: (obs, reward, done, info)
+    if len(out) == 4:
+        obs, _, done, info = out
+        return _merge_obs_info(obs, info), bool(done)
+
+    raise RuntimeError(f"Unexpected env.step output tuple length: {len(out)}")
 
 
 def _create_widowx_env() -> Any:
@@ -436,18 +482,60 @@ def _save_video(frames: List[np.ndarray], step_duration: float) -> None:
     logging.info("Saved rollout video: %s", save_path)
 
 
+# ---------------------------------------------------------------------------
+# Wait for valid obs (uses reset/step that merges info)
+# ---------------------------------------------------------------------------
+def _obs_has_all_policy_modalities(raw_obs: Dict[str, Any], obs_shape_meta: Dict[str, Any]) -> bool:
+    # We consider it "ready" if we can successfully build a source map.
+    try:
+        _build_obs_source_map(raw_obs, obs_shape_meta)
+        return True
+    except KeyError:
+        return False
+
+
+def _wait_for_valid_obs(
+    env: Any,
+    obs_shape_meta: Dict[str, Any],
+    action_dim_env: int,
+    timeout_s: float = 30.0,
+    poll_sleep_s: float = 0.05,
+) -> Dict[str, Any]:
+    t0 = time.time()
+    obs = _reset_env(env)
+    zero_action = np.zeros((action_dim_env,), dtype=np.float32)
+
+    while True:
+        if _obs_has_all_policy_modalities(obs, obs_shape_meta):
+            return obs
+
+        if time.time() - t0 > timeout_s:
+            raise TimeoutError(f"Timed out waiting for valid observations. Last keys={list(obs.keys())}")
+
+        try:
+            obs, _ = _step_env(env, zero_action)
+        except Exception:
+            # if stepping fails early, give service time
+            time.sleep(0.2)
+            obs = _reset_env(env)
+
+        time.sleep(poll_sleep_s)
+
+
+# ---------------------------------------------------------------------------
+# Rollout
+# ---------------------------------------------------------------------------
 def _run_episode(
     env: Any,
     policy: Any,
     obs_shape_meta: Dict[str, Any],
     n_obs_steps: int,
     device: torch.device,
+    action_dim_env: int,
 ) -> None:
-    obs_history: Dict[str, Deque[np.ndarray]] = {
-        k: deque(maxlen=n_obs_steps) for k in obs_shape_meta.keys()
-    }
+    obs_history: Dict[str, Deque[np.ndarray]] = {k: deque(maxlen=n_obs_steps) for k in obs_shape_meta.keys()}
 
-    obs = _reset_env(env)
+    obs = _wait_for_valid_obs(env, obs_shape_meta, action_dim_env=action_dim_env, timeout_s=30.0)
     source_map = _build_obs_source_map(obs, obs_shape_meta)
     logging.info("Observation source map: %s", source_map)
 
@@ -502,6 +590,7 @@ def _run_episode(
                 action = np.concatenate([action, np.array([FLAGS.gripper_value], dtype=np.float32)])
 
             obs, done = _step_env(env, action)
+
             policy_obs = _convert_raw_obs_to_policy_obs(obs, obs_shape_meta, source_map)
             for key, value in policy_obs.items():
                 obs_history[key].append(value.copy())
@@ -539,15 +628,24 @@ def main(_: Any) -> None:
         device=str(device),
         use_ema=FLAGS.use_ema,
     )
-    del workspace  # not used after loading
+    del workspace
 
     _apply_step_overrides(policy)
 
     shape_meta = _get_shape_meta(cfg)
     obs_shape_meta = shape_meta["obs"]
     n_obs_steps = int(getattr(policy, "n_obs_steps", cfg.get("n_obs_steps", 2)))
+
+    if "action" not in shape_meta or "shape" not in shape_meta["action"]:
+        raise KeyError("shape_meta missing `action.shape`; cannot infer action dimension.")
+    action_dim_policy = int(np.prod(shape_meta["action"]["shape"]))
+    action_dim_env = action_dim_policy
+    if FLAGS.append_gripper and action_dim_policy == 6:
+        action_dim_env = 7
+
     logging.info("n_obs_steps=%d", n_obs_steps)
     logging.info("Policy obs keys=%s", list(obs_shape_meta.keys()))
+    logging.info("action_dim_policy=%d action_dim_env=%d", action_dim_policy, action_dim_env)
 
     env = _create_widowx_env()
     episode_idx = 0
@@ -561,6 +659,7 @@ def main(_: Any) -> None:
                 obs_shape_meta=obs_shape_meta,
                 n_obs_steps=n_obs_steps,
                 device=device,
+                action_dim_env=action_dim_env,
             )
             episode_idx += 1
     finally:

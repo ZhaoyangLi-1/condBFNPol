@@ -149,3 +149,7 @@ zipp==3.21.0
 zstandard==0.25.0
 av
 pettingzoo
+# widowx
+pyquaternion
+funcsigs
+git+https://github.com/youliangtan/edgeml.git
