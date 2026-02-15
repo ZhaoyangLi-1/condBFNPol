@@ -1,89 +1,28 @@
-# Install minimal dependencies (`torch`, `transformers`, `timm`, `tokenizers`, ...)
-# > pip install -r https://raw.githubusercontent.com/openvla/openvla/main/requirements-min.txt
-
-'''
-from transformers import AutoModelForVision2Seq, AutoProcessor
-from PIL import Image
-import torch
-import numpy as np
-from widowx_envs.widowx_env_service import WidowXClient, WidowXStatus
-import time
-
-# Load Processor & VLA
-processor = AutoProcessor.from_pretrained("openvla/openvla-7b", trust_remote_code=True)
-# import ipdb; ipdb.set_trace()
-vla = AutoModelForVision2Seq.from_pretrained(
-    "openvla/openvla-7b",
-    attn_implementation="flash_attention_2",  # [Optional] Requires `flash_attn`
-    torch_dtype=torch.bfloat16,
-    low_cpu_mem_usage=True,
-    trust_remote_code=True
-)
-# ).to("cuda:0")
-
-# Initialize WidowXClient
-robot_ip = "localhost"  # Replace with actual IP if different
-robot_port = 5556  # Replace with actual port if different
-widowx_client = WidowXClient(host=robot_ip, port=robot_port)
-
-def get_from_camera():
-    # Implement the function to capture an image from the Wi`dowX robot's camera
-    obs = widowx_client.get_observation()
-    image = obs["image_primary"]  # or another key depending on your setup
-    return Image.fromarray(image)
-
-def send_robot_action(action):
-    # Convert the action into the format expected by the WidowX robot
-    # This function needs to be implemented based on how actions are sent to the robot
-    # Example placeholder
-    widowx_client.act(action)
-
-def main():
-    # Capture image from the robot's camera
-    image: Image.Image = get_from_camera()
-    
-    # Format the prompt with the specific goal instruction
-    goal_instruction = "move the gripper to the target position"  # Adjust this based on your goal
-    prompt = f"In: What action should the robot take to {goal_instruction}?\nOut:"
-
-    # Predict action
-    inputs = processor(prompt, image).to("cuda:0", dtype=torch.bfloat16)
-    with torch.no_grad():
-        action = vla.predict_action(**inputs, unnorm_key="bridge_orig", do_sample=False)
-    
-    # Execute the action
-    send_robot_action(action)
-
-if __name__ == "__main__":
-    main()
-'''
-
-from transformers import AutoModelForVision2Seq, AutoProcessor
-from PIL import Image
-import torch
-import numpy as np
-import time
-
-from datetime import datetime
-from functools import partial
+import sys
 import os
 import time
+from datetime import datetime
+import traceback
+from collections import deque
+import json
 
 from absl import app, flags, logging
-import click
-import cv2
-import  os
 
-import sys
-# Append the directory path to sys.path
-sys.path.append('../../../octo/examples/')
-from envs.widowx_env import convert_obs, state_to_eep, wait_for_obs, WidowXGym
-import imageio
-import jax
-import jax.numpy as jnp
 import numpy as np
-from widowx_envs.widowx_env_service import WidowXClient, WidowXConfigs, WidowXStatus
+import tensorflow as tf
 
+import jax
+from PIL import Image
+import imageio
+
+from flax.training import checkpoints
+from jaxrl_m.vision import encoders
+from jaxrl_m.agents import agents
+
+# bridge_data_robot imports
+from widowx_envs.widowx_env import BridgeDataRailRLPrivateWidowX
+from multicam_server.topic_utils import IMTopic
+from utils import stack_obs
 
 np.set_printoptions(suppress=True)
 
@@ -91,58 +30,115 @@ logging.set_verbosity(logging.WARNING)
 
 FLAGS = flags.FLAGS
 
-flags.DEFINE_string(
-    "checkpoint_weights_path", None, "Path to checkpoint", required=False
+flags.DEFINE_multi_string(
+    "checkpoint_weights_path", None, "Path to checkpoint", required=True
 )
-# image: Image.Image = get_from_camera()
-    
-# custom to bridge_data_robot
-flags.DEFINE_string("ip", "localhost", "IP address of the robot")
-flags.DEFINE_integer("port", 5556, "Port of the robot")
+flags.DEFINE_multi_string(
+    "checkpoint_config_path", None, "Path to checkpoint config JSON", required=True
+)
+flags.DEFINE_integer("im_size", None, "Image size", required=True)
+flags.DEFINE_string("video_save_path", None, "Path to save video")
+flags.DEFINE_string("goal_image_path", None, "Path to a single goal image")
+flags.DEFINE_integer("num_timesteps", 120, "num timesteps")
+flags.DEFINE_bool("blocking", False, "Use the blocking controller")
 flags.DEFINE_spaceseplist("goal_eep", [0.3, 0.0, 0.15], "Goal position")
 flags.DEFINE_spaceseplist("initial_eep", [0.3, 0.0, 0.15], "Initial position")
-flags.DEFINE_bool("blocking", False, "Use the blocking controller")
-
-
-flags.DEFINE_integer("im_size", None, "Image size", required=False)
-flags.DEFINE_string("video_save_path", None, "Path to save video")
-flags.DEFINE_integer("num_timesteps", 120, "num timesteps")
-flags.DEFINE_integer("window_size", 2, "Observation history length")
-flags.DEFINE_integer(
-    "action_horizon", 4, "Length of action sequence to execute/ensemble"
-)
-
-# Define the 'deterministic' flag
-# flags.DEFINE_boolean('deterministic', default=False, help='Use deterministic mode')
-
-# flags.DEFINE_boolean('temperature', default=False, help='Use temperature mode')
-
-# show image flag
-flags.DEFINE_bool("show_image", False, "Show image")
+flags.DEFINE_integer("act_exec_horizon", 1, "Action sequence length")
+flags.DEFINE_bool("deterministic", True, "Whether to sample action deterministically")
 
 ##############################################################################
 
-STEP_DURATION_MESSAGE = """
-Bridge data was collected with non-blocking control and a step duration of 0.2s.
-However, we relabel the actions to make it look like the data was collected with
-blocking control and we evaluate with blocking control.
-Be sure to use a step duration of 0.2 if evaluating with non-blocking control.
-"""
 STEP_DURATION = 0.2
+NO_PITCH_ROLL = False
+NO_YAW = False
 STICKY_GRIPPER_NUM_STEPS = 1
-WORKSPACE_BOUNDS = [[0.1, -0.15, -0.01, -1.57, 0], [0.45, 0.25, 0.25, 1.57, 0]]
-CAMERA_TOPICS = [{"name": "/blue/image_raw"}]
-ENV_PARAMS = {
-    "camera_topics": CAMERA_TOPICS,
-    "override_workspace_boundaries": WORKSPACE_BOUNDS,
-    "move_duration": STEP_DURATION,
-}
+WORKSPACE_BOUNDS = np.array([[0.1, -0.15, -0.1, -1.57, 0], [0.45, 0.25, 0.25, 1.57, 0]])
+CAMERA_TOPICS = [IMTopic("/blue/image_raw")]
+FIXED_STD = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
 
 ##############################################################################
+
+def load_checkpoint(checkpoint_weights_path, checkpoint_config_path):
+    with open(checkpoint_config_path, "r") as f:
+        config = json.load(f)
+
+    # create encoder from wandb config
+    encoder_def = encoders[config["encoder"]](**config["encoder_kwargs"])
+
+    act_pred_horizon = config["dataset_kwargs"].get("act_pred_horizon")
+    obs_horizon = config["dataset_kwargs"].get("obs_horizon")
+
+    if act_pred_horizon is not None:
+        example_actions = np.zeros((1, act_pred_horizon, 7), dtype=np.float32)
+    else:
+        example_actions = np.zeros((1, 7), dtype=np.float32)
+
+    if obs_horizon is not None:
+        example_obs = {
+            "image": np.zeros(
+                (1, obs_horizon, FLAGS.im_size, FLAGS.im_size, 3), dtype=np.uint8
+            )
+        }
+    else:
+        example_obs = {
+            "image": np.zeros((1, FLAGS.im_size, FLAGS.im_size, 3), dtype=np.uint8)
+        }
+
+    example_batch = {
+        "observations": example_obs,
+        "goals": {
+            "image": np.zeros((1, FLAGS.im_size, FLAGS.im_size, 3), dtype=np.uint8)
+        },
+        "actions": example_actions,
+    }
+
+    # create agent from wandb config
+    rng = jax.random.PRNGKey(0)
+    rng, construct_rng = jax.random.split(rng)
+    agent = agents[config["agent"]].create(
+        rng=construct_rng,
+        observations=example_batch["observations"],
+        goals=example_batch["goals"],
+        actions=example_batch["actions"],
+        encoder_def=encoder_def,
+        **config["agent_kwargs"],
+    )
+
+    # load action metadata from wandb
+    action_proprio_metadata = config["bridgedata_config"]["action_proprio_metadata"]
+    action_mean = np.array(action_proprio_metadata["action"]["mean"])
+    action_std = np.array(action_proprio_metadata["action"]["std"])
+
+    # hydrate agent with parameters from checkpoint
+    agent = checkpoints.restore_checkpoint(checkpoint_weights_path, agent)
+
+    def get_action(obs, goal_obs):
+        nonlocal rng
+        rng, key = jax.random.split(rng)
+        action = jax.device_get(
+            agent.sample_actions(obs, goal_obs, seed=key, argmax=FLAGS.deterministic)
+        )
+        action = action * action_std + action_mean
+        return action
+
+    return get_action, obs_horizon
 
 
 def main(_):
-    # set up the widowx client
+    assert len(FLAGS.checkpoint_weights_path) == len(FLAGS.checkpoint_config_path)
+
+    # policies is a dict from run_name to get_action function
+    policies = {}
+    for checkpoint_weights_path, checkpoint_config_path in zip(
+        FLAGS.checkpoint_weights_path, FLAGS.checkpoint_config_path
+    ):
+        assert tf.io.gfile.exists(checkpoint_weights_path), checkpoint_weights_path
+        checkpoint_num = int(checkpoint_weights_path.split("_")[-1])
+        run_name = checkpoint_config_path.split("/")[-1]
+        policies[f"{run_name}-{checkpoint_num}"] = load_checkpoint(
+            checkpoint_weights_path, checkpoint_config_path
+        )
+
     if FLAGS.initial_eep is not None:
         assert isinstance(FLAGS.initial_eep, list)
         initial_eep = [float(e) for e in FLAGS.initial_eep]
@@ -150,87 +146,155 @@ def main(_):
     else:
         start_state = None
 
-    env_params = WidowXConfigs.DefaultEnvParams.copy()
-    env_params.update(ENV_PARAMS)
-    env_params["start_state"] = list(start_state)
-    widowx_client = WidowXClient(host=FLAGS.ip, port=FLAGS.port)
-    widowx_client.init(env_params, image_size=256)
-    env = WidowXGym(
-        widowx_client, 256, FLAGS.blocking, STICKY_GRIPPER_NUM_STEPS
-    )
-    if not FLAGS.blocking:
-        assert STEP_DURATION == 0.2, STEP_DURATION_MESSAGE
+    # set up environment
+    env_params = {
+        "fix_zangle": 0.1,
+        "move_duration": 0.2,
+        "adaptive_wait": True,
+        "move_to_rand_start_freq": 1,
+        "override_workspace_boundaries": WORKSPACE_BOUNDS,
+        "action_clipping": "xyz",
+        "catch_environment_except": False,
+        "start_state": start_state,
+        "return_full_image": False,
+        "camera_topics": CAMERA_TOPICS,
+    }
+    env = BridgeDataRailRLPrivateWidowX(env_params, fixed_image_size=FLAGS.im_size)
 
-    # load models
-    # Load Processor & VLA
-    processor = AutoProcessor.from_pretrained("openvla/openvla-7b", trust_remote_code=True)
-    # import ipdb; ipdb.set_trace()
-    vla = AutoModelForVision2Seq.from_pretrained(
-        "openvla/openvla-7b",
-        attn_implementation="flash_attention_2",  # [Optional] Requires `flash_attn`
-        torch_dtype=torch.bfloat16,
-        low_cpu_mem_usage=True,
-        trust_remote_code=True
-    )
+    # load image goal
+    image_goal = None
+    if FLAGS.goal_image_path is not None:
+        image_goal = np.array(Image.open(FLAGS.goal_image_path))
 
-    goal_image = jnp.zeros((256, 256, 3), dtype=np.uint8)
-    # import ipdb; ipdb.set_trace()
     # goal sampling loop
     while True:
-        # reset env
-        obs, _ = env.reset()
-        # image: Image.Image = get_from_camera()
-        image = obs["image_primary"][-1]
-    
-        if click.confirm("Take a new instruction?", default=True):
-            text = input("Instruction?")
-        # For logging purposes
-        goal_instruction = text
-        goal_image = jnp.zeros_like(goal_image) # blank technically
+        # ask for new goal
+        if image_goal is None:
+            print("Taking a new goal...")
+            ch = "y"
+        else:
+            ch = input("Taking a new goal? [y/n]")
+        if ch == "y":
+            if FLAGS.goal_eep is not None:
+                assert isinstance(FLAGS.goal_eep, list)
+                goal_eep = [float(e) for e in FLAGS.goal_eep]
+            else:
+                low_bound = WORKSPACE_BOUNDS[0][:3] + 0.03
+                high_bound = WORKSPACE_BOUNDS[1][:3] - 0.03
+                goal_eep = np.random.uniform(low_bound, high_bound)
+            env.controller().open_gripper(True)
+            try:
+                env.controller().move_to_state(goal_eep, 0, duration=1.5)
+                env._reset_previous_qpos()
+            except Exception as e:
+                continue
+            input("Press [Enter] when ready for taking the goal image. ")
+            obs = env.current_obs()
+            image_goal = (
+                obs["image"].reshape(3, FLAGS.im_size, FLAGS.im_size).transpose(1, 2, 0)
+                * 255
+            ).astype(np.uint8)
 
-        # Predict action
-        # inputs = processor(goal_instruction, goal_image).to("cuda:0", dtype=torch.bfloat16)
-        inputs = processor(goal_instruction, Image.fromarray(image)).to(dtype=torch.bfloat16)
+        # ask for which policy to use
+        if len(policies) == 1:
+            policy_idx = 0
+            input("Press [Enter] to start.")
+        else:
+            print("policies:")
+            for i, name in enumerate(policies.keys()):
+                print(f"{i}) {name}")
+            policy_idx = int(input("select policy: "))
 
-        input("Press [Enter] to start.")
+        policy_name = list(policies.keys())[policy_idx]
+        get_action, obs_horizon = policies[policy_name]
+        try:
+            env.reset()
+            env.start()
+        except Exception as e:
+            continue
 
-        # time.sleep(2.0)
+        # move to initial position
+        try:
+            if FLAGS.initial_eep is not None:
+                assert isinstance(FLAGS.initial_eep, list)
+                initial_eep = [float(e) for e in FLAGS.initial_eep]
+                env.controller().move_to_state(initial_eep, 0, duration=1.5)
+                env._reset_previous_qpos()
+        except Exception as e:
+            continue
 
         # do rollout
+        obs = env.current_obs()
         last_tstep = time.time()
         images = []
         goals = []
         t = 0
-        while t < FLAGS.num_timesteps:
-            print(f"Iteration {t}")
-            if time.time() > last_tstep + STEP_DURATION:
-                last_tstep = time.time()
+        if obs_horizon is not None:
+            obs_hist = deque(maxlen=obs_horizon)
+        # keep track of our own gripper state to implement sticky gripper
+        is_gripper_closed = False
+        num_consecutive_gripper_change_actions = 0
+        try:
+            while t < FLAGS.num_timesteps:
+                if time.time() > last_tstep + STEP_DURATION or FLAGS.blocking:
+                    image_obs = (
+                        obs["image"]
+                        .reshape(3, FLAGS.im_size, FLAGS.im_size)
+                        .transpose(1, 2, 0)
+                        * 255
+                    ).astype(np.uint8)
+                    obs = {"image": image_obs, "proprio": obs["state"]}
+                    goal_obs = {"image": image_goal}
+                    if obs_horizon is not None:
+                        if len(obs_hist) == 0:
+                            obs_hist.extend([obs] * obs_horizon)
+                        else:
+                            obs_hist.append(obs)
+                        obs = stack_obs(obs_hist)
 
-                # save images
-                images.append(obs["image_primary"][-1])
-                goals.append(goal_image) # technically not useful
+                    last_tstep = time.time()
 
-                if FLAGS.show_image:
-                    bgr_img = cv2.cvtColor(obs["image_primary"][-1], cv2.COLOR_RGB2BGR)
-                    cv2.imshow("img_view", bgr_img)
-                    cv2.waitKey(20)
+                    actions = get_action(obs, goal_obs)
+                    if len(actions.shape) == 1:
+                        actions = actions[None]
+                    for i in range(FLAGS.act_exec_horizon):
+                        action = actions[i]
+                        action += np.random.normal(0, FIXED_STD)
 
-                # get action
-                forward_pass_time = time.time()
-                with torch.no_grad():
-                    action = vla.predict_action(**inputs, unnorm_key="bridge_orig", do_sample=False)
+                        # sticky gripper logic
+                        if (action[-1] < 0.5) != is_gripper_closed:
+                            num_consecutive_gripper_change_actions += 1
+                        else:
+                            num_consecutive_gripper_change_actions = 0
 
-                print("forward pass time: ", time.time() - forward_pass_time)
+                        if (
+                            num_consecutive_gripper_change_actions
+                            >= STICKY_GRIPPER_NUM_STEPS
+                        ):
+                            is_gripper_closed = not is_gripper_closed
+                            num_consecutive_gripper_change_actions = 0
 
-                # perform environment step
-                start_time = time.time()
-                obs, _, _, truncated, _ = env.step(action)
-                print("step time: ", time.time() - start_time)
+                        action[-1] = 0.0 if is_gripper_closed else 1.0
 
-                t += 1
+                        # remove degrees of freedom
+                        if NO_PITCH_ROLL:
+                            action[3] = 0
+                            action[4] = 0
+                        if NO_YAW:
+                            action[5] = 0
 
-                if truncated:
-                    break
+                        # perform environment step
+                        obs, _, _, _ = env.step(
+                            action, last_tstep + STEP_DURATION, blocking=FLAGS.blocking
+                        )
+
+                        # save image
+                        images.append(image_obs)
+                        goals.append(image_goal)
+
+                        t += 1
+        except Exception as e:
+            print(traceback.format_exc(), file=sys.stderr)
 
         # save video
         if FLAGS.video_save_path is not None:
@@ -238,7 +302,7 @@ def main(_):
             curr_time = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
             save_path = os.path.join(
                 FLAGS.video_save_path,
-                f"{curr_time}.mp4",
+                f"{curr_time}_{policy_name}_sticky_{STICKY_GRIPPER_NUM_STEPS}.mp4",
             )
             video = np.concatenate([np.stack(goals), np.stack(images)], axis=1)
             imageio.mimsave(save_path, video, fps=1.0 / STEP_DURATION * 3)
