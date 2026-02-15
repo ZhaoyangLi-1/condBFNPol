@@ -1,5 +1,5 @@
 """
-python eval/eval_widowx.py \
+python eval_widowx.py \
   --checkpoint_path /path/to/your_model.ckpt \
   --device cuda \
   --im_size 480 \
