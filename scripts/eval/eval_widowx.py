@@ -1,23 +1,28 @@
 #!/usr/bin/env python3
 
 """
+cd /home/liralab-widowx/condBFNPol
 python eval_widowx.py \
-  --ckpt_path xx/xx.ckpt \
-  --ip localhost \
-  --port 5556 \
-  --device cuda \
+  --ckpt_path /data/BFN_data/checkpoints/diffusion_real_pusht.ckpt \
+  --ip localhost --port 5556 \
+  --camera_topics /D435/color/image_raw /blue/image_raw \
+  --device cuda --im_size 480 \
   --prefer_full_image \
-  --act_exec_horizon 8 \
-  --robot_action_dim 6 \
-  --action_noise_std 0.0 \
+  --action_representation auto \
+  --act_exec_horizon 1 \
+  --robot_action_dim 7 \
   --sticky_gripper_num_steps 0 \
-  --num_timesteps 120
+  --max_delta_translation 0.01 \
+  --max_delta_rotation 0.05 \
+  --action_noise_std 0.0 \
+  --print_action_debug --show_image
 """
 
 import os
 import sys
 import time
 import argparse
+import inspect
 from pathlib import Path
 from datetime import datetime
 from collections import deque
@@ -56,11 +61,15 @@ NO_YAW = False
 STICKY_GRIPPER_NUM_STEPS = 0
 WORKSPACE_BOUNDS = [[0.1, -0.15, -0.01, -1.57, 0], [0.45, 0.25, 0.25, 1.57, 0]]
 CAMERA_TOPICS = [{"name": "/blue/image_raw"}]
-ENV_PARAMS = {
-    "camera_topics": CAMERA_TOPICS,
-    "override_workspace_boundaries": WORKSPACE_BOUNDS,
-    "move_duration": STEP_DURATION,
-}
+
+
+def _build_env_params(camera_topics: List[str]) -> Dict:
+    topics = [{"name": t} for t in camera_topics]
+    return {
+        "camera_topics": topics,
+        "override_workspace_boundaries": WORKSPACE_BOUNDS,
+        "move_duration": STEP_DURATION,
+    }
 
 
 def _stdin_has_data() -> bool:
@@ -233,7 +242,13 @@ def _load_policy_from_checkpoint(
     for source, state in load_candidates:
         try:
             state = _strip_orig_mod_prefix(state)
-            policy.load_state_dict(state, strict=False)
+            # Some custom policy classes override load_state_dict(state_dict)
+            # without a `strict` kwarg, so support both signatures.
+            load_sig = inspect.signature(policy.load_state_dict)
+            if "strict" in load_sig.parameters:
+                policy.load_state_dict(state, strict=False)
+            else:
+                policy.load_state_dict(state)
             loaded_from = source
             break
         except Exception as e:
@@ -257,6 +272,9 @@ def _load_policy_from_checkpoint(
     if not action_shape:
         raise KeyError("shape_meta.action.shape missing")
     action_dim = int(action_shape[0])
+    delta_action = OmegaConf.select(cfg, "task.dataset.delta_action")
+    if delta_action is not None:
+        delta_action = bool(delta_action)
 
     return {
         "policy": policy,
@@ -265,6 +283,7 @@ def _load_policy_from_checkpoint(
         "n_obs_steps": max(1, n_obs_steps),
         "n_action_steps": max(1, n_action_steps),
         "action_dim": action_dim,
+        "delta_action": delta_action,
         "kind": _infer_policy_kind(policy),
         "loaded_from": loaded_from,
     }
@@ -304,34 +323,51 @@ def _select_rgb_source(
     im_size: int,
     target_hw: Tuple[int, int],
     prefer_full_image: bool,
+    preferred_keys: Optional[List[str]] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     target_h, target_w = target_hw
 
-    full_img = None
-    if prefer_full_image and obs.get("full_image") is not None:
-        try:
-            full_img = _as_hwc_float01(obs["full_image"], im_size)
-        except Exception:
-            full_img = None
-
-    small_img = None
-    if obs.get("image") is not None:
-        try:
-            small_img = _as_hwc_float01(obs["image"], im_size)
-        except Exception:
-            small_img = None
-
-    if full_img is None and small_img is None:
-        raise RuntimeError("Observation has neither valid full_image nor image")
-
-    if full_img is not None and small_img is not None:
-        fh, fw = full_img.shape[:2]
-        sh, sw = small_img.shape[:2]
-        full_cost = abs(fh - target_h) + abs(fw - target_w)
-        small_cost = abs(sh - target_h) + abs(sw - target_w)
-        src = full_img if full_cost <= small_cost else small_img
+    if prefer_full_image:
+        key_order = ["full_image", "external_img", "over_shoulder_img", "wrist_img", "image"]
     else:
-        src = full_img if full_img is not None else small_img
+        key_order = ["image", "full_image", "external_img", "over_shoulder_img", "wrist_img"]
+
+    if preferred_keys:
+        ordered = []
+        seen = set()
+        for key in list(preferred_keys) + key_order:
+            if key not in seen:
+                ordered.append(key)
+                seen.add(key)
+        key_order = ordered
+
+    candidates = []
+    for key in key_order:
+        if obs.get(key) is None:
+            continue
+        try:
+            img = _as_hwc_float01(obs[key], im_size)
+            candidates.append((key, img))
+        except Exception:
+            continue
+
+    if not candidates:
+        obs_keys = sorted(list(obs.keys()))
+        raise RuntimeError(
+            f"Observation has no valid RGB image source. "
+            f"Tried keys={key_order}, available_keys={obs_keys}"
+        )
+
+    best_img = None
+    best_cost = None
+    for key, img in candidates:
+        h, w = img.shape[:2]
+        cost = abs(h - target_h) + abs(w - target_w)
+        if best_cost is None or cost < best_cost:
+            best_img = img
+            best_cost = cost
+
+    src = best_img
 
     if src.shape[:2] != (target_h, target_w):
         src = _resize_hwc_float01(src, (target_h, target_w))
@@ -375,11 +411,20 @@ def _build_obs_frame(
             if len(shape) != 3:
                 raise ValueError(f"RGB obs key {key} expects 3D shape, got {shape}")
             _, h, w = shape
+
+            preferred_keys = None
+            key_l = key.lower()
+            if key_l == "camera_0" or key_l.endswith("camera_0"):
+                preferred_keys = ["external_img", "full_image", "image"]
+            elif key_l == "camera_1" or key_l.endswith("camera_1"):
+                preferred_keys = ["over_shoulder_img", "wrist_img", "external_img", "full_image", "image"]
+
             chw, rgb_u8 = _select_rgb_source(
                 obs=raw_obs,
                 im_size=im_size,
                 target_hw=(h, w),
                 prefer_full_image=prefer_full_image,
+                preferred_keys=preferred_keys,
             )
             frame[key] = chw
             if display_rgb_u8 is None:
@@ -394,8 +439,12 @@ def _build_obs_frame(
     if display_rgb_u8 is None:
         # Fallback for video/preview when shape_meta has no rgb key.
         try:
-            img = _as_hwc_float01(raw_obs["full_image"], im_size)
-            display_rgb_u8 = np.clip(img * 255.0, 0.0, 255.0).astype(np.uint8)
+            _, display_rgb_u8 = _select_rgb_source(
+                obs=raw_obs,
+                im_size=im_size,
+                target_hw=(im_size, im_size),
+                prefer_full_image=prefer_full_image,
+            )
         except Exception:
             display_rgb_u8 = None
 
@@ -484,14 +533,91 @@ def _postprocess_action(
     return action
 
 
-def _get_display_bgr(raw_obs: Dict, fallback_rgb_u8: Optional[np.ndarray]) -> Optional[np.ndarray]:
-    if raw_obs.get("full_image") is not None:
-        try:
-            rgb = _as_hwc_float01(raw_obs["full_image"], im_size=96)
-            rgb_u8 = np.clip(rgb * 255.0, 0.0, 255.0).astype(np.uint8)
-            return _rgb_to_bgr_u8(rgb_u8)
-        except Exception:
-            pass
+def _resolve_action_representation(
+    user_mode: str,
+    ckpt_delta_action: Optional[bool],
+) -> str:
+    if user_mode in ("delta", "absolute"):
+        return user_mode
+    if ckpt_delta_action is None:
+        # Keep previous behavior if config does not specify semantics.
+        return "delta"
+    return "delta" if ckpt_delta_action else "absolute"
+
+
+def _convert_absolute_to_delta_sequence(
+    action_seq: np.ndarray,
+    current_state: np.ndarray,
+) -> np.ndarray:
+    """
+    Convert absolute pose targets [x,y,z,roll,pitch,yaw,...] to deltas.
+    Consecutive actions are differenced against previous absolute targets.
+    """
+    if action_seq.ndim != 2:
+        raise ValueError(f"Expected action_seq rank 2, got shape={action_seq.shape}")
+    if current_state.size < 6:
+        raise ValueError(
+            f"Need at least 6-D state for absolute->delta conversion, got {current_state.size}"
+        )
+
+    out = np.zeros_like(action_seq, dtype=np.float32)
+    prev_abs_pose = current_state[:6].astype(np.float32).copy()
+    for i in range(action_seq.shape[0]):
+        action = action_seq[i].astype(np.float32, copy=False)
+        if action.size < 6:
+            raise ValueError(
+                f"Absolute action conversion requires >=6 dims, got {action.size}"
+            )
+        target_abs_pose = action[:6]
+        out[i, :6] = target_abs_pose - prev_abs_pose
+        if action.size > 6:
+            out[i, 6:] = action[6:]
+        prev_abs_pose = target_abs_pose.copy()
+    return out
+
+
+def _clip_delta_action(
+    action: np.ndarray,
+    max_delta_translation: float,
+    max_delta_rotation: float,
+) -> np.ndarray:
+    """
+    Additional safety clipping before sending delta commands to robot.
+    """
+    action = action.copy()
+    if max_delta_translation > 0 and action.size >= 3:
+        action[:3] = np.clip(action[:3], -max_delta_translation, max_delta_translation)
+
+    if max_delta_rotation > 0:
+        if action.size >= 6:
+            action[3:6] = np.clip(action[3:6], -max_delta_rotation, max_delta_rotation)
+        elif action.size == 5:
+            action[3] = np.clip(action[3], -max_delta_rotation, max_delta_rotation)
+
+    # Gripper is absolute in WidowX SDK.
+    if action.size in (4, 5):
+        action[-1] = np.clip(action[-1], 0.0, 1.0)
+    elif action.size >= 7:
+        action[6] = np.clip(action[6], 0.0, 1.0)
+
+    return action
+
+
+def _get_display_bgr(
+    raw_obs: Dict,
+    fallback_rgb_u8: Optional[np.ndarray],
+    im_size: int,
+) -> Optional[np.ndarray]:
+    try:
+        _, rgb_u8 = _select_rgb_source(
+            obs=raw_obs,
+            im_size=im_size,
+            target_hw=(im_size, im_size),
+            prefer_full_image=True,
+        )
+        return _rgb_to_bgr_u8(rgb_u8)
+    except Exception:
+        pass
 
     if fallback_rgb_u8 is not None:
         try:
@@ -590,6 +716,38 @@ def _normalize_action_client_config(widowx_client) -> None:
         pass
 
 
+def _set_reqrep_timeout_ms(widowx_client, timeout_ms: int) -> None:
+    """Set edgeml req/rep timeout for this client (best-effort)."""
+    try:
+        action_client = getattr(widowx_client, "_WidowXClient__client", None)
+        if action_client is None:
+            return
+        reqrep_client = getattr(action_client, "client", None)
+        if reqrep_client is None:
+            return
+        reqrep_client.timeout_ms = int(timeout_ms)
+        reqrep_client.reset_socket()
+    except Exception:
+        pass
+
+
+def _wait_for_widowx_observation(
+    widowx_client,
+    timeout_s: float = 20.0,
+    poll_s: float = 0.5,
+) -> bool:
+    end_t = time.time() + timeout_s
+    while time.time() < end_t:
+        try:
+            obs = widowx_client.get_observation()
+        except Exception:
+            obs = None
+        if obs is not None:
+            return True
+        time.sleep(poll_s)
+    return False
+
+
 def _init_widowx_with_retry(
     WidowXClient,
     WidowXConfigs,
@@ -620,16 +778,27 @@ def _init_widowx_with_retry(
                             setattr(cfg, key, sorted(value))
                 client = WidowXClient(host=host, port=port)
                 _normalize_action_client_config(client)
+                # Init can block while server boots ROS/cameras; use longer RPC timeout.
+                _set_reqrep_timeout_ms(client, timeout_ms=120_000)
 
             status = client.init(env_params, image_size=image_size)
             last_status = status
             if _status_ok(status, WidowXStatus):
+                # Restore shorter timeout for rollout RPCs.
+                _set_reqrep_timeout_ms(client, timeout_ms=2_000)
                 return client
 
             print(
                 f"[WARN] WidowX init attempt {attempt} returned "
                 f"{_status_name(status, WidowXStatus)}; retrying..."
             )
+            # If init response timed out but server is still finishing setup,
+            # observations may start flowing without requiring another init call.
+            _set_reqrep_timeout_ms(client, timeout_ms=2_000)
+            if _wait_for_widowx_observation(client, timeout_s=10.0, poll_s=0.5):
+                print("[INFO] WidowX observation stream is ready after init timeout.")
+                return client
+            _set_reqrep_timeout_ms(client, timeout_ms=120_000)
         except Exception as e:
             last_error = e
             print(f"[WARN] WidowX init attempt {attempt} failed: {e}; retrying...")
@@ -696,6 +865,13 @@ def main():
     parser.add_argument("--act_exec_horizon", type=int, default=8)
     parser.add_argument("--ip", type=str, default="localhost")
     parser.add_argument("--port", type=int, default=5556)
+    parser.add_argument(
+        "--camera_topics",
+        type=str,
+        nargs="+",
+        default=[x["name"] for x in CAMERA_TOPICS],
+        help="ROS image topics used by WidowX env service. Pass one or more topics.",
+    )
     parser.add_argument("--show_image", action="store_true")
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument(
@@ -713,8 +889,18 @@ def main():
     parser.add_argument(
         "--robot_action_dim",
         type=int,
-        default=6,
+        default=7,
         help="Action dimension sent to WidowX",
+    )
+    parser.add_argument(
+        "--action_representation",
+        type=str,
+        choices=["auto", "delta", "absolute"],
+        default="auto",
+        help=(
+            "How to interpret policy outputs before step_action. "
+            "'auto' uses task.dataset.delta_action from checkpoint config."
+        ),
     )
     parser.add_argument(
         "--action_noise_std",
@@ -727,6 +913,23 @@ def main():
         type=int,
         default=STICKY_GRIPPER_NUM_STEPS,
         help="Consecutive toggle count for sticky gripper logic; <=0 disables",
+    )
+    parser.add_argument(
+        "--max_delta_translation",
+        type=float,
+        default=0.03,
+        help="Safety clip for |dx,dy,dz| before step_action (meters). <=0 disables.",
+    )
+    parser.add_argument(
+        "--max_delta_rotation",
+        type=float,
+        default=0.15,
+        help="Safety clip for |droll,dpitch,dyaw| before step_action (radians). <=0 disables.",
+    )
+    parser.add_argument(
+        "--print_action_debug",
+        action="store_true",
+        help="Print per-step action debug values.",
     )
     parser.add_argument("--no_pitch_roll", action="store_true", default=NO_PITCH_ROLL)
     parser.add_argument("--no_yaw", action="store_true", default=NO_YAW)
@@ -826,6 +1029,10 @@ def main():
         shape_meta = picked["shape_meta"]
         obs_shape_meta = shape_meta["obs"]
         n_obs_steps = picked["n_obs_steps"]
+        action_mode = _resolve_action_representation(
+            user_mode=args.action_representation,
+            ckpt_delta_action=picked.get("delta_action"),
+        )
 
         print(
             f"Loaded {picked['kind']} policy ({type(policy).__name__}), "
@@ -833,12 +1040,17 @@ def main():
             f"n_action_steps={picked['n_action_steps']}, action_dim={picked['action_dim']}"
         )
         print(f"Observation keys: {list(obs_shape_meta.keys())}")
+        print(
+            f"Action representation: {action_mode} "
+            f"(cfg task.dataset.delta_action={picked.get('delta_action')})"
+        )
 
         if widowx_client is None:
             print("Initializing WidowX connection...")
             env_params = WidowXConfigs.DefaultEnvParams.copy()
-            env_params.update(ENV_PARAMS)
+            env_params.update(_build_env_params(args.camera_topics))
             env_params["start_state"] = list(np.concatenate([args.initial_eep, [0, 0, 0, 1]]))
+            print(f"WidowX camera topics: {args.camera_topics}")
             widowx_client = _init_widowx_with_retry(
                 WidowXClient=WidowXClient,
                 WidowXConfigs=WidowXConfigs,
@@ -862,6 +1074,7 @@ def main():
         is_gripper_closed = False
         consecutive_gripper_change = 0
         reset_requested = False
+        abs_to_delta_warned = False
 
         if args.show_image:
             obs = widowx_client.get_observation()
@@ -869,7 +1082,7 @@ def main():
                 print("Waiting for observations...")
                 time.sleep(1)
                 obs = widowx_client.get_observation()
-            bgr = _get_display_bgr(obs, None)
+            bgr = _get_display_bgr(obs, None, args.im_size)
             if bgr is not None:
                 cv2.imshow("img_view", bgr)
                 cv2.waitKey(100)
@@ -886,15 +1099,20 @@ def main():
                     print("WARNING: retrying get_observation...")
                     continue
 
-                curr_frame, frame_rgb_u8 = _build_obs_frame(
-                    raw_obs=raw_obs,
-                    obs_shape_meta=obs_shape_meta,
-                    im_size=args.im_size,
-                    prefer_full_image=args.prefer_full_image,
-                )
+                try:
+                    curr_frame, frame_rgb_u8 = _build_obs_frame(
+                        raw_obs=raw_obs,
+                        obs_shape_meta=obs_shape_meta,
+                        im_size=args.im_size,
+                        prefer_full_image=args.prefer_full_image,
+                    )
+                except RuntimeError as e:
+                    print(f"[WARN] {e}")
+                    time.sleep(0.2)
+                    continue
 
                 if args.show_image:
-                    bgr_img = _get_display_bgr(raw_obs, frame_rgb_u8)
+                    bgr_img = _get_display_bgr(raw_obs, frame_rgb_u8, args.im_size)
                     if bgr_img is not None:
                         cv2.imshow("img_view", bgr_img)
                         key = cv2.waitKey(10) & 0xFF
@@ -923,9 +1141,25 @@ def main():
                 last_tstep = time.time()
                 actions = _predict_action_sequence(policy, model_obs, device)
                 exec_horizon = min(max(1, args.act_exec_horizon), actions.shape[0])
+                action_seq = actions[:exec_horizon].copy()
+
+                if action_mode == "absolute":
+                    try:
+                        curr_state = _extract_state(raw_obs)
+                        action_seq = _convert_absolute_to_delta_sequence(
+                            action_seq=action_seq,
+                            current_state=curr_state,
+                        )
+                    except Exception as e:
+                        if not abs_to_delta_warned:
+                            print(
+                                "[WARN] Failed absolute->delta conversion; "
+                                f"falling back to raw actions. Error: {e}"
+                            )
+                            abs_to_delta_warned = True
 
                 for i in range(exec_horizon):
-                    action = actions[i].copy()
+                    action = action_seq[i].copy()
 
                     if args.action_noise_std > 0:
                         action += np.random.normal(
@@ -953,8 +1187,23 @@ def main():
                         no_pitch_roll=args.no_pitch_roll,
                         no_yaw=args.no_yaw,
                     )
+                    action = _clip_delta_action(
+                        action,
+                        max_delta_translation=args.max_delta_translation,
+                        max_delta_rotation=args.max_delta_rotation,
+                    )
 
-                    widowx_client.step_action(action, blocking=args.blocking)
+                    if args.print_action_debug:
+                        print(
+                            f"[action] step={t} exec_idx={i} "
+                            f"cmd={np.array2string(action, precision=5, suppress_small=True)}"
+                        )
+
+                    status = widowx_client.step_action(action, blocking=args.blocking)
+                    if not _status_ok(status, WidowXStatus):
+                        raise RuntimeError(
+                            f"WidowX step_action failed with status={_status_name(status, WidowXStatus)}"
+                        )
 
                     if frame_rgb_u8 is not None:
                         images.append(frame_rgb_u8)
