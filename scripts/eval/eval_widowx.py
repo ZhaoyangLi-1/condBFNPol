@@ -2,14 +2,16 @@
 
 """
 python scripts/eval/eval_widowx.py \
-  --ckpt_path xxx.ckpt \
+  --ckpt_path xx/xx.ckpt \
   --ip localhost \
   --port 5556 \
   --device cuda \
-  --im_size 96 \
-  --num_timesteps 120 \
-  --robot_action_dim 7 \
-  --show_image
+  --prefer_full_image \
+  --act_exec_horizon 8 \
+  --robot_action_dim 6 \
+  --action_noise_std 0.0 \
+  --sticky_gripper_num_steps 0 \
+  --num_timesteps 120
 """
 
 import os
