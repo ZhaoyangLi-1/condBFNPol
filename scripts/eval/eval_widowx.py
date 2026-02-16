@@ -1,20 +1,19 @@
 """
 python eval_widowx.py \
-  --checkpoint_path /path/to/your_model.ckpt \
-  --device cuda \
-  --im_size 480 \
-  --num_timesteps 120 \
-  --video_save_path /tmp/widowx_eval
+  --checkpoint_path /data/BFN_data/checkpoints/diffusion_real_pusht.ckpt \
+  --device cuda --im_size 480 --num_timesteps 120 --video_save_path /tmp/widowx_eval \
+  --ip 127.0.0.1 --port 5556
 """
 
 import os
 import sys
 import time
 import traceback
+import socket
 from collections import deque
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, List
 
 import dill
 import hydra
@@ -25,8 +24,76 @@ from absl import app, flags, logging
 from omegaconf import OmegaConf
 from PIL import Image
 
-from multicam_server.topic_utils import IMTopic
-from widowx_envs.widowx_env import BridgeDataRailRLPrivateWidowX
+
+def _extend_pythonpath_for_widowx() -> None:
+    """Allow running this script without pre-configuring PYTHONPATH."""
+    script_path = Path(__file__).resolve()
+    project_root = script_path.parents[2] if len(script_path.parents) > 2 else script_path.parent
+    workspace_root = script_path.parents[3] if len(script_path.parents) > 3 else script_path.parent
+    home_dir = Path.home()
+    candidate_paths = []
+
+    env_project_root = os.environ.get("BFNPOL_ROOT")
+    if env_project_root:
+        env_project_root = Path(env_project_root)
+        candidate_paths.append(env_project_root)
+        candidate_paths.append(env_project_root / "src")
+        candidate_paths.append(env_project_root / "src/diffusion-policy")
+
+    env_dp_root = os.environ.get("DIFFUSION_POLICY_ROOT")
+    if env_dp_root:
+        candidate_paths.append(Path(env_dp_root))
+
+    env_widowx_root = os.environ.get("WIDOWX_ENVS_ROOT")
+    if env_widowx_root:
+        candidate_paths.append(Path(env_widowx_root))
+
+    env_src = os.environ.get("MULTICAM_SERVER_SRC")
+    if env_src:
+        candidate_paths.append(Path(env_src))
+
+    candidate_paths.extend(
+        [
+            project_root,
+            project_root / "src",
+            project_root / "src/diffusion-policy",
+            workspace_root / "bridge_data_robot/widowx_envs",
+            workspace_root / "Documents/bridge_data_robot/widowx_envs",
+            workspace_root / "bridge_data_robot/widowx_envs/multicam_server/src",
+            workspace_root / "Documents/bridge_data_robot/widowx_envs/multicam_server/src",
+            home_dir / "bridge_data_robot/widowx_envs",
+            home_dir / "Documents/bridge_data_robot/widowx_envs",
+            home_dir / "bridge_data_robot/widowx_envs/multicam_server/src",
+            home_dir / "Documents/bridge_data_robot/widowx_envs/multicam_server/src",
+        ]
+    )
+
+    existing_candidates: List[str] = []
+    seen = set()
+    for candidate in candidate_paths:
+        candidate_str = str(candidate)
+        if candidate_str in seen:
+            continue
+        seen.add(candidate_str)
+        if candidate.is_dir():
+            existing_candidates.append(candidate_str)
+
+    for candidate_str in reversed(existing_candidates):
+        if candidate_str not in sys.path:
+            sys.path.insert(0, candidate_str)
+
+
+_extend_pythonpath_for_widowx()
+
+try:
+    from widowx_envs.widowx_env_service import WidowXClient, WidowXConfigs, WidowXStatus
+except ModuleNotFoundError as exc:
+    if exc.name and exc.name.startswith("widowx_envs"):
+        raise ModuleNotFoundError(
+            "widowx_envs is not importable. Install it, set WIDOWX_ENVS_ROOT, or "
+            "place it at bridge_data_robot/widowx_envs."
+        ) from exc
+    raise
 
 np.set_printoptions(suppress=True)
 logging.set_verbosity(logging.WARNING)
@@ -38,6 +105,8 @@ FLAGS = flags.FLAGS
 flags.DEFINE_multi_string(
     "checkpoint_path", None, "Path(s) to diffusion/BFN checkpoint .ckpt", required=True
 )
+flags.DEFINE_string("ip", "127.0.0.1", "WidowX service IP (use IPv4; localhost may resolve to ::1)")
+flags.DEFINE_integer("port", 5556, "WidowX service port")
 flags.DEFINE_string("device", "cuda", "Torch device (e.g. cuda, cuda:0, cpu)")
 flags.DEFINE_bool("use_ema", True, "Load EMA policy when available")
 flags.DEFINE_integer("im_size", 96, "WidowX env image size")
@@ -81,6 +150,71 @@ WORKSPACE_BOUNDS = np.array(
     [[0.1, -0.15, -0.1, -1.57, 0], [0.45, 0.25, 0.25, 1.57, 0]], dtype=np.float64
 )
 FIXED_STD = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float64)
+STEP_DURATION_MESSAGE = """
+Bridge data was collected with non-blocking control and a step duration of 0.2s.
+Use 0.2s step duration for non-blocking evaluation.
+"""
+
+
+def _status_name(status: int) -> str:
+    for name in ("SUCCESS", "NO_CONNECTION", "EXECUTION_FAILURE", "NOT_INITIALIZED"):
+        if getattr(WidowXStatus, name) == status:
+            return name
+    return str(status)
+
+
+def _wait_for_obs(
+    client: WidowXClient, timeout_s: float = 30.0, poll_s: float = 0.1
+) -> Dict[str, Any]:
+    deadline = time.time() + timeout_s
+    obs = client.get_observation()
+    while obs is None and time.time() < deadline:
+        time.sleep(poll_s)
+        obs = client.get_observation()
+    if obs is None:
+        raise TimeoutError(f"Timed out waiting for WidowX observation after {timeout_s:.1f}s")
+    return obs
+
+
+def _convert_client_obs(raw_obs: Dict[str, Any], im_size: int) -> Dict[str, Any]:
+    image = raw_obs.get("external_img", None)
+    if image is None:
+        image = raw_obs.get("image", None)
+    if image is None:
+        raise KeyError(f"Observation has no image key. Keys: {list(raw_obs.keys())}")
+
+    image = _image_to_hwc_uint8(image, im_size)
+    image = _resize_hwc_uint8(image, im_size, im_size)
+    state = np.asarray(
+        raw_obs.get("state", np.zeros((7,), dtype=np.float32)), dtype=np.float32
+    ).reshape(-1)
+    return {"image": image, "state": state}
+
+
+def _move_to_xyz(
+    client: WidowXClient, xyz: np.ndarray, duration: float = 1.5, blocking: bool = True
+) -> bool:
+    pose = np.asarray([xyz[0], xyz[1], xyz[2], 0.0, 1.57, 0.0], dtype=np.float64)
+    status = client.move(pose, duration=duration, blocking=blocking)
+    if status != WidowXStatus.SUCCESS:
+        logging.warning("WidowX move failed with status=%s", _status_name(status))
+        return False
+    return True
+
+
+def _client_step(
+    client: WidowXClient, env_action: np.ndarray, blocking: bool, im_size: int
+) -> Tuple[Optional[Dict[str, Any]], bool]:
+    status = client.step_action(np.asarray(env_action, dtype=np.float64), blocking=blocking)
+    if status != WidowXStatus.SUCCESS:
+        logging.warning("WidowX step_action failed with status=%s", _status_name(status))
+        return None, True
+
+    raw_obs = client.get_observation()
+    if raw_obs is None:
+        logging.warning("WidowX observation returned None after step_action.")
+        return None, True
+    return _convert_client_obs(raw_obs, im_size), False
 
 
 def _to_container(x: Any) -> Any:
@@ -242,7 +376,9 @@ def _stack_obs(obs_hist: deque) -> Dict[str, np.ndarray]:
     return {k: np.stack([obs[k] for obs in obs_hist], axis=0) for k in keys}
 
 
-def _to_torch_obs_batch(obs_np: Dict[str, np.ndarray], device: torch.device) -> Dict[str, torch.Tensor]:
+def _to_torch_obs_batch(
+    obs_np: Dict[str, np.ndarray], device: torch.device
+) -> Dict[str, torch.Tensor]:
     return {
         k: torch.from_numpy(v).unsqueeze(0).to(device=device, dtype=torch.float32)
         for k, v in obs_np.items()
@@ -333,23 +469,19 @@ def _load_policy(checkpoint_path: str, device: torch.device):
     def get_action(obs_dict_np: Dict[str, np.ndarray]) -> np.ndarray:
         nonlocal infer_count
         obs_torch = _to_torch_obs_batch(obs_dict_np, device)
+
         if FLAGS.deterministic:
             if device.type == "cuda":
                 dev_idx = device.index if device.index is not None else torch.cuda.current_device()
                 rng_ctx = torch.random.fork_rng(devices=[dev_idx])
             else:
                 rng_ctx = torch.random.fork_rng()
+
             with rng_ctx:
                 torch.manual_seed(FLAGS.seed + infer_count)
-                if hasattr(policy, "predict_action"):
-                    out = policy.predict_action(obs_torch)
-                else:
-                    out = policy(obs_torch)
+                out = policy.predict_action(obs_torch) if hasattr(policy, "predict_action") else policy(obs_torch)
         else:
-            if hasattr(policy, "predict_action"):
-                out = policy.predict_action(obs_torch)
-            else:
-                out = policy(obs_torch)
+            out = policy.predict_action(obs_torch) if hasattr(policy, "predict_action") else policy(obs_torch)
 
         infer_count += 1
         return _extract_action_array(out)
@@ -362,6 +494,138 @@ def _load_policy(checkpoint_path: str, device: torch.device):
         "action_dim": action_dim,
         "get_action": get_action,
     }
+
+
+def _candidate_ips(user_ip: str, port: int) -> List[str]:
+    """
+    Build a list of IPs to try. Handles cases where the service binds to IPv6 ::1,
+    or where localhost resolves differently between host/container.
+    """
+    cands: List[str] = []
+
+    def add(x: Optional[str]) -> None:
+        if x and x not in cands:
+            cands.append(x)
+
+    add(user_ip)
+    add("127.0.0.1")
+    add("localhost")  # may resolve to ::1
+    add("::1")        # IPv6 loopback
+
+    try:
+        hostname = socket.gethostname()
+        for _fam, _typ, _pro, _can, sockaddr in socket.getaddrinfo(hostname, None):
+            add(sockaddr[0])
+    except Exception:
+        pass
+
+    try:
+        add(socket.gethostbyname(socket.gethostname()))
+    except Exception:
+        pass
+
+    return cands
+
+
+def _connect_widowx_with_retry(
+    env_params: dict,
+    image_size: int,
+    total_timeout_s: float = 120.0,
+    per_ip_timeout_s: float = 30.0,
+) -> WidowXClient:
+    """
+    Robust connect that retries BOTH:
+      (1) WidowXClient(...) constructor (ActionClient connect)  <-- your crash happens here
+      (2) client.init(...)
+    so you can wait for server startup without crashing.
+    """
+    ips = _candidate_ips(FLAGS.ip, FLAGS.port)
+
+    t_start = time.time()
+    last_err: Optional[str] = None
+
+    for ip in ips:
+        print(f"[widowx] Trying {ip}:{FLAGS.port} ...")
+        ip_start = time.time()
+        attempt = 0
+
+        while True:
+            if time.time() - t_start > total_timeout_s:
+                raise RuntimeError(
+                    f"WidowX connect timeout after {total_timeout_s:.1f}s. "
+                    f"Tried IPs={ips}. Last error: {last_err}"
+                )
+
+            if time.time() - ip_start > per_ip_timeout_s:
+                print(f"[widowx] Giving up on {ip} after {per_ip_timeout_s:.1f}s. Last error: {last_err}")
+                break
+
+            attempt += 1
+            sleep_s = min(2.0, 0.1 * (2 ** (attempt - 1)))
+
+            # Retry constructor (ActionClient connect)
+            try:
+                client = WidowXClient(host=ip, port=FLAGS.port)
+            except Exception as e:
+                last_err = f"constructor failed: {repr(e)}"
+                logging.warning("[widowx] %s (attempt %d). Sleeping %.2fs", last_err, attempt, sleep_s)
+                time.sleep(sleep_s)
+                continue
+
+            # Retry init
+            try:
+                st = client.init(env_params, image_size=int(image_size))
+                if st == WidowXStatus.SUCCESS:
+                    print(f"[widowx] Connected on {ip}:{FLAGS.port}")
+                    return client
+
+                last_err = f"init status={_status_name(st)}"
+                logging.warning("[widowx] %s (attempt %d). Sleeping %.2fs", last_err, attempt, sleep_s)
+
+            except Exception as e:
+                last_err = f"init exception: {repr(e)}"
+                logging.warning("[widowx] %s (attempt %d). Sleeping %.2fs", last_err, attempt, sleep_s)
+
+            if hasattr(client, "close"):
+                try:
+                    client.close()
+                except Exception:
+                    pass
+
+            time.sleep(sleep_s)
+
+    raise RuntimeError(f"WidowX connect failed for all candidates {ips}. Last error: {last_err}")
+
+
+def _warmup_camera_or_die(client: WidowXClient, im_size: int, timeout_s: float = 60.0) -> None:
+    """
+    Explicitly wait for first *valid* image observation.
+    This prevents hanging later at goal capture / rollout if camera never publishes.
+    """
+    print(f"[widowx] Waiting for first camera frame (timeout {timeout_s:.0f}s)...")
+    deadline = time.time() + timeout_s
+    last_err: Optional[str] = None
+
+    while time.time() < deadline:
+        try:
+            raw = client.get_observation()
+            if raw is None:
+                time.sleep(0.1)
+                continue
+            _ = _convert_client_obs(raw, im_size)  # validate
+            print("[widowx] First camera frame received.")
+            return
+        except Exception as e:
+            last_err = repr(e)
+            time.sleep(0.2)
+
+    raise RuntimeError(
+        "Camera did not produce a valid frame within timeout.\n"
+        f"  camera_topic(s): {FLAGS.camera_topic}\n"
+        f"  last_error: {last_err}\n"
+        "Likely causes: wrong topic name, no publisher, compressed-vs-raw mismatch, "
+        "or camera driver not accessible inside container."
+    )
 
 
 def main(_):
@@ -392,20 +656,26 @@ def main(_):
     else:
         start_state = None
 
-    camera_topics = [IMTopic(topic) for topic in FLAGS.camera_topic]
-    env_params = {
-        "fix_zangle": 0.1,
-        "move_duration": 0.2,
-        "adaptive_wait": True,
-        "move_to_rand_start_freq": 1,
-        "override_workspace_boundaries": WORKSPACE_BOUNDS,
-        "action_clipping": "xyz",
-        "catch_environment_except": False,
-        "start_state": start_state,
-        "return_full_image": False,
-        "camera_topics": camera_topics,
-    }
-    env = BridgeDataRailRLPrivateWidowX(env_params, fixed_image_size=FLAGS.im_size)
+    if not FLAGS.blocking:
+        assert abs(float(FLAGS.step_duration) - 0.2) < 1e-6, STEP_DURATION_MESSAGE
+
+    camera_topics = [{"name": topic} for topic in FLAGS.camera_topic]
+    env_params = WidowXConfigs.DefaultEnvParams.copy()
+    env_params.update(
+        {
+            "camera_topics": camera_topics,
+            "override_workspace_boundaries": WORKSPACE_BOUNDS.tolist(),
+            "move_duration": float(FLAGS.step_duration),
+        }
+    )
+    if start_state is not None:
+        env_params["start_state"] = list(start_state)
+
+    # Robust connect (retries constructor + init)
+    widowx_client = _connect_widowx_with_retry(env_params, image_size=int(FLAGS.im_size))
+
+    # Optional: require first camera frame early
+    _warmup_camera_or_die(widowx_client, im_size=int(FLAGS.im_size), timeout_s=60.0)
 
     image_goal: Optional[np.ndarray] = None
     if FLAGS.goal_image_path is not None:
@@ -429,15 +699,20 @@ def main(_):
                 low_bound = WORKSPACE_BOUNDS[0][:3] + 0.03
                 high_bound = WORKSPACE_BOUNDS[1][:3] - 0.03
                 goal_eep = np.random.uniform(low_bound, high_bound)
-            env.controller().open_gripper(True)
+
+            gripper_status = widowx_client.move_gripper(1.0)
+            if gripper_status != WidowXStatus.SUCCESS:
+                logging.warning("WidowX move_gripper failed with status=%s", _status_name(gripper_status))
+
             try:
-                env.controller().move_to_state(goal_eep, 0, duration=1.5)
-                env._reset_previous_qpos()
+                if not _move_to_xyz(widowx_client, np.asarray(goal_eep, dtype=np.float64), duration=1.5):
+                    continue
             except Exception:
                 continue
+
             input("Press [Enter] when ready for taking the goal image. ")
-            obs = env.current_obs()
-            image_goal = _image_to_hwc_uint8(obs["image"], FLAGS.im_size)
+            obs = _convert_client_obs(_wait_for_obs(widowx_client), FLAGS.im_size)
+            image_goal = obs["image"]
 
         if len(policies) == 1:
             policy_idx = 0
@@ -455,20 +730,23 @@ def main(_):
         n_obs_steps = policy_data["n_obs_steps"]
 
         try:
-            env.reset()
-            env.start()
+            reset_status = widowx_client.reset()
+            if reset_status != WidowXStatus.SUCCESS:
+                logging.warning("WidowX reset failed with status=%s", _status_name(reset_status))
+                continue
+            obs = _convert_client_obs(_wait_for_obs(widowx_client), FLAGS.im_size)
         except Exception:
             continue
 
         try:
             if FLAGS.initial_eep is not None:
                 initial_eep = [float(x) for x in FLAGS.initial_eep]
-                env.controller().move_to_state(initial_eep, 0, duration=1.5)
-                env._reset_previous_qpos()
+                if not _move_to_xyz(widowx_client, np.asarray(initial_eep, dtype=np.float64), duration=1.5):
+                    continue
+                obs = _convert_client_obs(_wait_for_obs(widowx_client), FLAGS.im_size)
         except Exception:
             continue
 
-        obs = env.current_obs()
         last_tstep = time.time()
         images = []
         goals = []
@@ -476,6 +754,7 @@ def main(_):
         obs_hist = deque(maxlen=n_obs_steps)
         is_gripper_closed = False
         num_consecutive_gripper_change_actions = 0
+        episode_truncated = False
         last_env_action = np.zeros((FLAGS.env_action_dim,), dtype=np.float64)
         if FLAGS.env_action_dim > 0:
             last_env_action[-1] = 1.0
@@ -496,9 +775,7 @@ def main(_):
                             obs_hist.append(policy_obs)
                         policy_obs_stacked = _stack_obs(obs_hist)
                     else:
-                        policy_obs_stacked = {
-                            k: np.expand_dims(v, axis=0) for k, v in policy_obs.items()
-                        }
+                        policy_obs_stacked = {k: np.expand_dims(v, axis=0) for k, v in policy_obs.items()}
 
                     last_tstep = time.time()
                     actions = get_action(policy_obs_stacked)
@@ -506,8 +783,8 @@ def main(_):
                         actions = actions[None]
 
                     n_exec = min(int(FLAGS.act_exec_horizon), actions.shape[0])
-                    for i in range(n_exec):
-                        policy_action = np.asarray(actions[i], dtype=np.float64).reshape(-1)
+                    for i_exec in range(n_exec):
+                        policy_action = np.asarray(actions[i_exec], dtype=np.float64).reshape(-1)
                         env_action = last_env_action.copy()
 
                         n_copy = min(policy_action.size, env_action.size)
@@ -522,16 +799,13 @@ def main(_):
                         if FLAGS.sticky_gripper and env_action.size >= 7:
                             gripper_idx = env_action.size - 1
                             if n_copy > gripper_idx:
-                                change = (env_action[gripper_idx] < FLAGS.gripper_close_threshold)
+                                change = env_action[gripper_idx] < FLAGS.gripper_close_threshold
                                 if change != is_gripper_closed:
                                     num_consecutive_gripper_change_actions += 1
                                 else:
                                     num_consecutive_gripper_change_actions = 0
 
-                                if (
-                                    num_consecutive_gripper_change_actions
-                                    >= FLAGS.sticky_gripper_num_steps
-                                ):
+                                if num_consecutive_gripper_change_actions >= FLAGS.sticky_gripper_num_steps:
                                     is_gripper_closed = not is_gripper_closed
                                     num_consecutive_gripper_change_actions = 0
 
@@ -543,11 +817,10 @@ def main(_):
                         if FLAGS.no_yaw and env_action.size >= 6:
                             env_action[5] = 0.0
 
-                        obs, _, _, _ = env.step(
-                            env_action,
-                            last_tstep + FLAGS.step_duration,
-                            blocking=FLAGS.blocking,
-                        )
+                        obs, truncated = _client_step(widowx_client, env_action, FLAGS.blocking, FLAGS.im_size)
+                        if truncated or obs is None:
+                            episode_truncated = True
+                            break
                         last_env_action = env_action
 
                         if image_goal is not None:
@@ -557,6 +830,9 @@ def main(_):
                         t += 1
                         if t >= FLAGS.num_timesteps:
                             break
+
+                    if episode_truncated:
+                        break
 
         except Exception:
             print(traceback.format_exc(), file=sys.stderr)

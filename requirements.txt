@@ -152,4 +152,6 @@ pettingzoo
 # widowx
 pyquaternion
 funcsigs
+moviepy<2
+decorator
 git+https://github.com/youliangtan/edgeml.git
