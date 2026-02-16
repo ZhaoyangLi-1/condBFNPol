@@ -37,9 +37,17 @@ except ImportError:
 
 # Add project root and local diffusion_policy to path.
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-for p in [PROJECT_ROOT, PROJECT_ROOT / "src" / "diffusion-policy"]:
+# Add likely local WidowX package roots as well.
+for p in [
+    PROJECT_ROOT,
+    PROJECT_ROOT / "src" / "diffusion-policy",
+    PROJECT_ROOT.parent / "bridge_data_robot" / "widowx_envs",
+    PROJECT_ROOT.parent / "bridge_data_robot" / "widowx_envs" / "multicam_server" / "src",
+    Path.home() / "bridge_data_robot" / "widowx_envs",
+    Path.home() / "bridge_data_robot" / "widowx_envs" / "multicam_server" / "src",
+]:
     sp = str(p)
-    if sp not in sys.path:
+    if p.is_dir() and sp not in sys.path:
         sys.path.insert(0, sp)
 
 STEP_DURATION = 0.2
@@ -521,6 +529,141 @@ def _build_run_list(args) -> List[str]:
     return unique
 
 
+def _load_widowx_sdk():
+    # Legacy/internal package layout.
+    try:
+        from experiments.widowx_envs.widowx_env_service import (
+            WidowXClient,
+            WidowXConfigs,
+            WidowXStatus,
+        )
+        return WidowXClient, WidowXConfigs, WidowXStatus
+    except ImportError:
+        pass
+
+    # Open-source bridge_data_robot layout.
+    try:
+        from widowx_envs.widowx_env_service import (
+            WidowXClient,
+            WidowXConfigs,
+            WidowXStatus,
+        )
+        return WidowXClient, WidowXConfigs, WidowXStatus
+    except ImportError as e:
+        raise ModuleNotFoundError(
+            "Missing WidowX SDK. Tried "
+            "'experiments.widowx_envs.widowx_env_service' and "
+            "'widowx_envs.widowx_env_service'. "
+            "Install widowx_envs or set PYTHONPATH/WIDOWX_ENVS_ROOT to bridge_data_robot/widowx_envs."
+        ) from e
+
+
+def _status_ok(status, WidowXStatus) -> bool:
+    success = getattr(WidowXStatus, "SUCCESS", None)
+    if success is None:
+        return True
+    return status == success
+
+
+def _status_name(status, WidowXStatus) -> str:
+    for name in ("SUCCESS", "NO_CONNECTION", "EXECUTION_FAILURE", "NOT_INITIALIZED"):
+        if hasattr(WidowXStatus, name) and status == getattr(WidowXStatus, name):
+            return name
+    return str(status)
+
+
+def _normalize_action_client_config(widowx_client) -> None:
+    """Work around edgeml config mutation (list -> set) that breaks JSON serialization."""
+    try:
+        action_client = getattr(widowx_client, "_WidowXClient__client", None)
+        if action_client is None:
+            return
+        cfg = getattr(action_client, "config", None)
+        if cfg is None:
+            return
+        for key in ("observation_keys", "action_keys"):
+            value = getattr(cfg, key, None)
+            if isinstance(value, set):
+                setattr(cfg, key, sorted(value))
+    except Exception:
+        # Best-effort compatibility patch.
+        pass
+
+
+def _init_widowx_with_retry(
+    WidowXClient,
+    WidowXConfigs,
+    WidowXStatus,
+    host: str,
+    port: int,
+    env_params: Dict,
+    image_size: int,
+    timeout_s: float = 180.0,
+    retry_interval_s: float = 2.0,
+):
+    deadline = time.time() + timeout_s
+    attempt = 0
+    last_status = None
+    last_error = None
+    client = None
+
+    while time.time() < deadline:
+        attempt += 1
+        try:
+            if client is None:
+                # edgeml mutates these fields to sets; ensure they stay JSON-serializable.
+                cfg = getattr(WidowXConfigs, "DefaultActionConfig", None)
+                if cfg is not None:
+                    for key in ("observation_keys", "action_keys"):
+                        value = getattr(cfg, key, None)
+                        if isinstance(value, set):
+                            setattr(cfg, key, sorted(value))
+                client = WidowXClient(host=host, port=port)
+                _normalize_action_client_config(client)
+
+            status = client.init(env_params, image_size=image_size)
+            last_status = status
+            if _status_ok(status, WidowXStatus):
+                return client
+
+            print(
+                f"[WARN] WidowX init attempt {attempt} returned "
+                f"{_status_name(status, WidowXStatus)}; retrying..."
+            )
+        except Exception as e:
+            last_error = e
+            print(f"[WARN] WidowX init attempt {attempt} failed: {e}; retrying...")
+            # Recreate client on transport exceptions.
+            client = None
+
+        time.sleep(retry_interval_s)
+
+    if last_error is not None:
+        raise RuntimeError(f"WidowX init failed after {attempt} attempts: {last_error}")
+    raise RuntimeError(
+        f"WidowX init failed after {attempt} attempts "
+        f"(last status={_status_name(last_status, WidowXStatus)})"
+    )
+
+
+def _go_to_neutral(widowx_client, initial_eep: List[float]) -> None:
+    # API compatibility across WidowX SDK variants.
+    if hasattr(widowx_client, "go_to_neutral"):
+        widowx_client.go_to_neutral()
+        return
+    if hasattr(widowx_client, "reset"):
+        widowx_client.reset()
+        return
+    if hasattr(widowx_client, "move"):
+        pose = np.asarray(
+            [initial_eep[0], initial_eep[1], initial_eep[2], 0.0, 0.0, 0.0],
+            dtype=np.float64,
+        )
+        widowx_client.move(pose, duration=1.5, blocking=True)
+        return
+    raise AttributeError("WidowX client has no go_to_neutral/reset/move method")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Real-robot WidowX eval for diffusion/BFN checkpoints"
@@ -608,12 +751,7 @@ def main():
 
     args = parser.parse_args()
 
-    try:
-        from experiments.widowx_envs.widowx_env_service import WidowXClient, WidowXConfigs
-    except ImportError as e:
-        raise ModuleNotFoundError(
-            "Missing dependency 'experiments.widowx_envs'. Use the environment where WidowX SDK is installed."
-        ) from e
+    WidowXClient, WidowXConfigs, WidowXStatus = _load_widowx_sdk()
 
     OmegaConf.register_new_resolver("eval", eval, replace=True)
 
@@ -700,12 +838,20 @@ def main():
             print("Initializing WidowX connection...")
             env_params = WidowXConfigs.DefaultEnvParams.copy()
             env_params.update(ENV_PARAMS)
-            env_params["state_state"] = list(np.concatenate([args.initial_eep, [0, 0, 0, 1]]))
-            widowx_client = WidowXClient(host=args.ip, port=args.port)
-            widowx_client.init(env_params, image_size=args.im_size)
+            env_params["start_state"] = list(np.concatenate([args.initial_eep, [0, 0, 0, 1]]))
+            widowx_client = _init_widowx_with_retry(
+                WidowXClient=WidowXClient,
+                WidowXConfigs=WidowXConfigs,
+                WidowXStatus=WidowXStatus,
+                host=args.ip,
+                port=args.port,
+                env_params=env_params,
+                image_size=args.im_size,
+            )
+            _normalize_action_client_config(widowx_client)
             print("WidowX connection established.")
 
-        widowx_client.go_to_neutral()
+        _go_to_neutral(widowx_client, args.initial_eep)
         time.sleep(0.5)
 
         last_tstep = time.time()
@@ -820,7 +966,7 @@ def main():
         except KeyboardInterrupt:
             print("[INFO] Ctrl+C received; moving robot to neutral...", file=sys.stderr)
             try:
-                widowx_client.go_to_neutral()
+                _go_to_neutral(widowx_client, args.initial_eep)
             except Exception as e:
                 print(f"[WARN] Failed to move to neutral: {e}", file=sys.stderr)
             sys.exit(0)
@@ -829,7 +975,7 @@ def main():
 
         if reset_requested:
             try:
-                widowx_client.go_to_neutral()
+                _go_to_neutral(widowx_client, args.initial_eep)
             except Exception as e:
                 print(f"[WARN] Failed to move to neutral on reset: {e}", file=sys.stderr)
             if args.show_image:
