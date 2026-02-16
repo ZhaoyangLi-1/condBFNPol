@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 """
-python scripts/eval/eval_widowx.py \
+python eval_widowx.py \
   --ckpt_path xx/xx.ckpt \
   --ip localhost \
   --port 5556 \
@@ -45,7 +45,7 @@ for p in [PROJECT_ROOT, PROJECT_ROOT / "src" / "diffusion-policy"]:
 STEP_DURATION = 0.2
 NO_PITCH_ROLL = False
 NO_YAW = False
-STICKY_GRIPPER_NUM_STEPS = 1
+STICKY_GRIPPER_NUM_STEPS = 0
 WORKSPACE_BOUNDS = [[0.1, -0.15, -0.01, -1.57, 0], [0.45, 0.25, 0.25, 1.57, 0]]
 CAMERA_TOPICS = [{"name": "/blue/image_raw"}]
 ENV_PARAMS = {
@@ -550,7 +550,7 @@ def main():
     parser.add_argument("--num_timesteps", type=int, default=120)
     parser.add_argument("--blocking", action="store_true")
     parser.add_argument("--initial_eep", type=float, nargs=3, default=[0.3, 0.0, 0.15])
-    parser.add_argument("--act_exec_horizon", type=int, default=1)
+    parser.add_argument("--act_exec_horizon", type=int, default=8)
     parser.add_argument("--ip", type=str, default="localhost")
     parser.add_argument("--port", type=int, default=5556)
     parser.add_argument("--show_image", action="store_true")
@@ -570,7 +570,7 @@ def main():
     parser.add_argument(
         "--robot_action_dim",
         type=int,
-        default=7,
+        default=6,
         help="Action dimension sent to WidowX",
     )
     parser.add_argument(
