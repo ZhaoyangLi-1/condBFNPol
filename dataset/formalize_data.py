@@ -7,9 +7,10 @@ import pickle
 import re
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Iterable, List, Tuple
+from typing import List, Tuple
 
 import numpy as np
 import zarr
@@ -22,6 +23,7 @@ except Exception:  # pragma: no cover - fallback if tqdm not installed
 
 
 TRAJ_PATTERN = re.compile(r"^traj\d+$")
+DEFAULT_REFERENCE_ROOT = Path("/scr2/zhaoyang/pusht_real/real_pusht_20230105")
 
 
 class Dummy(SimpleNamespace):
@@ -122,6 +124,56 @@ def make_downsample_indices(length: int, factor: int) -> np.ndarray:
     return np.arange(0, length, factor, dtype=np.int64)
 
 
+def make_target_hz_indices(
+    timestamps: np.ndarray,
+    target_hz: float,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Resample to target_hz by selecting nearest source frames on a uniform time grid.
+
+    Returns:
+        - selected source indices
+        - resampled timestamps on an exact uniform grid
+    """
+    timestamps = np.asarray(timestamps, dtype=np.float64)
+    n = timestamps.shape[0]
+    if n == 0:
+        return np.zeros((0,), dtype=np.int64), np.zeros((0,), dtype=np.float64)
+    if n == 1:
+        return np.array([0], dtype=np.int64), timestamps.copy()
+
+    dt = 1.0 / float(target_hz)
+    start_t = float(timestamps[0])
+    end_t = float(timestamps[-1])
+    n_target = int(np.floor((end_t - start_t) / dt)) + 1
+    target_ts = start_t + np.arange(n_target, dtype=np.float64) * dt
+
+    # Choose nearest source frame for each target timestamp.
+    right_idx = np.searchsorted(timestamps, target_ts, side="left")
+    right_idx = np.clip(right_idx, 0, n - 1)
+    left_idx = np.maximum(right_idx - 1, 0)
+    use_left = np.abs(timestamps[left_idx] - target_ts) <= np.abs(timestamps[right_idx] - target_ts)
+    raw_idx = np.where(use_left, left_idx, right_idx)
+
+    # Enforce strictly increasing indices to preserve sequence ordering.
+    selected = []
+    last = -1
+    for cand in raw_idx.tolist():
+        idx = int(cand)
+        if idx <= last:
+            idx = last + 1
+        if idx >= n:
+            break
+        selected.append(idx)
+        last = idx
+
+    if not selected:
+        selected = [0]
+
+    indices = np.asarray(selected, dtype=np.int64)
+    resampled_timestamps = start_t + np.arange(len(indices), dtype=np.float64) * dt
+    return indices, resampled_timestamps
+
+
 def extract_action(policy_out, target_len: int) -> np.ndarray:
     """
     Build action array of shape (target_len, 6).
@@ -175,8 +227,46 @@ def make_video_from_images(
     fps: int,
     frame_stride: int = 1,
     input_fps: float | None = None,
+    frame_indices: np.ndarray | None = None,
 ) -> None:
     ext = detect_image_ext(img_dir)
+    if frame_indices is not None:
+        frame_indices = np.asarray(frame_indices, dtype=np.int64)
+        if frame_indices.size == 0:
+            raise ValueError(f"Empty frame_indices for {img_dir}")
+
+        with tempfile.TemporaryDirectory(prefix="formalize_frames_", dir=str(out_path.parent)) as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            for out_idx, src_idx in enumerate(frame_indices.tolist()):
+                src = img_dir / f"im_{src_idx}.{ext}"
+                if not src.exists():
+                    raise FileNotFoundError(f"Missing source frame: {src}")
+                dst = tmp_path / f"im_{out_idx}.{ext}"
+                os.symlink(src, dst)
+
+            pattern = str(tmp_path / f"im_%d.{ext}")
+            cmd = [
+                "ffmpeg",
+                "-y",
+                "-loglevel",
+                "error",
+                "-framerate",
+                str(fps),
+                "-start_number",
+                "0",
+                "-i",
+                pattern,
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-crf",
+                "22",
+                str(out_path),
+            ]
+            subprocess.run(cmd, check=True)
+        return
+
     pattern = str(img_dir / f"im_%d.{ext}")
     src_fps = fps
     if frame_stride > 1:
@@ -219,10 +309,14 @@ def build_videos(
     duplicate_with_symlink: bool,
     frame_stride: int = 1,
     input_fps: float | None = None,
+    frame_indices_per_episode: List[np.ndarray] | None = None,
 ) -> None:
     for ep_idx, traj_dir in enumerate(tqdm(traj_dirs, desc="Videos", unit="traj")):
         ep_out = out_videos_dir / str(ep_idx)
         ep_out.mkdir(parents=True, exist_ok=True)
+        frame_indices = None
+        if frame_indices_per_episode is not None:
+            frame_indices = frame_indices_per_episode[ep_idx]
 
         img_dirs = sorted(
             [p for p in traj_dir.iterdir() if p.is_dir() and p.name.startswith("images")],
@@ -239,15 +333,16 @@ def build_videos(
                 fps,
                 frame_stride=frame_stride,
                 input_fps=input_fps,
+                frame_indices=frame_indices,
             )
 
-        # If fewer cameras than requested, duplicate camera 0 (or last available)
+        # If fewer cameras than requested, cycle through available cameras.
         if num_videos is not None and len(img_dirs) < num_videos:
             if len(img_dirs) == 0:
                 raise RuntimeError(f"No image directories found in {traj_dir}")
-            src_cam = 0
-            src_path = ep_out / f"{src_cam}.mp4"
             for cam_idx in range(len(img_dirs), num_videos):
+                src_cam = cam_idx % len(img_dirs)
+                src_path = ep_out / f"{src_cam}.mp4"
                 dst_path = ep_out / f"{cam_idx}.mp4"
                 if dst_path.exists():
                     continue
@@ -267,8 +362,60 @@ def parse_default_output(src_root: Path) -> Path:
             date_tag = date_time.split("_")[0].replace("-", "") or date_tag
         except Exception:
             pass
-    # default to sibling pusht_real folder
-    return Path("/scr2/zhaoyang/pusht_real_raw") / f"real_pusht_{date_tag}"
+    # default to pusht_real folder
+    return Path("/scr2/zhaoyang/pusht_real") / f"real_pusht_{date_tag}"
+
+
+def find_episode_video_dirs(videos_dir: Path) -> List[Path]:
+    episode_dirs = [p for p in videos_dir.iterdir() if p.is_dir() and p.name.isdigit()]
+    episode_dirs.sort(key=lambda p: int(p.name))
+    return episode_dirs
+
+
+def count_image_cameras(traj_dir: Path) -> int:
+    img_dirs = [p for p in traj_dir.iterdir() if p.is_dir() and p.name.startswith("images")]
+    return len(img_dirs)
+
+
+def infer_reference_format(reference_root: Path) -> dict:
+    """
+    Infer formatting knobs from an existing dataset root:
+    - target_hz / fps from replay_buffer.zarr/data/timestamp
+    - chunk_len from replay_buffer.zarr/data/timestamp chunks
+    - meta_chunk_len from replay_buffer.zarr/meta/episode_ends chunks
+    - num_videos from videos/<episode>/*.mp4 count
+    """
+    spec = {
+        "target_hz": None,
+        "fps": None,
+        "chunk_len": None,
+        "meta_chunk_len": None,
+        "num_videos": None,
+    }
+
+    replay_path = reference_root / "replay_buffer.zarr"
+    if replay_path.exists():
+        root = zarr.open(str(replay_path), mode="r")
+        if "data" in root and "timestamp" in root["data"]:
+            ts_arr = root["data"]["timestamp"]
+            hz = estimate_hz(ts_arr[:])
+            if np.isfinite(hz):
+                spec["target_hz"] = float(hz)
+                spec["fps"] = int(round(hz))
+            if ts_arr.chunks and len(ts_arr.chunks) >= 1:
+                spec["chunk_len"] = int(ts_arr.chunks[0])
+        if "meta" in root and "episode_ends" in root["meta"]:
+            ep_arr = root["meta"]["episode_ends"]
+            if ep_arr.chunks and len(ep_arr.chunks) >= 1:
+                spec["meta_chunk_len"] = int(ep_arr.chunks[0])
+
+    videos_dir = reference_root / "videos"
+    if videos_dir.exists():
+        episode_dirs = find_episode_video_dirs(videos_dir)
+        if episode_dirs:
+            spec["num_videos"] = len(list(episode_dirs[0].glob("*.mp4")))
+
+    return spec
 
 
 def main() -> None:
@@ -282,8 +429,19 @@ def main() -> None:
     parser.add_argument(
         "--dst",
         type=Path,
-        default=None,
+        default=Path("/scr2/zhaoyang/BFN_data/pusht_real"),
         help="Output directory (defaults based on collection_metadata.json)",
+    )
+    parser.add_argument(
+        "--reference",
+        type=Path,
+        default=DEFAULT_REFERENCE_ROOT,
+        help="Reference formatted dataset to mimic when corresponding args are not provided.",
+    )
+    parser.add_argument(
+        "--no-reference",
+        action="store_true",
+        help="Disable reference-format inference.",
     )
     parser.add_argument("--overwrite", action="store_true", help="Overwrite output directory if exists")
     parser.add_argument("--no-videos", action="store_true", help="Skip video generation")
@@ -292,7 +450,7 @@ def main() -> None:
         "--num-videos",
         type=int,
         default=None,
-        help="Number of video files per episode (duplicate if fewer cameras). Default: use available cameras.",
+        help="Number of video files per episode (duplicate if fewer cameras).",
     )
     parser.add_argument(
         "--no-symlink",
@@ -303,7 +461,7 @@ def main() -> None:
         "--chunk-len",
         type=int,
         default=None,
-        help="Zarr chunk length (time dimension). Defaults to max episode length.",
+        help="Zarr chunk length (time dimension).",
     )
     parser.add_argument(
         "--downsample",
@@ -315,7 +473,7 @@ def main() -> None:
         "--target-hz",
         type=float,
         default=None,
-        help="Target sampling rate in Hz. Overrides --downsample by computing a factor from timestamps (first trajectory).",
+        help="Target sampling rate in Hz. Resamples each trajectory on a uniform timestamp grid.",
     )
     parser.add_argument(
         "--check-existing-hz",
@@ -326,10 +484,32 @@ def main() -> None:
     args = parser.parse_args()
     if args.downsample < 1:
         raise ValueError("--downsample must be >= 1")
+
+    reference_spec = None
+    if not args.no_reference:
+        if args.reference.exists():
+            reference_spec = infer_reference_format(args.reference)
+            if args.target_hz is None and args.downsample == 1 and reference_spec["target_hz"] is not None:
+                args.target_hz = reference_spec["target_hz"]
+            if args.fps is None and args.target_hz is None and reference_spec["fps"] is not None:
+                args.fps = int(reference_spec["fps"])
+            if args.chunk_len is None and reference_spec["chunk_len"] is not None:
+                args.chunk_len = int(reference_spec["chunk_len"])
+            print(
+                "Reference format inferred from "
+                f"{args.reference}: target_hz={reference_spec['target_hz']}, "
+                f"fps={reference_spec['fps']}, num_videos={reference_spec['num_videos']}, "
+                f"chunk_len={reference_spec['chunk_len']}, meta_chunk_len={reference_spec['meta_chunk_len']}"
+            )
+        else:
+            print(f"Reference path not found, skip inference: {args.reference}")
+
     if args.target_hz is not None and args.target_hz <= 0:
         raise ValueError("--target-hz must be > 0")
     if args.target_hz is not None and args.downsample != 1:
         raise ValueError("Use either --target-hz or --downsample, not both")
+    if args.target_hz is not None and args.fps is None:
+        args.fps = int(round(args.target_hz))
 
     src_root: Path = args.src
     if args.dst is None:
@@ -363,6 +543,14 @@ def main() -> None:
     traj_dirs = find_traj_dirs(src_root)
     if not traj_dirs:
         raise FileNotFoundError(f"No traj directories found under {src_root}")
+    if args.num_videos is None and not args.no_videos:
+        src_num_videos = count_image_cameras(traj_dirs[0])
+        if src_num_videos > 0:
+            args.num_videos = src_num_videos
+            print(f"Video camera count inferred from source: num_videos={args.num_videos}")
+        elif reference_spec is not None and reference_spec.get("num_videos") is not None:
+            args.num_videos = int(reference_spec["num_videos"])
+            print(f"Video camera count fallback to reference: num_videos={args.num_videos}")
 
     all_timestamp = []
     all_joint = []
@@ -377,6 +565,7 @@ def main() -> None:
     resolved_downsample = None
     resolved_src_hz = None
     resolved_eff_hz = None
+    frame_indices_per_episode = []
 
     for traj_dir in tqdm(traj_dirs, desc="Trajs", unit="traj"):
         obs_path = traj_dir / "obs_dict.pkl"
@@ -410,17 +599,12 @@ def main() -> None:
             if args.target_hz is not None:
                 if resolved_src_hz is None or not np.isfinite(resolved_src_hz):
                     raise ValueError("Unable to estimate source Hz for --target-hz")
-                resolved_downsample = max(1, int(round(resolved_src_hz / args.target_hz)))
-                resolved_eff_hz = resolved_src_hz / resolved_downsample
-                if resolved_downsample == 1:
-                    print(
-                        f"Target Hz {args.target_hz:.2f} ~ source {resolved_src_hz:.2f} Hz, no downsampling needed."
-                    )
-                else:
-                    print(
-                        f"Target Hz {args.target_hz:.2f} -> downsample {resolved_downsample} "
-                        f"(source {resolved_src_hz:.2f} Hz -> {resolved_eff_hz:.2f} Hz)"
-                    )
+                resolved_downsample = 1
+                resolved_eff_hz = float(args.target_hz)
+                print(
+                    f"Target Hz {args.target_hz:.2f} with timestamp resampling "
+                    f"(source {resolved_src_hz:.2f} Hz)"
+                )
             else:
                 resolved_downsample = args.downsample
                 if resolved_src_hz is not None and np.isfinite(resolved_src_hz):
@@ -432,13 +616,17 @@ def main() -> None:
                         )
 
         action_full = extract_action(policy_out, target_len=len(timestamps_full))
-        idx = make_downsample_indices(len(timestamps_full), resolved_downsample)
-        timestamps = timestamps_full[idx]
+        if args.target_hz is not None:
+            idx, timestamps = make_target_hz_indices(timestamps_full, args.target_hz)
+        else:
+            idx = make_downsample_indices(len(timestamps_full), resolved_downsample)
+            timestamps = timestamps_full[idx]
         qpos = qpos[idx]
         qvel = qvel[idx]
         stage = stage[idx]
         eef_T = eef_T[idx]
         action = action_full[idx]
+        frame_indices_per_episode.append(idx)
 
         eef_pose = transform_to_pose(eef_T)
         eef_pose_vel = compute_pose_vel(eef_T, timestamps)
@@ -484,10 +672,15 @@ def main() -> None:
     data_grp.create_dataset("stage", data=stage, chunks=(chunk_len,), compressor=compressor)
     data_grp.create_dataset("action", data=action, chunks=(chunk_len, 6), compressor=compressor)
 
+    meta_chunk_len = len(episode_ends)
+    if reference_spec is not None and reference_spec.get("meta_chunk_len") is not None:
+        meta_chunk_len = int(reference_spec["meta_chunk_len"])
+    meta_chunk_len = int(max(1, meta_chunk_len))
+
     meta_grp.create_dataset(
         "episode_ends",
         data=np.asarray(episode_ends, dtype=np.int64),
-        chunks=(len(episode_ends),),
+        chunks=(meta_chunk_len,),
         compressor=None,
     )
 
@@ -511,6 +704,7 @@ def main() -> None:
             duplicate_with_symlink=not args.no_symlink,
             frame_stride=resolved_downsample,
             input_fps=resolved_src_hz,
+            frame_indices_per_episode=frame_indices_per_episode,
         )
 
     print(f"Done. Output written to {dst_root}")
@@ -518,4 +712,7 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-    # python /scr2/zhaoyang/formalize_data.py --src /scr2/zhaoyang/BFN_data/pusht_real_raw --dst /scr2/zhaoyang/BFN_data/pusht_real_10hz --overwrite --target-hz 10
+"""
+python /scr/zhaoyang/formalize_data.py \
+  --overwrite --no-reference --target-hz 20
+"""

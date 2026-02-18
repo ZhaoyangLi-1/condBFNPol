@@ -33,11 +33,24 @@ try:
     from robomimic.algo import algo_factory
     from robomimic.algo.algo import PolicyAlgo
     import robomimic.utils.obs_utils as ObsUtils
-    import robomimic.models.obs_core as rmbn
+    # robomimic version compatibility:
+    # - 0.2.x: CropRandomizer in models.base_nets
+    # - 0.3.x: CropRandomizer in models.obs_core
+    import robomimic.models.base_nets as rm_base_nets
+    try:
+        import robomimic.models.obs_core as rm_obs_core
+    except Exception:
+        rm_obs_core = None
+
+    RM_CropRandomizer = getattr(rm_base_nets, "CropRandomizer", None)
+    if RM_CropRandomizer is None and rm_obs_core is not None:
+        RM_CropRandomizer = getattr(rm_obs_core, "CropRandomizer", None)
+
     import diffusion_policy.model.vision.crop_randomizer as dmvc
     HAS_ROBOMIMIC = True
 except ImportError:
     HAS_ROBOMIMIC = False
+    RM_CropRandomizer = None
 
 __all__ = ["BFNUnetHybridImagePolicy"]
 
@@ -298,17 +311,22 @@ class BFNUnetHybridImagePolicy(BasePolicy):
                 )
             )
         
-        if eval_fixed_crop:
+        if eval_fixed_crop and RM_CropRandomizer is not None:
             replace_submodules(
                 root_module=obs_encoder,
-                predicate=lambda x: isinstance(x, rmbn.CropRandomizer),
+                predicate=lambda x: isinstance(x, RM_CropRandomizer),
                 func=lambda x: dmvc.CropRandomizer(
                     input_shape=x.input_shape,
                     crop_height=x.crop_height,
                     crop_width=x.crop_width,
-                    num_crops=x.num_crops,
-                    pos_enc=x.pos_enc
+                    num_crops=getattr(x, 'num_crops', 1),
+                    pos_enc=getattr(x, 'pos_enc', False)
                 )
+            )
+        elif eval_fixed_crop:
+            print(
+                "[WARN] eval_fixed_crop=True but could not locate robomimic CropRandomizer; "
+                "skip replacing."
             )
         
         return obs_encoder

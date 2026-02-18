@@ -113,7 +113,7 @@ pytz==2025.2
 pyyaml
 regex==2024.11.6
 requests
-robomimic==0.3.0
+robomimic==0.2.0
 safetensors==0.5.3
 scikit-image==0.22.0
 scikit-misc==0.3.0
@@ -149,6 +149,7 @@ zipp==3.21.0
 zstandard==0.25.0
 av
 pettingzoo
+imagecodecs
 # widowx
 pyquaternion
 funcsigs
