@@ -18,6 +18,8 @@ from collections import deque
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+import hydra
+from experiments.widowx_envs.widowx_env_service import WidowXClient, WidowXConfigs
 
 import numpy as np
 import torch
@@ -33,17 +35,20 @@ try:
 except ImportError:
     imageio = None
 
-# Add project roots to import path.
+# Add project root and local diffusion_policy to path.
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DIFFUSION_POLICY_ROOT = PROJECT_ROOT / "src" / "diffusion-policy"
-for p in (str(PROJECT_ROOT), str(DIFFUSION_POLICY_ROOT)):
-    if p not in sys.path:
-        sys.path.insert(0, p)
-
-import hydra
-
-from experiments.widowx_envs.widowx_env_service import WidowXClient, WidowXConfigs
-
+# Add likely local WidowX package roots as well.
+for p in [
+    PROJECT_ROOT,
+    PROJECT_ROOT / "src" / "diffusion-policy",
+    PROJECT_ROOT.parent / "bridge_data_robot" / "widowx_envs",
+    PROJECT_ROOT.parent / "bridge_data_robot" / "widowx_envs" / "multicam_server" / "src",
+    Path.home() / "bridge_data_robot" / "widowx_envs",
+    Path.home() / "bridge_data_robot" / "widowx_envs" / "multicam_server" / "src",
+]:
+    sp = str(p)
+    if p.is_dir() and sp not in sys.path:
+        sys.path.insert(0, sp)
 
 DEFAULT_WORKSPACE_BOUNDS = [[0.1, -0.15, -0.01, -1.57, 0], [0.45, 0.25, 0.25, 1.57, 0]]
 
