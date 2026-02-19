@@ -10,19 +10,27 @@ This script:
 
 # diffusion
 python scripts/eval/eval_widowx.py \
-  --checkpoint <your_path> \
+  --checkpoint /data/BFN_data/checkpoints/diffusion_real_pusht.ckpt \
   --method diffusion \
   --ip localhost --port 5556 \
-  --camera-topics /blue/image_raw,/wrist/image_raw \
-  --show-image
+  --camera-topics /D435/color/image_raw,/blue/image_raw \
+  --show-image \
+  --startup-timeout 180 \
+  --startup-poll-interval 1.0 \
+  --neutral-retries 60 \
+  --rpc-timeout-ms 8000
 
 # bfn
 python scripts/eval/eval_widowx.py \
-  --checkpoint <your_path> \
+  --checkpoint /data/BFN_data/checkpoints/bfn_real_pusht.ckpt \
   --method bfn \
   --ip localhost --port 5556 \
-  --camera-topics /blue/image_raw,/wrist/image_raw \
-  --show-image
+  --camera-topics /D435/color/image_raw,/blue/image_raw \
+  --show-image \
+  --startup-timeout 180 \
+  --startup-poll-interval 1.0 \
+  --neutral-retries 60 \
+  --rpc-timeout-ms 8000
 """
 
 from __future__ import annotations
@@ -34,8 +42,31 @@ from collections import deque
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+# Add project root and local dependency roots before importing local packages.
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+for p in [
+    PROJECT_ROOT,
+    PROJECT_ROOT / "src" / "diffusion-policy",
+    PROJECT_ROOT.parent / "bridge_data_robot",
+    PROJECT_ROOT.parent / "bridge_data_robot" / "widowx_envs",
+    PROJECT_ROOT.parent / "bridge_data_robot" / "widowx_envs" / "multicam_server" / "src",
+    Path.home() / "bridge_data_robot",
+    Path.home() / "bridge_data_robot" / "widowx_envs",
+    Path.home() / "bridge_data_robot" / "widowx_envs" / "multicam_server" / "src",
+]:
+    sp = str(p)
+    if p.is_dir() and sp not in sys.path:
+        sys.path.insert(0, sp)
+
 import hydra
-from experiments.widowx_envs.widowx_env_service import WidowXClient, WidowXConfigs
+try:
+    from experiments.widowx_envs.widowx_env_service import WidowXClient, WidowXConfigs
+except ModuleNotFoundError as exc:
+    if exc.name and exc.name.startswith("experiments"):
+        from widowx_envs.widowx_env_service import WidowXClient, WidowXConfigs
+    else:
+        raise
 
 import numpy as np
 import torch
@@ -51,22 +82,17 @@ try:
 except ImportError:
     imageio = None
 
-# Add project root and local diffusion_policy to path.
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-# Add likely local WidowX package roots as well.
-for p in [
-    PROJECT_ROOT,
-    PROJECT_ROOT / "src" / "diffusion-policy",
-    PROJECT_ROOT.parent / "bridge_data_robot" / "widowx_envs",
-    PROJECT_ROOT.parent / "bridge_data_robot" / "widowx_envs" / "multicam_server" / "src",
-    Path.home() / "bridge_data_robot" / "widowx_envs",
-    Path.home() / "bridge_data_robot" / "widowx_envs" / "multicam_server" / "src",
-]:
-    sp = str(p)
-    if p.is_dir() and sp not in sys.path:
-        sys.path.insert(0, sp)
-
 DEFAULT_WORKSPACE_BOUNDS = [[0.1, -0.15, -0.01, -1.57, 0], [0.45, 0.25, 0.25, 1.57, 0]]
+
+
+def _register_omegaconf_resolvers() -> None:
+    # Keep parity with training-time Hydra resolvers used in benchmark configs.
+    OmegaConf.register_new_resolver("eval", eval, replace=True)
+    OmegaConf.register_new_resolver(
+        "now",
+        lambda fmt="%Y-%m-%d": datetime.now().strftime(fmt),
+        replace=True,
+    )
 
 
 def _stdin_has_data() -> bool:
@@ -82,6 +108,122 @@ def _prep_device(device: str) -> torch.device:
     if device == "cuda" and torch.cuda.is_available():
         return torch.device("cuda")
     return torch.device("cpu")
+
+
+def _status_is_success(status: Any) -> bool:
+    if status is None:
+        # Some variants use side effects only and return nothing.
+        return True
+    if isinstance(status, np.generic):
+        status = status.item()
+    if isinstance(status, bool):
+        return status
+    if isinstance(status, (int, float)):
+        # WidowXStatus.SUCCESS is 1 in known implementations.
+        return int(status) == 1
+    s = str(status).strip().lower()
+    if not s:
+        return True
+    return (
+        "success" in s
+        and "no_connection" not in s
+        and "not_initialized" not in s
+        and "failure" not in s
+    )
+
+
+def _set_widowx_rpc_timeout_ms(widowx_client: Any, timeout_ms: int) -> bool:
+    """
+    Best-effort override of edgeml REQ/REP client timeout.
+
+    widowx_envs.WidowXClient wraps an internal ActionClient -> ReqRepClient
+    with default timeout ~800ms, which is too short for slow init/reset calls.
+    """
+    try:
+        action_client = getattr(widowx_client, "_WidowXClient__client", None)
+        req_client = getattr(action_client, "client", None)
+        if req_client is None:
+            return False
+        if not hasattr(req_client, "timeout_ms") or not hasattr(req_client, "reset_socket"):
+            return False
+        req_client.timeout_ms = int(timeout_ms)
+        req_client.reset_socket()
+        return True
+    except Exception:
+        return False
+
+
+def _move_to_neutral(
+    widowx_client: Any,
+    initial_eep: List[float],
+    blocking: bool = True,
+    retries: int = 1,
+    retry_interval_s: float = 0.5,
+) -> None:
+    neutral_pose = np.asarray(list(initial_eep) + [0.0, 0.0, 0.0], dtype=np.float32)
+    errors: List[str] = []
+    for attempt in range(1, max(1, int(retries)) + 1):
+        for name, fn in (
+            ("reset", lambda: getattr(widowx_client, "reset", None)),
+            ("go_to_neutral", lambda: getattr(widowx_client, "go_to_neutral", None)),
+            ("move", lambda: getattr(widowx_client, "move", None)),
+        ):
+            method = fn()
+            if not callable(method):
+                continue
+            try:
+                if name == "move":
+                    status = method(neutral_pose, duration=1.0, blocking=blocking)
+                else:
+                    status = method()
+                if _status_is_success(status):
+                    return
+                errors.append(f"{name} returned non-success status {status!r}")
+            except Exception as e:
+                errors.append(f"{name} failed with {type(e).__name__}: {e}")
+        if attempt < retries:
+            if attempt == 1 or attempt % 5 == 0:
+                print(f"[INFO] Waiting for WidowX neutral/reset to become available (attempt {attempt}/{retries})...")
+            time.sleep(max(0.01, float(retry_interval_s)))
+
+    if not errors:
+        raise AttributeError("WidowXClient does not support reset(), go_to_neutral(), or move().")
+    raise RuntimeError(
+        "Failed to move to neutral after retries. "
+        f"Last error: {errors[-1]}"
+    )
+
+
+def _wait_for_startup_observation(
+    widowx_client: Any,
+    timeout_s: float,
+    poll_interval_s: float,
+) -> Dict[str, Any]:
+    deadline = time.time() + max(0.0, float(timeout_s))
+    poll_interval_s = max(0.01, float(poll_interval_s))
+    attempts = 0
+    last_error: Optional[Exception] = None
+
+    while time.time() < deadline:
+        attempts += 1
+        try:
+            obs = widowx_client.get_observation()
+            if obs is not None:
+                if attempts > 1:
+                    print(f"[INFO] WidowX observation stream is ready after {attempts} attempts.")
+                return obs
+        except Exception as e:
+            last_error = e
+
+        if attempts == 1 or attempts % max(1, int(round(5.0 / poll_interval_s))) == 0:
+            print("[INFO] Waiting for WidowX initialization (controller/cameras) to finish...")
+        time.sleep(poll_interval_s)
+
+    if last_error is not None:
+        raise TimeoutError(
+            f"Timed out waiting {timeout_s:.1f}s for first observation. Last error: {type(last_error).__name__}: {last_error}"
+        )
+    raise TimeoutError(f"Timed out waiting {timeout_s:.1f}s for first observation from WidowX server.")
 
 
 def _resolve_checkpoint(path: str) -> Path:
@@ -182,9 +324,10 @@ def _load_policy_from_benchmark(
     device: torch.device,
     policy_steps: Optional[int],
 ) -> Tuple[torch.nn.Module, Any]:
-    OmegaConf.register_new_resolver("eval", eval, replace=True)
+    _register_omegaconf_resolvers()
     cfg = OmegaConf.load(str(benchmark_cfg_path))
-    OmegaConf.resolve(cfg)
+    # Resolve only the policy subtree to avoid unrelated training/logging-only interpolations.
+    OmegaConf.resolve(cfg.policy)
 
     policy = hydra.utils.instantiate(cfg.policy)
     policy.load_state_dict(policy_state, strict=True)
@@ -265,8 +408,20 @@ def _extract_camera_source(obs: Dict[str, Any], key: str, fallback_idx: int) -> 
         if fallback_idx < len(values):
             return values[fallback_idx]
 
+    # Legacy widowx_env_service variants expose camera streams as:
+    # external_img, over_shoulder_img, wrist_img
+    legacy_cam_keys = ["external_img", "over_shoulder_img", "wrist_img"]
+    if fallback_idx < len(legacy_cam_keys):
+        v = obs.get(legacy_cam_keys[fallback_idx], None)
+        if v is not None:
+            return v
+
     if "full_image" in obs:
-        return obs["full_image"]
+        full = obs["full_image"]
+        arr = np.asarray(full)
+        if arr.ndim == 4 and fallback_idx < arr.shape[0]:
+            return arr[fallback_idx]
+        return full
     if "image" in obs:
         return obs["image"]
     return None
@@ -331,14 +486,6 @@ def _stack_obs_history(history: deque, keys: List[str]) -> Dict[str, np.ndarray]
     return result
 
 
-def _build_action_sender(action: np.ndarray, gripper_value: Optional[float]) -> np.ndarray:
-    if gripper_value is None:
-        return action
-    if action.shape[-1] == 6:
-        return np.concatenate([action, np.array([gripper_value], dtype=np.float32)], axis=0)
-    return action
-
-
 def _print_runtime_config(method: str, benchmark_cfg_path: Path, cfg: Any, ckpt_path: Path):
     image_shape = list(cfg.image_shape)
     crop_shape = list(cfg.crop_shape)
@@ -388,9 +535,33 @@ def main():
     parser.add_argument("--show-image", action="store_true")
     parser.add_argument("--video-save-path", type=str, default=None)
     parser.add_argument("--initial-eep", type=float, nargs=3, default=[0.3, 0.0, 0.15])
-    parser.add_argument("--gripper-value", type=float, default=None, help="If set and action_dim==6, append this as 7th gripper command.")
+    parser.add_argument("--gripper-value", type=float, default=None, help="If set, override the 7th (gripper) component of 7D action.")
     parser.add_argument("--no-pitch-roll", action="store_true")
     parser.add_argument("--no-yaw", action="store_true")
+    parser.add_argument(
+        "--rpc-timeout-ms",
+        type=int,
+        default=5000,
+        help="ZMQ RPC timeout for WidowX client calls (init/reset can exceed default 800ms).",
+    )
+    parser.add_argument(
+        "--startup-timeout",
+        type=float,
+        default=90.0,
+        help="Max seconds to wait for first observation after init (slow robot/camera startup).",
+    )
+    parser.add_argument(
+        "--startup-poll-interval",
+        type=float,
+        default=0.5,
+        help="Polling interval while waiting for startup readiness.",
+    )
+    parser.add_argument(
+        "--neutral-retries",
+        type=int,
+        default=20,
+        help="How many times to retry neutral/reset when startup is still busy.",
+    )
     args = parser.parse_args()
 
     if args.show_image and cv2 is None:
@@ -451,13 +622,25 @@ def main():
             "move_duration": float(args.step_duration),
         }
     )
-    env_params["state_state"] = list(np.concatenate([np.asarray(args.initial_eep, dtype=np.float32), [0, 0, 0, 1]]))
+    env_params["start_state"] = list(np.concatenate([np.asarray(args.initial_eep, dtype=np.float32), [0, 0, 0, 1]]))
 
     widowx_client = WidowXClient(host=args.ip, port=args.port)
-    if args.client_image_size is None:
-        widowx_client.init(env_params)
+    if _set_widowx_rpc_timeout_ms(widowx_client, args.rpc_timeout_ms):
+        print(f"[INFO] Set WidowX RPC timeout to {int(args.rpc_timeout_ms)} ms.")
     else:
-        widowx_client.init(env_params, image_size=int(args.client_image_size))
+        print("[WARN] Could not override WidowX RPC timeout; using library default.")
+    if args.client_image_size is None:
+        init_status = widowx_client.init(env_params)
+    else:
+        init_status = widowx_client.init(env_params, image_size=int(args.client_image_size))
+    if not _status_is_success(init_status):
+        print(f"[WARN] widowx_client.init returned non-success status {init_status!r}; waiting for readiness anyway.")
+
+    _wait_for_startup_observation(
+        widowx_client,
+        timeout_s=args.startup_timeout,
+        poll_interval_s=args.startup_poll_interval,
+    )
 
     obs_hist: deque = deque(maxlen=n_obs_steps)
     warned_missing = set()
@@ -465,15 +648,29 @@ def main():
     reset_requested = False
 
     def _read_obs_retry() -> Dict[str, Any]:
-        obs = widowx_client.get_observation()
-        while obs is None:
+        while True:
+            try:
+                obs = widowx_client.get_observation()
+            except Exception as e:
+                print(f"[WARN] get_observation() failed: {type(e).__name__}: {e}; retrying...")
+                time.sleep(max(0.01, float(args.startup_poll_interval)))
+                continue
+            if obs is not None:
+                return obs
             print("[WARN] get_observation() returned None; retrying...")
-            time.sleep(0.05)
-            obs = widowx_client.get_observation()
-        return obs
+            time.sleep(max(0.01, float(args.startup_poll_interval)))
 
     try:
-        widowx_client.go_to_neutral()
+        try:
+            _move_to_neutral(
+                widowx_client,
+                initial_eep=args.initial_eep,
+                blocking=True,
+                retries=args.neutral_retries,
+                retry_interval_s=args.startup_poll_interval,
+            )
+        except Exception as e:
+            print(f"[WARN] Startup move-to-neutral failed: {e}. Continuing anyway.")
         time.sleep(0.5)
         input("Press [Enter] to start real-robot evaluation...")
 
@@ -529,13 +726,13 @@ def main():
             exec_steps = min(act_exec_horizon, action_seq.shape[0], args.num_timesteps - t)
             for i in range(exec_steps):
                 step_start = time.time()
-                action = np.asarray(action_seq[i], dtype=np.float32).copy()
-
-                if action.shape[0] < action_dim:
-                    pad = np.zeros((action_dim - action.shape[0],), dtype=np.float32)
-                    action = np.concatenate([action, pad], axis=0)
-                elif action.shape[0] > action_dim:
-                    action = action[:action_dim]
+                action = np.asarray(action_seq[i], dtype=np.float32).reshape(-1).copy()
+                if action.shape[0] != 7:
+                    raise RuntimeError(
+                        f"Expected 7D policy action for WidowX step_action, got shape {tuple(action.shape)}"
+                    )
+                if args.gripper_value is not None:
+                    action[6] = float(np.clip(args.gripper_value, 0.0, 1.0))
 
                 if args.no_pitch_roll and action.shape[0] >= 5:
                     action[3] = 0.0
@@ -543,8 +740,7 @@ def main():
                 if args.no_yaw and action.shape[0] >= 6:
                     action[5] = 0.0
 
-                send_action = _build_action_sender(action, gripper_value=args.gripper_value)
-                widowx_client.step_action(send_action, blocking=args.blocking)
+                widowx_client.step_action(action, blocking=args.blocking)
 
                 # Save visualization frame (camera_0).
                 cam0 = step_obs[rgb_keys[0]]
@@ -566,7 +762,13 @@ def main():
         print("[INFO] Ctrl+C received, stopping rollout.")
     finally:
         try:
-            widowx_client.go_to_neutral()
+            _move_to_neutral(
+                widowx_client,
+                initial_eep=args.initial_eep,
+                blocking=True,
+                retries=max(1, min(5, args.neutral_retries)),
+                retry_interval_s=args.startup_poll_interval,
+            )
         except Exception as e:
             print(f"[WARN] Failed to move to neutral: {e}")
         if args.show_image:

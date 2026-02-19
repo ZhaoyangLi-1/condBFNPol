@@ -15,6 +15,7 @@ from typing import List, Tuple
 import numpy as np
 import zarr
 from scipy.spatial.transform import Rotation as R
+
 try:
     from tqdm import tqdm
 except Exception:  # pragma: no cover - fallback if tqdm not installed
@@ -24,6 +25,10 @@ except Exception:  # pragma: no cover - fallback if tqdm not installed
 
 TRAJ_PATTERN = re.compile(r"^traj\d+$")
 DEFAULT_REFERENCE_ROOT = Path("/scr2/zhaoyang/pusht_real/real_pusht_20230105")
+
+# Option A: always store 7D actions: [x, y, z, rx, ry, rz, gripper]
+# Gripper defaults to "open" if not available.
+DEFAULT_GRIPPER_OPEN = 1.0
 
 
 class Dummy(SimpleNamespace):
@@ -83,7 +88,6 @@ def compute_pose_vel(T: np.ndarray, timestamps: np.ndarray) -> np.ndarray:
 
     pos = T[:, :3, 3]
     dt = np.diff(timestamps)
-    # avoid divide by zero
     dt_safe = np.where(dt == 0, np.nan, dt)
 
     dpos = (pos[1:] - pos[:-1]) / dt_safe[:, None]
@@ -97,7 +101,6 @@ def compute_pose_vel(T: np.ndarray, timestamps: np.ndarray) -> np.ndarray:
     ang_vel = np.nan_to_num(ang_vel)
 
     vel = np.concatenate([dpos, ang_vel], axis=1)
-    # repeat last velocity to match length
     vel = np.vstack([vel, vel[-1]])
     return vel.astype(np.float64)
 
@@ -147,14 +150,12 @@ def make_target_hz_indices(
     n_target = int(np.floor((end_t - start_t) / dt)) + 1
     target_ts = start_t + np.arange(n_target, dtype=np.float64) * dt
 
-    # Choose nearest source frame for each target timestamp.
     right_idx = np.searchsorted(timestamps, target_ts, side="left")
     right_idx = np.clip(right_idx, 0, n - 1)
     left_idx = np.maximum(right_idx - 1, 0)
     use_left = np.abs(timestamps[left_idx] - target_ts) <= np.abs(timestamps[right_idx] - target_ts)
     raw_idx = np.where(use_left, left_idx, right_idx)
 
-    # Enforce strictly increasing indices to preserve sequence ordering.
     selected = []
     last = -1
     for cand in raw_idx.tolist():
@@ -174,47 +175,155 @@ def make_target_hz_indices(
     return indices, resampled_timestamps
 
 
-def extract_action(policy_out, target_len: int) -> np.ndarray:
+def _as_gripper_series(x, target_len: int) -> np.ndarray:
+    """Coerce a possible scalar/len-1/len-T array to shape (T,) float64, else raise."""
+    if x is None:
+        raise ValueError("gripper source is None")
+    arr = np.asarray(x)
+    if arr.ndim == 0:
+        return np.full((target_len,), float(arr), dtype=np.float64)
+    if arr.ndim >= 1:
+        if arr.shape[0] == target_len:
+            return arr.astype(np.float64).reshape((target_len,))
+        if arr.shape[0] == 1:
+            return np.full((target_len,), float(arr.reshape(-1)[0]), dtype=np.float64)
+    raise ValueError(f"Unsupported gripper shape {arr.shape} for target_len={target_len}")
+
+
+def get_gripper_from_obs(obs: dict, target_len: int) -> np.ndarray | None:
     """
-    Build action array of shape (target_len, 6).
-    Prefer new_robot_transform if available; otherwise use actions[:6].
+    Try to infer a per-step gripper "command/state" time series from obs_dict.
+    This is intentionally permissive: checks multiple common key names.
+    """
+    candidate_keys = [
+        "gripper",
+        "gripper_cmd",
+        "gripper_command",
+        "gripper_action",
+        "gripper_state",
+        "gripper_pos",
+        "gripper_position",
+        "gripper_qpos",
+        "eef_gripper",
+        "eef_gripper_state",
+    ]
+    for k in candidate_keys:
+        if k in obs:
+            try:
+                return _as_gripper_series(obs[k], target_len)
+            except Exception:
+                pass
+    return None
+
+
+def get_gripper_from_policy_out(policy_out, target_len: int) -> np.ndarray | None:
+    """
+    Try to infer a per-step gripper series from policy_out.
+    Supports:
+      - dict entries with common gripper keys
+      - "actions" with >=7 dims where the 7th dim is gripper
     """
     if policy_out is None:
-        return np.zeros((target_len, 6), dtype=np.float64)
+        return None
+    if not (isinstance(policy_out, list) and len(policy_out) > 0):
+        return None
 
-    if isinstance(policy_out, list) and len(policy_out) > 0:
-        sample = policy_out[0]
-        if isinstance(sample, dict) and "new_robot_transform" in sample:
-            Ts = np.stack([p["new_robot_transform"] for p in policy_out], axis=0)
-            act = transform_to_pose(Ts)
-        elif isinstance(sample, dict) and "actions" in sample:
-            act = np.stack([p["actions"][:6] for p in policy_out], axis=0)
+    sample = policy_out[0]
+    if not isinstance(sample, dict):
+        return None
+
+    # 1) If actions contain a 7th dim, use it.
+    if "actions" in sample:
+        try:
+            a0 = np.asarray(sample["actions"])
+            if a0.ndim >= 1 and a0.shape[-1] >= 7:
+                g = np.stack([np.asarray(p["actions"])[6] for p in policy_out], axis=0)
+                return _as_gripper_series(g, target_len)
+        except Exception:
+            pass
+
+    # 2) Common explicit gripper keys
+    candidate_keys = [
+        "gripper",
+        "gripper_cmd",
+        "gripper_command",
+        "gripper_action",
+        "gripper_state",
+        "gripper_open",
+        "gripper_close",
+    ]
+    for k in candidate_keys:
+        if k in sample:
+            try:
+                g = np.stack([np.asarray(p[k]).reshape(-1)[0] for p in policy_out], axis=0)
+                return _as_gripper_series(g, target_len)
+            except Exception:
+                pass
+
+    return None
+
+
+def extract_action(policy_out, obs: dict, target_len: int, default_gripper: float = DEFAULT_GRIPPER_OPEN) -> np.ndarray:
+    """
+    Build action array of shape (target_len, 7):
+      [x, y, z, rotvec(3), gripper]
+
+    Arm part:
+      - Prefer new_robot_transform if available -> 6D pose via transform_to_pose
+      - Otherwise use policy_out["actions"][:6]
+
+    Gripper part:
+      - Prefer policy_out gripper (if available)
+      - Else use obs-derived gripper series (if available)
+      - Else default open (broadcast)
+    """
+    # -------- arm (6d) --------
+    if policy_out is None:
+        arm6 = np.zeros((target_len, 6), dtype=np.float64)
+    else:
+        if isinstance(policy_out, list) and len(policy_out) > 0:
+            sample = policy_out[0]
+            if isinstance(sample, dict) and "new_robot_transform" in sample:
+                Ts = np.stack([p["new_robot_transform"] for p in policy_out], axis=0)
+                arm6 = transform_to_pose(Ts)
+            elif isinstance(sample, dict) and "actions" in sample:
+                arm6 = np.stack([np.asarray(p["actions"])[:6] for p in policy_out], axis=0)
+            else:
+                raise ValueError("policy_out format not recognized")
         else:
             raise ValueError("policy_out format not recognized")
-    else:
-        raise ValueError("policy_out format not recognized")
 
-    if act.shape[0] == target_len:
-        return act.astype(np.float64)
-    if act.shape[0] == target_len - 1:
-        act = np.vstack([act, act[-1]])
-        return act.astype(np.float64)
+    # Length align for arm
+    if arm6.shape[0] == target_len:
+        arm6 = arm6.astype(np.float64)
+    elif arm6.shape[0] == target_len - 1:
+        arm6 = np.vstack([arm6, arm6[-1]]).astype(np.float64)
+    elif arm6.shape[0] > target_len:
+        arm6 = arm6[:target_len].astype(np.float64)
+    elif arm6.shape[0] < target_len:
+        pad = np.repeat(arm6[-1][None, :], target_len - arm6.shape[0], axis=0)
+        arm6 = np.vstack([arm6, pad]).astype(np.float64)
 
-    # fallback: truncate or pad with last
-    if act.shape[0] > target_len:
-        return act[:target_len].astype(np.float64)
-    if act.shape[0] < target_len:
-        pad = np.repeat(act[-1][None, :], target_len - act.shape[0], axis=0)
-        return np.vstack([act, pad]).astype(np.float64)
+    # -------- gripper (1d) --------
+    g = get_gripper_from_policy_out(policy_out, target_len)
+    if g is None:
+        g = get_gripper_from_obs(obs, target_len)
+    if g is None:
+        g = np.full((target_len,), float(default_gripper), dtype=np.float64)
 
-    return act.astype(np.float64)
+    g = g.reshape((target_len, 1)).astype(np.float64)
+
+    # -------- concat --------
+    act7 = np.concatenate([arm6, g], axis=1)
+    if act7.shape != (target_len, 7):
+        raise RuntimeError(f"Internal error: expected (T,7) got {act7.shape}")
+    return act7
 
 
 def detect_image_ext(img_dir: Path) -> str:
     for ext in ("jpg", "png", "jpeg"):
         if (img_dir / f"im_0.{ext}").exists():
             return ext
-    # fallback: infer from any file
     for p in img_dir.iterdir():
         if p.is_file() and p.name.startswith("im_"):
             return p.suffix.lstrip(".")
@@ -336,7 +445,6 @@ def build_videos(
                 frame_indices=frame_indices,
             )
 
-        # If fewer cameras than requested, cycle through available cameras.
         if num_videos is not None and len(img_dirs) < num_videos:
             if len(img_dirs) == 0:
                 raise RuntimeError(f"No image directories found in {traj_dir}")
@@ -362,7 +470,6 @@ def parse_default_output(src_root: Path) -> Path:
             date_tag = date_time.split("_")[0].replace("-", "") or date_tag
         except Exception:
             pass
-    # default to pusht_real folder
     return Path("/scr2/zhaoyang/pusht_real") / f"real_pusht_{date_tag}"
 
 
@@ -480,6 +587,12 @@ def main() -> None:
         action="store_true",
         help="If output exists, report its estimated Hz and exit.",
     )
+    parser.add_argument(
+        "--default-gripper-open",
+        type=float,
+        default=DEFAULT_GRIPPER_OPEN,
+        help="Default gripper command used when unavailable in policy_out/obs (Option A).",
+    )
 
     args = parser.parse_args()
     if args.downsample < 1:
@@ -512,10 +625,7 @@ def main() -> None:
         args.fps = int(round(args.target_hz))
 
     src_root: Path = args.src
-    if args.dst is None:
-        dst_root = parse_default_output(src_root)
-    else:
-        dst_root = args.dst
+    dst_root = args.dst if args.dst is not None else parse_default_output(src_root)
 
     if dst_root.exists():
         replay_path = dst_root / "replay_buffer.zarr"
@@ -615,17 +725,25 @@ def main() -> None:
                             f"(source {resolved_src_hz:.2f} Hz -> {resolved_eff_hz:.2f} Hz)"
                         )
 
-        action_full = extract_action(policy_out, target_len=len(timestamps_full))
+        # >>> Option A change: action_full is now (T, 7)
+        action_full = extract_action(
+            policy_out,
+            obs=obs,
+            target_len=len(timestamps_full),
+            default_gripper=float(args.default_gripper_open),
+        )
+
         if args.target_hz is not None:
             idx, timestamps = make_target_hz_indices(timestamps_full, args.target_hz)
         else:
             idx = make_downsample_indices(len(timestamps_full), resolved_downsample)
             timestamps = timestamps_full[idx]
+
         qpos = qpos[idx]
         qvel = qvel[idx]
         stage = stage[idx]
         eef_T = eef_T[idx]
-        action = action_full[idx]
+        action = action_full[idx]  # (len(idx), 7)
         frame_indices_per_episode.append(idx)
 
         eef_pose = transform_to_pose(eef_T)
@@ -642,16 +760,14 @@ def main() -> None:
         total += len(timestamps)
         episode_ends.append(total)
 
-    # concatenate
     timestamp = np.concatenate(all_timestamp, axis=0)
     robot_joint = np.concatenate(all_joint, axis=0)
     robot_joint_vel = np.concatenate(all_joint_vel, axis=0)
     robot_eef_pose = np.concatenate(all_eef_pose, axis=0)
     robot_eef_pose_vel = np.concatenate(all_eef_pose_vel, axis=0)
     stage = np.concatenate(all_stage, axis=0)
-    action = np.concatenate(all_action, axis=0)
+    action = np.concatenate(all_action, axis=0)  # (N, 7)
 
-    # create zarr
     replay_path = dst_root / "replay_buffer.zarr"
     replay_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -670,7 +786,9 @@ def main() -> None:
     data_grp.create_dataset("robot_eef_pose", data=robot_eef_pose, chunks=(chunk_len, 6), compressor=compressor)
     data_grp.create_dataset("robot_eef_pose_vel", data=robot_eef_pose_vel, chunks=(chunk_len, 6), compressor=compressor)
     data_grp.create_dataset("stage", data=stage, chunks=(chunk_len,), compressor=compressor)
-    data_grp.create_dataset("action", data=action, chunks=(chunk_len, 6), compressor=compressor)
+
+    # >>> Option A change: write (N, 7) actions
+    data_grp.create_dataset("action", data=action, chunks=(chunk_len, 7), compressor=compressor)
 
     meta_chunk_len = len(episode_ends)
     if reference_spec is not None and reference_spec.get("meta_chunk_len") is not None:
@@ -684,7 +802,6 @@ def main() -> None:
         compressor=None,
     )
 
-    # videos
     if not args.no_videos:
         video_fps = args.fps
         if video_fps is None:
@@ -712,6 +829,7 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
 """
 python /scr/zhaoyang/formalize_data.py \
   --overwrite --no-reference --target-hz 20
