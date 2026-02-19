@@ -10,7 +10,7 @@ This script:
 
 # diffusion
 python scripts/eval/eval_widowx.py \
-  --checkpoint <你的ckpt或run目录> \
+  --checkpoint <your_path> \
   --method diffusion \
   --ip localhost --port 5556 \
   --camera-topics /blue/image_raw,/wrist/image_raw \
@@ -18,7 +18,7 @@ python scripts/eval/eval_widowx.py \
 
 # bfn
 python scripts/eval/eval_widowx.py \
-  --checkpoint <你的ckpt或run目录> \
+  --checkpoint <your_path> \
   --method bfn \
   --ip localhost --port 5556 \
   --camera-topics /blue/image_raw,/wrist/image_raw \
