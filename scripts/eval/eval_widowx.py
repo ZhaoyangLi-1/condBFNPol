@@ -7,6 +7,22 @@ This script:
    - config/benchmark_bfn_pusht_real.yaml
 2) Loads checkpoint weights from a .ckpt file (or run directory).
 3) Runs real-robot rollout with WidowXClient using benchmark-aligned horizons.
+
+# diffusion
+python scripts/eval/eval_widowx.py \
+  --checkpoint <你的ckpt或run目录> \
+  --method diffusion \
+  --ip localhost --port 5556 \
+  --camera-topics /blue/image_raw,/wrist/image_raw \
+  --show-image
+
+# bfn
+python scripts/eval/eval_widowx.py \
+  --checkpoint <你的ckpt或run目录> \
+  --method bfn \
+  --ip localhost --port 5556 \
+  --camera-topics /blue/image_raw,/wrist/image_raw \
+  --show-image
 """
 
 from __future__ import annotations
