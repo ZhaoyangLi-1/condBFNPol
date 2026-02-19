@@ -486,7 +486,65 @@ def _stack_obs_history(history: deque, keys: List[str]) -> Dict[str, np.ndarray]
     return result
 
 
-def _print_runtime_config(method: str, benchmark_cfg_path: Path, cfg: Any, ckpt_path: Path):
+def _resolve_control_frequencies(
+    step_duration_s: Optional[float],
+    policy_hz: float,
+    robot_hz: float,
+) -> Tuple[float, float, int]:
+    if step_duration_s is not None:
+        if float(step_duration_s) <= 0.0:
+            raise ValueError(f"--step-duration must be > 0, got {step_duration_s}")
+        policy_hz = 1.0 / float(step_duration_s)
+
+    policy_hz = float(policy_hz)
+    robot_hz = float(robot_hz)
+    if policy_hz <= 0.0:
+        raise ValueError(f"--policy-hz must be > 0, got {policy_hz}")
+    if robot_hz <= 0.0:
+        raise ValueError(f"--robot-hz must be > 0, got {robot_hz}")
+    if robot_hz < policy_hz:
+        raise ValueError(
+            f"--robot-hz ({robot_hz}) must be >= --policy-hz ({policy_hz}) for interpolation."
+        )
+
+    ratio = robot_hz / policy_hz
+    interp_substeps = int(round(ratio))
+    if interp_substeps < 1:
+        interp_substeps = 1
+    if abs(ratio - interp_substeps) > 1e-4:
+        raise ValueError(
+            f"robot_hz/policy_hz must be an integer multiple; got ratio={ratio:.6f} "
+            f"(policy_hz={policy_hz}, robot_hz={robot_hz})."
+        )
+    return policy_hz, robot_hz, interp_substeps
+
+
+def _interpolate_actions(
+    start_action: np.ndarray,
+    end_action: np.ndarray,
+    substeps: int,
+) -> np.ndarray:
+    start = np.asarray(start_action, dtype=np.float32).reshape(-1)
+    end = np.asarray(end_action, dtype=np.float32).reshape(-1)
+    if start.shape != end.shape:
+        raise ValueError(f"Action shape mismatch for interpolation: {start.shape} vs {end.shape}")
+    if substeps <= 1:
+        return end[None, :]
+
+    # Exclude alpha=0 so we don't resend the previous command.
+    alphas = np.linspace(0.0, 1.0, num=substeps + 1, dtype=np.float32)[1:]
+    return start[None, :] + (end - start)[None, :] * alphas[:, None]
+
+
+def _print_runtime_config(
+    method: str,
+    benchmark_cfg_path: Path,
+    cfg: Any,
+    ckpt_path: Path,
+    policy_hz: float,
+    robot_hz: float,
+    interp_substeps: int,
+):
     image_shape = list(cfg.image_shape)
     crop_shape = list(cfg.crop_shape)
     print("=" * 80)
@@ -500,6 +558,9 @@ def _print_runtime_config(method: str, benchmark_cfg_path: Path, cfg: Any, ckpt_
     print(f"image_shape (C,H,W)  : {image_shape}")
     print(f"crop_shape (H,W)     : {crop_shape}")
     print(f"action_dim           : {int(cfg.shape_meta.action.shape[0])}")
+    print(f"policy_hz            : {policy_hz:.3f}")
+    print(f"robot_hz             : {robot_hz:.3f}")
+    print(f"interp_substeps      : {interp_substeps}")
     print("=" * 80)
 
 
@@ -528,7 +589,19 @@ def main():
     parser.add_argument("--port", type=int, default=5556)
     parser.add_argument("--camera-topics", type=str, default="/blue/image_raw", help="Comma-separated ROS camera topics.")
     parser.add_argument("--client-image-size", type=int, default=None, help="Optional WidowX image_size init arg; used as flat image reshape hint.")
-    parser.add_argument("--step-duration", type=float, default=0.05, help="Control period in seconds (0.05 = 20Hz).")
+    parser.add_argument(
+        "--step-duration",
+        type=float,
+        default=None,
+        help="Deprecated override of policy period in seconds; if set, overrides --policy-hz.",
+    )
+    parser.add_argument("--policy-hz", type=float, default=10.0, help="Policy command rate before interpolation.")
+    parser.add_argument(
+        "--robot-hz",
+        type=float,
+        default=30.0,
+        help="Robot execution rate after interpolation (must be integer multiple of --policy-hz).",
+    )
     parser.add_argument("--num-timesteps", type=int, default=120)
     parser.add_argument("--act-exec-horizon", type=int, default=None, help="How many predicted actions to execute per inference. Default: benchmark n_action_steps.")
     parser.add_argument("--blocking", action="store_true")
@@ -568,6 +641,13 @@ def main():
         print("[WARN] cv2 is not installed, disabling --show-image.")
         args.show_image = False
 
+    policy_hz, robot_hz, interp_substeps = _resolve_control_frequencies(
+        step_duration_s=args.step_duration,
+        policy_hz=args.policy_hz,
+        robot_hz=args.robot_hz,
+    )
+    robot_step_duration = 1.0 / robot_hz
+
     device = _prep_device(args.device)
     ckpt_path = _resolve_checkpoint(args.checkpoint)
     payload = _load_payload(ckpt_path)
@@ -591,7 +671,15 @@ def main():
         policy_steps=args.policy_steps,
     )
 
-    _print_runtime_config(method, benchmark_cfg_path, benchmark_cfg, ckpt_path)
+    _print_runtime_config(
+        method=method,
+        benchmark_cfg_path=benchmark_cfg_path,
+        cfg=benchmark_cfg,
+        ckpt_path=ckpt_path,
+        policy_hz=policy_hz,
+        robot_hz=robot_hz,
+        interp_substeps=interp_substeps,
+    )
 
     # Benchmark-aligned hyperparameters.
     n_obs_steps = int(benchmark_cfg.n_obs_steps)
@@ -619,7 +707,7 @@ def main():
         {
             "camera_topics": [{"name": t} for t in topics],
             "override_workspace_boundaries": DEFAULT_WORKSPACE_BOUNDS,
-            "move_duration": float(args.step_duration),
+            "move_duration": float(robot_step_duration),
         }
     )
     env_params["start_state"] = list(np.concatenate([np.asarray(args.initial_eep, dtype=np.float32), [0, 0, 0, 1]]))
@@ -675,6 +763,7 @@ def main():
         input("Press [Enter] to start real-robot evaluation...")
 
         t = 0
+        prev_policy_action: Optional[np.ndarray] = None
         while t < args.num_timesteps:
             raw_obs = _read_obs_retry()
 
@@ -725,7 +814,6 @@ def main():
 
             exec_steps = min(act_exec_horizon, action_seq.shape[0], args.num_timesteps - t)
             for i in range(exec_steps):
-                step_start = time.time()
                 action = np.asarray(action_seq[i], dtype=np.float32).reshape(-1).copy()
                 if action.shape[0] != 7:
                     raise RuntimeError(
@@ -740,7 +828,21 @@ def main():
                 if args.no_yaw and action.shape[0] >= 6:
                     action[5] = 0.0
 
-                widowx_client.step_action(action, blocking=args.blocking)
+                interp_start = prev_policy_action if prev_policy_action is not None else action
+                interp_actions = _interpolate_actions(
+                    start_action=interp_start,
+                    end_action=action,
+                    substeps=interp_substeps,
+                )
+                for robot_action in interp_actions:
+                    robot_step_start = time.time()
+                    widowx_client.step_action(robot_action, blocking=args.blocking)
+                    if not args.blocking:
+                        dt = time.time() - robot_step_start
+                        if dt < robot_step_duration:
+                            time.sleep(robot_step_duration - dt)
+
+                prev_policy_action = action
 
                 # Save visualization frame (camera_0).
                 cam0 = step_obs[rgb_keys[0]]
@@ -751,12 +853,6 @@ def main():
                 t += 1
                 if t >= args.num_timesteps:
                     break
-
-                # Keep control period close to benchmark timebase.
-                if not args.blocking:
-                    dt = time.time() - step_start
-                    if dt < args.step_duration:
-                        time.sleep(args.step_duration - dt)
 
     except KeyboardInterrupt:
         print("[INFO] Ctrl+C received, stopping rollout.")
@@ -784,7 +880,7 @@ def main():
         out_dir.mkdir(parents=True, exist_ok=True)
         ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         out_path = out_dir / f"{ts}_{method}_widowx_eval.mp4"
-        fps = 1.0 / float(args.step_duration) if args.step_duration > 0 else 20.0
+        fps = float(policy_hz)
         imageio.mimsave(str(out_path), saved_frames, fps=fps)
         print(f"[INFO] Saved rollout video: {out_path}")
 

@@ -831,6 +831,6 @@ if __name__ == "__main__":
     main()
 
 """
-python /scr/zhaoyang/formalize_data.py \
+python ./dataset/formalize_data.py \
   --overwrite --no-reference --target-hz 20
 """
