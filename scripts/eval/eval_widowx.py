@@ -69,8 +69,9 @@ try:
 except Exception:
     wx_tr = None
 
-# Collected dataset starts around this neutral eef xyz (estimated from replay_buffer first frames).
-DEFAULT_INITIAL_EEP = [0.12, -0.02, 0.24]
+# Keep WidowX init consistent with example_widowx.py.
+DEFAULT_WORKSPACE_BOUNDS = [[0.1, -0.15, -0.01, -1.57, 0], [0.45, 0.25, 0.25, 1.57, 0]]
+DEFAULT_INITIAL_EEP = [0.3, 0.0, 0.15]
 WIDOWX_DEFAULT_ROTATION = np.array(
     [[0.0, 0.0, 1.0], [0.0, 1.0, 0.0], [-1.0, 0.0, 0.0]], dtype=np.float64
 )
@@ -685,7 +686,7 @@ def main():
     parser.add_argument(
         "--camera-topics",
         type=str,
-        default="/D435/color/image_raw,/blue/image_raw",
+        default="/blue/image_raw,/D435/color/image_raw",
         help="Comma-separated ROS camera topics.",
     )
     parser.add_argument("--num-timesteps", type=int, default=120)
@@ -768,15 +769,14 @@ def main():
     env_params.update(
         {
             "camera_topics": [{"name": t} for t in topics],
-            # Match bridge_data_v2/conf_clam_pusht.py behavior.
-            "override_workspace_boundaries": None,
-            "action_clipping": None,
-            "move_to_rand_start_freq": -1,
-            "fix_zangle": 0.1,
+            "override_workspace_boundaries": DEFAULT_WORKSPACE_BOUNDS,
             "move_duration": move_duration,
         }
     )
-    env_params["start_state"] = list(np.concatenate([np.asarray(args.initial_eep, dtype=np.float32), [0, 0, 0, 1]]))
+    start_state = list(np.concatenate([np.asarray(args.initial_eep, dtype=np.float32), [0, 0, 0, 1]]))
+    env_params["start_state"] = start_state
+    # example_widowx.py writes this legacy key; keep both for compatibility.
+    env_params["state_state"] = start_state
 
     widowx_client = WidowXClient(host=args.ip, port=args.port)
     if _set_widowx_rpc_timeout_ms(widowx_client, RPC_TIMEOUT_MS):
@@ -784,7 +784,7 @@ def main():
     else:
         print("[WARN] Could not override WidowX RPC timeout; using library default.")
 
-    init_status = widowx_client.init(env_params)
+    init_status = widowx_client.init(env_params, image_size=256)
     if not _status_is_success(init_status):
         print(f"[WARN] widowx_client.init returned non-success status {init_status!r}; waiting for readiness anyway.")
 
