@@ -11,7 +11,7 @@ This script:
 # diffusion
 python scripts/eval/eval_widowx.py \
   --checkpoint /data/BFN_data/checkpoints/diffusion_pusht_real.ckpt \
-  --method bfn \
+  --method diffusion \
   --policy-hz 10 \
   --robot-hz 30
 
