@@ -10,27 +10,17 @@ This script:
 
 # diffusion
 python scripts/eval/eval_widowx.py \
-  --checkpoint /data/BFN_data/checkpoints/diffusion_real_pusht.ckpt \
-  --method diffusion \
-  --ip localhost --port 5556 \
-  --camera-topics /D435/color/image_raw,/blue/image_raw \
-  --show-image \
-  --startup-timeout 180 \
-  --startup-poll-interval 1.0 \
-  --neutral-retries 60 \
-  --rpc-timeout-ms 8000
+  --checkpoint /data/BFN_data/checkpoints/diffusion_real_pusht.ckp \
+  --method bfn \
+  --policy-hz 10 \
+  --robot-hz 30
 
 # bfn
 python scripts/eval/eval_widowx.py \
   --checkpoint /data/BFN_data/checkpoints/bfn_real_pusht.ckpt \
   --method bfn \
-  --ip localhost --port 5556 \
-  --camera-topics /D435/color/image_raw,/blue/image_raw \
-  --show-image \
-  --startup-timeout 180 \
-  --startup-poll-interval 1.0 \
-  --neutral-retries 60 \
-  --rpc-timeout-ms 8000
+  --policy-hz 10 \
+  --robot-hz 30
 """
 
 from __future__ import annotations
