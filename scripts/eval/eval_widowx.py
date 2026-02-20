@@ -341,13 +341,22 @@ def _to_hwc_uint8(
     target_hw: Tuple[int, int],
     flat_hint_size: Optional[int] = None,
 ) -> np.ndarray:
+    target_h, target_w = target_hw
     arr = np.asarray(image)
+    # Some WidowX transports add singleton batch/channel dims (e.g., [1, N] or [1, H, W, C]).
+    arr = np.squeeze(arr)
+
+    # Handle flattened pixel tables [H*W,3] or [3,H*W] when provided.
+    if arr.ndim == 2:
+        if arr.shape == (target_h * target_w, 3):
+            arr = arr.reshape(target_h, target_w, 3)
+        elif arr.shape == (3, target_h * target_w):
+            arr = arr.reshape(3, target_h, target_w).transpose(1, 2, 0)
 
     if arr.ndim == 1:
         total = arr.size
         if total % 3 != 0:
             raise ValueError(f"Flat image length {total} is not divisible by 3.")
-        target_h, target_w = target_hw
         if total == 3 * target_h * target_w:
             c, h, w = 3, target_h, target_w
         elif flat_hint_size is not None and total == 3 * flat_hint_size * flat_hint_size:
