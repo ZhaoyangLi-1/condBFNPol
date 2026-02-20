@@ -7,25 +7,22 @@ This script is intentionally minimal and conservative:
 - Runs WidowX rollout with bridge_data_robot-compatible relative actions.
 
 Typical usage:
-python scripts/eval/eval_widowx.py \
-  --checkpoint /data/BFN_data/checkpoints/diffusion_pusht_real.ckpt \
-  --method diffusion \
-  --policy-hz 10 \
-  --robot-hz 10 \
-  --move-duration 0.2 \
-  --act-exec-horizon 1 \
-  --initial-eep 0.3 0.0 0.15 \
-  --blocking
 
-python scripts/eval/eval_widowx.py \
+python /scr2/zhaoyang/condBFNPol/scripts/eval/eval_widowx.py \
+  --checkpoint /data/BFN_data/checkpoints/diffusion_pusht_real.ckpt \
+  --method auto \
+  --camera-topics /D435/color/image_raw,/blue/image_raw \
+  --initial-eep 0.12 -0.02 0.24 \
+  --policy-hz 10 --robot-hz 10 --move-duration 0.2 \
+  --act-exec-horizon 1
+  
+python /scr2/zhaoyang/condBFNPol/scripts/eval/eval_widowx.py \
   --checkpoint /data/BFN_data/checkpoints/bfn_pusht_real.ckpt \
-  --method bfn \
-  --policy-hz 10 \
-  --robot-hz 10 \
-  --move-duration 0.2 \
-  --act-exec-horizon 1 \
-  --initial-eep 0.3 0.0 0.15 \
-  --blocking
+  --method auto \
+  --camera-topics /D435/color/image_raw,/blue/image_raw \
+  --initial-eep 0.12 -0.02 0.24 \
+  --policy-hz 10 --robot-hz 10 --move-duration 0.2 \
+  --act-exec-horizon 1
 
 """
 
@@ -686,6 +683,29 @@ def _absolute_action_to_relative_from_target_tf(
     return _absolute_action_to_relative(target_action7=target, current_pose6_rotvec=curr_pose)
 
 
+def _apply_relative_action_to_pose(
+    current_pose6_rotvec: np.ndarray,
+    rel_action7: np.ndarray,
+) -> np.ndarray:
+    """Apply executed relative action to current pose estimate."""
+    curr = np.asarray(current_pose6_rotvec, dtype=np.float64).reshape(-1)
+    rel = np.asarray(rel_action7, dtype=np.float64).reshape(-1)
+    if curr.shape[0] < 6 or rel.shape[0] != 7:
+        raise ValueError(f"Invalid shapes for pose/action update: {curr.shape}, {rel.shape}")
+
+    if wx_tr is not None and SciRotation is not None:
+        curr_tf = _pose_rotvec6_to_transform(curr[:6])
+        delta_tf, _ = wx_tr.action2transform_local(rel, curr[:3])
+        next_tf = delta_tf.dot(curr_tf)
+        next_rotvec = SciRotation.from_matrix(next_tf[:3, :3]).as_rotvec()
+        return np.concatenate([next_tf[:3, 3], next_rotvec], axis=0).astype(np.float32)
+
+    # Fallback approximation.
+    out = curr[:6].astype(np.float32).copy()
+    out[:6] = out[:6] + rel[:6].astype(np.float32)
+    return out
+
+
 def _stack_obs_history(history: deque, keys: List[str]) -> Dict[str, np.ndarray]:
     result: Dict[str, np.ndarray] = {}
     for key in keys:
@@ -930,8 +950,6 @@ def main():
     if action_space_mode is not None:
         print(f"[INFO] Inferred model action space from normalizer stats: {action_space_mode}.")
     warned_missing_pose = False
-    target_tf_tracker: Optional[np.ndarray] = None
-    warned_tracker_resync = False
 
     def _read_obs_retry() -> Dict[str, Any]:
         while True:
@@ -1026,20 +1044,7 @@ def main():
                 action_seq = action_seq[None]
 
             curr_pose = _extract_current_pose_rotvec_from_obs(raw_obs)
-            obs_tf = None
-            if curr_pose is not None:
-                obs_tf = _pose_rotvec6_to_transform(curr_pose)
-                if target_tf_tracker is None:
-                    target_tf_tracker = obs_tf.copy()
-                else:
-                    drift = float(np.linalg.norm(target_tf_tracker[:3, 3] - obs_tf[:3, 3]))
-                    if drift > 0.05:
-                        if not warned_tracker_resync:
-                            print(
-                                f"[WARN] Target tracker drift {drift:.3f}m vs observation; resyncing tracker to obs pose."
-                            )
-                            warned_tracker_resync = True
-                        target_tf_tracker = obs_tf.copy()
+            curr_pose_exec = None if curr_pose is None else curr_pose.copy()
             exec_steps = min(act_exec_horizon, action_seq.shape[0], args.num_timesteps - t)
             for i in range(exec_steps):
                 model_action = np.asarray(action_seq[i], dtype=np.float32).reshape(-1)
@@ -1053,17 +1058,12 @@ def main():
                     print(f"[INFO] Inferred model action space: {action_space_mode}.")
 
                 if action_space_mode == "absolute":
-                    if target_tf_tracker is not None:
-                        rel_action = _absolute_action_to_relative_from_target_tf(model_action, target_tf_tracker)
-                        target_tf_tracker = _pose_rotvec6_to_transform(model_action[:6])
-                    elif curr_pose is not None:
-                        rel_action = _absolute_action_to_relative(model_action, curr_pose)
-                        target_tf_tracker = _pose_rotvec6_to_transform(model_action[:6])
-                    else:
+                    if curr_pose_exec is None:
                         if not warned_missing_pose:
-                            print("[WARN] Missing current pose in observation; falling back to direct step_action.")
+                            print("[WARN] Missing current pose in observation; skipping absolute->relative conversion this step.")
                             warned_missing_pose = True
-                        rel_action = model_action.copy()
+                        continue
+                    rel_action = _absolute_action_to_relative(model_action, curr_pose_exec)
                 else:
                     rel_action = model_action.copy()
 
@@ -1076,6 +1076,8 @@ def main():
                     rel_action[5] = 0.0
 
                 rel_action = _clip_relative_action(rel_action)
+                if action_space_mode == "absolute" and curr_pose_exec is not None:
+                    curr_pose_exec = _apply_relative_action_to_pose(curr_pose_exec, rel_action)
                 widowx_client.step_action(rel_action, blocking=True)
                 last_tstep = time.time()
 
