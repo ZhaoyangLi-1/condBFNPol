@@ -1,34 +1,13 @@
 #!/usr/bin/env python3
 """Evaluate trained Diffusion/BFN policies on real WidowX.
 
-This script:
-1) Loads policy architecture/hyperparameters from benchmark config
-   - config/benchmark_diffusion_pusht_real.yaml
-   - config/benchmark_bfn_pusht_real.yaml
-2) Loads checkpoint weights from a .ckpt file (or run directory).
-3) Runs real-robot rollout with WidowXClient using benchmark-aligned horizons.
+This script is intentionally minimal and conservative:
+- Loads policy architecture from benchmark config.
+- Loads .ckpt weights (Diffusion or BFN).
+- Runs WidowX rollout with bridge_data_robot-compatible relative actions.
 
-# diffusion
-python scripts/eval/eval_widowx.py \
-  --checkpoint /data/BFN_data/checkpoints/diffusion_pusht_real.ckpt \
-  --method diffusion \
-  --policy-hz 10 \
-  --robot-hz 10 \
-  --move-duration 0.25 \
-  --no-yaw \
-  --act-exec-horizon 1 \
-  --blocking
-
-# bfn
-python scripts/eval/eval_widowx.py \
-  --checkpoint /data/BFN_data/checkpoints/bfn_pusht_real.ckpt \
-  --method bfn \
-  --policy-hz 10 \
-  --robot-hz 10 \
-  --move-duration 0.25 \
-  --no-yaw \
-  --act-exec-horizon 1 \
-  --blocking
+Typical usage:
+python scripts/eval/eval_widowx.py --checkpoint /path/to/checkpoint.ckpt
 """
 
 from __future__ import annotations
@@ -71,6 +50,11 @@ import torch
 from omegaconf import OmegaConf
 
 try:
+    from scipy.spatial.transform import Rotation as SciRotation
+except Exception:
+    SciRotation = None
+
+try:
     import cv2
 except ImportError:
     cv2 = None
@@ -80,7 +64,29 @@ try:
 except ImportError:
     imageio = None
 
-DEFAULT_WORKSPACE_BOUNDS = [[0.1, -0.15, -0.01, -1.57, 0], [0.45, 0.25, 0.25, 1.57, 0]]
+try:
+    from widowx_envs.utils import transformation_utils as wx_tr
+except Exception:
+    wx_tr = None
+
+# Collected dataset starts around this neutral eef xyz (estimated from replay_buffer first frames).
+DEFAULT_INITIAL_EEP = [0.12, -0.02, 0.24]
+WIDOWX_DEFAULT_ROTATION = np.array(
+    [[0.0, 0.0, 1.0], [0.0, 1.0, 0.0], [-1.0, 0.0, 0.0]], dtype=np.float64
+)
+
+# Keep rollout conservative and aligned with 10Hz preprocessed dataset.
+STEP_DURATION = 0.1
+MOVE_DURATION = 0.1
+ACT_EXEC_HORIZON = 1
+RPC_TIMEOUT_MS = 8000
+STARTUP_TIMEOUT = 180.0
+STARTUP_POLL_INTERVAL = 1.0
+NEUTRAL_RETRIES = 60
+
+# bridge_data_robot RobotBaseEnv action limits for 3trans3rot + gripper
+REL_ACTION_LOW = np.array([-0.05, -0.05, -0.05, -0.25, -0.25, -0.25, 0.0], dtype=np.float32)
+REL_ACTION_HIGH = np.array([0.05, 0.05, 0.05, 0.25, 0.25, 0.25, 1.0], dtype=np.float32)
 
 
 def _register_omegaconf_resolvers() -> None:
@@ -162,9 +168,10 @@ def _move_to_neutral(
     errors: List[str] = []
     for attempt in range(1, max(1, int(retries)) + 1):
         for name, fn in (
-            ("reset", lambda: getattr(widowx_client, "reset", None)),
+            # Prefer explicit neutral/move path. reset() in widowx_env_service may jump to start_state.
             ("go_to_neutral", lambda: getattr(widowx_client, "go_to_neutral", None)),
             ("move", lambda: getattr(widowx_client, "move", None)),
+            ("reset", lambda: getattr(widowx_client, "reset", None)),
         ):
             method = fn()
             if not callable(method):
@@ -472,7 +479,12 @@ def _build_single_step_obs(
         if key in raw_obs:
             vec = np.asarray(raw_obs[key], dtype=np.float32).reshape(-1)
         elif key == "robot_eef_pose" and "state" in raw_obs:
-            vec = np.asarray(raw_obs["state"], dtype=np.float32).reshape(-1)
+            # widowx_env_service returns state in euler-angle parameterization.
+            # Our training data stores robot_eef_pose as xyz + rotvec; convert here.
+            state_vec = np.asarray(raw_obs["state"], dtype=np.float32).reshape(-1)
+            if state_vec.shape[0] < 6:
+                raise RuntimeError(f"Raw 'state' has invalid shape {state_vec.shape}, expected >=6.")
+            vec = _state_euler6_to_rotvec6(state_vec[:6])
         else:
             raise RuntimeError(f"Cannot find low-dim key '{key}' in WidowX observation.")
 
@@ -484,6 +496,95 @@ def _build_single_step_obs(
         out[key] = vec.astype(np.float32)
 
     return out
+
+
+def _state_euler6_to_rotvec6(euler_pose: np.ndarray) -> np.ndarray:
+    euler_pose = np.asarray(euler_pose, dtype=np.float64).reshape(-1)
+    if euler_pose.shape[0] < 6:
+        raise ValueError(f"Expected >=6 values for euler pose, got {euler_pose.shape}")
+
+    xyz = euler_pose[:3]
+    euler = euler_pose[3:6]
+    if wx_tr is None or SciRotation is None:
+        # Best-effort fallback if transformation helpers are unavailable.
+        return np.concatenate([xyz, euler], axis=0).astype(np.float32)
+
+    state7 = np.concatenate([xyz, euler, np.array([1.0], dtype=np.float64)], axis=0)
+    tf, _ = wx_tr.state2transform(state7, WIDOWX_DEFAULT_ROTATION)
+    rotvec = SciRotation.from_matrix(tf[:3, :3]).as_rotvec()
+    return np.concatenate([xyz, rotvec], axis=0).astype(np.float32)
+
+
+def _pose_rotvec6_to_transform(pose6: np.ndarray) -> np.ndarray:
+    pose6 = np.asarray(pose6, dtype=np.float64).reshape(-1)
+    if pose6.shape[0] < 6:
+        raise ValueError(f"Expected >=6 values for pose, got {pose6.shape}")
+    if SciRotation is None:
+        raise RuntimeError("scipy is required for rotvec conversion but is unavailable.")
+    tf = np.eye(4, dtype=np.float64)
+    tf[:3, :3] = SciRotation.from_rotvec(pose6[3:6]).as_matrix()
+    tf[:3, 3] = pose6[:3]
+    return tf
+
+
+def _extract_current_pose_rotvec_from_obs(raw_obs: Dict[str, Any]) -> Optional[np.ndarray]:
+    if "robot_eef_pose" in raw_obs:
+        vec = np.asarray(raw_obs["robot_eef_pose"], dtype=np.float32).reshape(-1)
+        if vec.shape[0] >= 6:
+            return vec[:6]
+    if "state" in raw_obs:
+        vec = np.asarray(raw_obs["state"], dtype=np.float32).reshape(-1)
+        if vec.shape[0] >= 6:
+            return _state_euler6_to_rotvec6(vec[:6])
+    return None
+
+
+def _infer_action_space(action7: np.ndarray) -> str:
+    a = np.asarray(action7, dtype=np.float32).reshape(-1)
+    if a.shape[0] != 7:
+        raise ValueError(f"Expected 7D action, got {a.shape}")
+    is_relative = (
+        np.max(np.abs(a[:3])) <= 0.08
+        and np.max(np.abs(a[3:6])) <= 0.4
+    )
+    return "relative" if is_relative else "absolute"
+
+
+def _absolute_action_to_relative(
+    target_action7: np.ndarray,
+    current_pose6_rotvec: np.ndarray,
+) -> np.ndarray:
+    target = np.asarray(target_action7, dtype=np.float64).reshape(-1)
+    curr = np.asarray(current_pose6_rotvec, dtype=np.float64).reshape(-1)
+    if target.shape[0] != 7:
+        raise ValueError(f"Expected target action shape (7,), got {target.shape}")
+    if curr.shape[0] < 6:
+        raise ValueError(f"Expected current pose shape (>=6,), got {curr.shape}")
+
+    # Primary path: exact transform math with bridge_data_robot utility.
+    if wx_tr is not None and SciRotation is not None:
+        tf_target = _pose_rotvec6_to_transform(target[:6])
+        tf_curr = _pose_rotvec6_to_transform(curr[:6])
+        tf_delta = tf_target.dot(np.linalg.inv(tf_curr))
+        rel = wx_tr.transform2action_local(
+            tf_delta,
+            np.array([target[6]], dtype=np.float64),
+            curr[:3],
+        )
+        return np.asarray(rel, dtype=np.float32).reshape(-1)
+
+    # Fallback: simple component delta.
+    rel = np.zeros((7,), dtype=np.float32)
+    rel[:6] = (target[:6] - curr[:6]).astype(np.float32)
+    rel[6] = float(target[6])
+    return rel
+
+
+def _clip_relative_action(action7: np.ndarray) -> np.ndarray:
+    a = np.asarray(action7, dtype=np.float32).reshape(-1)
+    if a.shape[0] != 7:
+        raise ValueError(f"Expected 7D action, got {a.shape}")
+    return np.clip(a, REL_ACTION_LOW, REL_ACTION_HIGH).astype(np.float32)
 
 
 def _stack_obs_history(history: deque, keys: List[str]) -> Dict[str, np.ndarray]:
@@ -548,9 +649,7 @@ def _print_runtime_config(
     benchmark_cfg_path: Path,
     cfg: Any,
     ckpt_path: Path,
-    policy_hz: float,
-    robot_hz: float,
-    interp_substeps: int,
+    step_duration: float,
     move_duration: float,
 ):
     image_shape = list(cfg.image_shape)
@@ -566,9 +665,7 @@ def _print_runtime_config(
     print(f"image_shape (C,H,W)  : {image_shape}")
     print(f"crop_shape (H,W)     : {crop_shape}")
     print(f"action_dim           : {int(cfg.shape_meta.action.shape[0])}")
-    print(f"policy_hz            : {policy_hz:.3f}")
-    print(f"robot_hz             : {robot_hz:.3f}")
-    print(f"interp_substeps      : {interp_substeps}")
+    print(f"control_step_duration: {step_duration:.3f}")
     print(f"env move_duration    : {move_duration:.3f}")
     print("=" * 80)
 
@@ -583,99 +680,31 @@ def main():
         choices=["auto", "bfn", "diffusion"],
         help="Policy type. 'auto' infers from checkpoint cfg.policy._target_.",
     )
-    parser.add_argument("--benchmark-config", type=str, default=None, help="Override benchmark yaml path.")
-    parser.add_argument(
-        "--use-ema",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Prefer ema_model weights if present.",
-    )
-    parser.add_argument("--policy-steps", type=int, default=None, help="Override inference steps (BFN n_timesteps / Diffusion num_inference_steps).")
-    parser.add_argument("--device", type=str, default="cuda", choices=["cuda", "cpu"])
-
-    # WidowX runtime
     parser.add_argument("--ip", type=str, default="localhost")
     parser.add_argument("--port", type=int, default=5556)
     parser.add_argument(
         "--camera-topics",
         type=str,
-        default="/blue/image_raw,/D435/color/image_raw",
+        default="/D435/color/image_raw,/blue/image_raw",
         help="Comma-separated ROS camera topics.",
     )
-    parser.add_argument("--client-image-size", type=int, default=None, help="Optional WidowX image_size init arg; used as flat image reshape hint.")
-    parser.add_argument(
-        "--step-duration",
-        type=float,
-        default=None,
-        help="Deprecated override of policy period in seconds; if set, overrides --policy-hz.",
-    )
-    parser.add_argument("--policy-hz", type=float, default=10.0, help="Policy command rate before interpolation.")
-    parser.add_argument(
-        "--robot-hz",
-        type=float,
-        default=30.0,
-        help="Robot execution rate after interpolation (must be integer multiple of --policy-hz).",
-    )
-    parser.add_argument(
-        "--move-duration",
-        type=float,
-        default=None,
-        help=(
-            "WidowX move duration (seconds) used by step_action. "
-            "Default: 1/--robot-hz."
-        ),
-    )
     parser.add_argument("--num-timesteps", type=int, default=120)
-    parser.add_argument("--act-exec-horizon", type=int, default=None, help="How many predicted actions to execute per inference. Default: benchmark n_action_steps.")
-    parser.add_argument("--blocking", action="store_true")
     parser.add_argument("--show-image", action="store_true")
     parser.add_argument("--video-save-path", type=str, default=None)
-    parser.add_argument("--initial-eep", type=float, nargs=3, default=[0.3, 0.0, 0.15])
-    parser.add_argument("--gripper-value", type=float, default=None, help="If set, override the 7th (gripper) component of 7D action.")
-    parser.add_argument("--no-pitch-roll", action="store_true")
-    parser.add_argument("--no-yaw", action="store_true")
-    parser.add_argument(
-        "--rpc-timeout-ms",
-        type=int,
-        default=5000,
-        help="ZMQ RPC timeout for WidowX client calls (init/reset can exceed default 800ms).",
-    )
-    parser.add_argument(
-        "--startup-timeout",
-        type=float,
-        default=90.0,
-        help="Max seconds to wait for first observation after init (slow robot/camera startup).",
-    )
-    parser.add_argument(
-        "--startup-poll-interval",
-        type=float,
-        default=0.5,
-        help="Polling interval while waiting for startup readiness.",
-    )
-    parser.add_argument(
-        "--neutral-retries",
-        type=int,
-        default=20,
-        help="How many times to retry neutral/reset when startup is still busy.",
-    )
+    parser.add_argument("--initial-eep", type=float, nargs=3, default=DEFAULT_INITIAL_EEP)
     args = parser.parse_args()
 
     if args.show_image and cv2 is None:
         print("[WARN] cv2 is not installed, disabling --show-image.")
         args.show_image = False
 
-    policy_hz, robot_hz, interp_substeps = _resolve_control_frequencies(
-        step_duration_s=args.step_duration,
-        policy_hz=args.policy_hz,
-        robot_hz=args.robot_hz,
-    )
-    robot_step_duration = 1.0 / robot_hz
+    step_duration = float(STEP_DURATION)
+    move_duration = float(MOVE_DURATION)
 
-    device = _prep_device(args.device)
+    device = _prep_device("cuda")
     ckpt_path = _resolve_checkpoint(args.checkpoint)
     payload = _load_payload(ckpt_path)
 
-    # Infer policy method from checkpoint config if needed.
     payload_cfg = payload.get("cfg", None)
     payload_method = _infer_method_from_cfg(payload_cfg)
     method = args.method
@@ -689,27 +718,14 @@ def main():
             "Use --method auto or match the checkpoint type."
         )
 
-    move_duration = robot_step_duration if args.move_duration is None else float(args.move_duration)
-    if move_duration <= 0.0:
-        raise ValueError(f"--move-duration must be > 0, got {move_duration}")
-    if move_duration < 0.1:
-        print(
-            f"[WARN] Very small move_duration={move_duration:.3f}s; this can cause fast/jerky motion and IK failures."
-        )
-    if not args.blocking and move_duration > robot_step_duration + 1e-6:
-        print(
-            "[WARN] --move-duration is larger than command period (1/--robot-hz) with non-blocking control. "
-            "Commands may overlap; consider --blocking or lowering --robot-hz."
-        )
-
-    benchmark_cfg_path = _get_benchmark_cfg_path(method=method, override_path=args.benchmark_config)
-    policy_state = _select_policy_state_dict(payload, prefer_ema=args.use_ema)
+    benchmark_cfg_path = _get_benchmark_cfg_path(method=method, override_path=None)
+    policy_state = _select_policy_state_dict(payload, prefer_ema=True)
     policy, benchmark_cfg = _load_policy_from_benchmark(
         method=method,
         benchmark_cfg_path=benchmark_cfg_path,
         policy_state=policy_state,
         device=device,
-        policy_steps=args.policy_steps,
+        policy_steps=None,
     )
 
     _print_runtime_config(
@@ -717,13 +733,10 @@ def main():
         benchmark_cfg_path=benchmark_cfg_path,
         cfg=benchmark_cfg,
         ckpt_path=ckpt_path,
-        policy_hz=policy_hz,
-        robot_hz=robot_hz,
-        interp_substeps=interp_substeps,
+        step_duration=step_duration,
         move_duration=move_duration,
     )
 
-    # Benchmark-aligned hyperparameters.
     n_obs_steps = int(benchmark_cfg.n_obs_steps)
     n_action_steps = int(benchmark_cfg.n_action_steps)
     if hasattr(policy, "n_obs_steps") and int(policy.n_obs_steps) != n_obs_steps:
@@ -732,50 +745,61 @@ def main():
         raise RuntimeError(
             f"Policy n_action_steps={policy.n_action_steps} != benchmark n_action_steps={n_action_steps}"
         )
-    act_exec_horizon = int(args.act_exec_horizon) if args.act_exec_horizon is not None else n_action_steps
 
+    act_exec_horizon = min(ACT_EXEC_HORIZON, n_action_steps)
     obs_meta = benchmark_cfg.shape_meta.obs
     rgb_keys = [k for k, v in obs_meta.items() if v.get("type", "low_dim") == "rgb"]
     lowdim_keys = [k for k, v in obs_meta.items() if v.get("type", "low_dim") == "low_dim"]
     all_obs_keys = rgb_keys + lowdim_keys
     action_dim = int(benchmark_cfg.shape_meta.action.shape[0])
+    if action_dim != 7:
+        raise RuntimeError(f"Expected action_dim=7 for WidowX, got {action_dim}.")
 
-    # Init WidowX.
     topics = [x.strip() for x in args.camera_topics.split(",") if x.strip()]
     if not topics:
         raise ValueError("camera-topics cannot be empty")
+    if len(rgb_keys) > len(topics):
+        print(
+            f"[WARN] Policy expects {len(rgb_keys)} RGB streams but only {len(topics)} camera topic(s) were provided. "
+            "Missing streams will duplicate camera_0."
+        )
+
     env_params = WidowXConfigs.DefaultEnvParams.copy()
     env_params.update(
         {
             "camera_topics": [{"name": t} for t in topics],
-            "override_workspace_boundaries": DEFAULT_WORKSPACE_BOUNDS,
-            "move_duration": float(move_duration),
+            # Match bridge_data_v2/conf_clam_pusht.py behavior.
+            "override_workspace_boundaries": None,
+            "action_clipping": None,
+            "move_to_rand_start_freq": -1,
+            "fix_zangle": 0.1,
+            "move_duration": move_duration,
         }
     )
     env_params["start_state"] = list(np.concatenate([np.asarray(args.initial_eep, dtype=np.float32), [0, 0, 0, 1]]))
 
     widowx_client = WidowXClient(host=args.ip, port=args.port)
-    if _set_widowx_rpc_timeout_ms(widowx_client, args.rpc_timeout_ms):
-        print(f"[INFO] Set WidowX RPC timeout to {int(args.rpc_timeout_ms)} ms.")
+    if _set_widowx_rpc_timeout_ms(widowx_client, RPC_TIMEOUT_MS):
+        print(f"[INFO] Set WidowX RPC timeout to {RPC_TIMEOUT_MS} ms.")
     else:
         print("[WARN] Could not override WidowX RPC timeout; using library default.")
-    if args.client_image_size is None:
-        init_status = widowx_client.init(env_params)
-    else:
-        init_status = widowx_client.init(env_params, image_size=int(args.client_image_size))
+
+    init_status = widowx_client.init(env_params)
     if not _status_is_success(init_status):
         print(f"[WARN] widowx_client.init returned non-success status {init_status!r}; waiting for readiness anyway.")
 
     _wait_for_startup_observation(
         widowx_client,
-        timeout_s=args.startup_timeout,
-        poll_interval_s=args.startup_poll_interval,
+        timeout_s=STARTUP_TIMEOUT,
+        poll_interval_s=STARTUP_POLL_INTERVAL,
     )
 
     obs_hist: deque = deque(maxlen=n_obs_steps)
     warned_missing = set()
     saved_frames: List[np.ndarray] = []
     reset_requested = False
+    action_space_mode: Optional[str] = None
+    warned_missing_pose = False
 
     def _read_obs_retry() -> Dict[str, Any]:
         while True:
@@ -783,12 +807,12 @@ def main():
                 obs = widowx_client.get_observation()
             except Exception as e:
                 print(f"[WARN] get_observation() failed: {type(e).__name__}: {e}; retrying...")
-                time.sleep(max(0.01, float(args.startup_poll_interval)))
+                time.sleep(max(0.01, STARTUP_POLL_INTERVAL))
                 continue
             if obs is not None:
                 return obs
             print("[WARN] get_observation() returned None; retrying...")
-            time.sleep(max(0.01, float(args.startup_poll_interval)))
+            time.sleep(max(0.01, STARTUP_POLL_INTERVAL))
 
     try:
         try:
@@ -796,22 +820,38 @@ def main():
                 widowx_client,
                 initial_eep=args.initial_eep,
                 blocking=True,
-                retries=args.neutral_retries,
-                retry_interval_s=args.startup_poll_interval,
+                retries=NEUTRAL_RETRIES,
+                retry_interval_s=STARTUP_POLL_INTERVAL,
             )
         except Exception as e:
             print(f"[WARN] Startup move-to-neutral failed: {e}. Continuing anyway.")
+
         time.sleep(0.5)
         input("Press [Enter] to start real-robot evaluation...")
 
         t = 0
-        prev_policy_action: Optional[np.ndarray] = None
+        last_tstep = time.time() - step_duration
         while t < args.num_timesteps:
+            now = time.time()
+            if now < last_tstep + step_duration:
+                time.sleep(0.001)
+                continue
+
             raw_obs = _read_obs_retry()
 
-            if args.show_image and "full_image" in raw_obs:
-                bgr = cv2.cvtColor(np.asarray(raw_obs["full_image"]), cv2.COLOR_RGB2BGR)
-                cv2.imshow("widowx_eval", bgr)
+            if args.show_image:
+                vis_img = None
+                if "full_image" in raw_obs:
+                    arr = np.asarray(raw_obs["full_image"])
+                    if arr.ndim == 4 and arr.shape[0] > 0:
+                        vis_img = arr[0]
+                    elif arr.ndim == 3:
+                        vis_img = arr
+                if vis_img is None and "external_img" in raw_obs:
+                    vis_img = np.asarray(raw_obs["external_img"])
+                if vis_img is not None and vis_img.ndim == 3 and vis_img.shape[-1] == 3:
+                    bgr = cv2.cvtColor(vis_img, cv2.COLOR_RGB2BGR)
+                    cv2.imshow("widowx_eval", bgr)
                 key = cv2.waitKey(1) & 0xFF
                 if key in (ord("r"), ord("R")):
                     reset_requested = True
@@ -832,11 +872,10 @@ def main():
                 obs_meta=obs_meta,
                 rgb_keys=rgb_keys,
                 lowdim_keys=lowdim_keys,
-                flat_hint_size=args.client_image_size,
+                flat_hint_size=None,
                 warned_missing=warned_missing,
             )
 
-            # bootstrap history
             if len(obs_hist) == 0:
                 obs_hist.extend([step_obs] * n_obs_steps)
             else:
@@ -854,39 +893,35 @@ def main():
             if action_seq.ndim == 1:
                 action_seq = action_seq[None]
 
+            curr_pose = _extract_current_pose_rotvec_from_obs(raw_obs)
             exec_steps = min(act_exec_horizon, action_seq.shape[0], args.num_timesteps - t)
             for i in range(exec_steps):
-                action = np.asarray(action_seq[i], dtype=np.float32).reshape(-1).copy()
-                if action.shape[0] != 7:
+                model_action = np.asarray(action_seq[i], dtype=np.float32).reshape(-1)
+                if model_action.shape[0] != 7:
                     raise RuntimeError(
-                        f"Expected 7D policy action for WidowX step_action, got shape {tuple(action.shape)}"
+                        f"Expected 7D policy action for WidowX step_action, got shape {tuple(model_action.shape)}"
                     )
-                if args.gripper_value is not None:
-                    action[6] = float(np.clip(args.gripper_value, 0.0, 1.0))
 
-                if args.no_pitch_roll and action.shape[0] >= 5:
-                    action[3] = 0.0
-                    action[4] = 0.0
-                if args.no_yaw and action.shape[0] >= 6:
-                    action[5] = 0.0
+                if action_space_mode is None:
+                    action_space_mode = _infer_action_space(model_action)
+                    print(f"[INFO] Inferred model action space: {action_space_mode}.")
 
-                interp_start = prev_policy_action if prev_policy_action is not None else action
-                interp_actions = _interpolate_actions(
-                    start_action=interp_start,
-                    end_action=action,
-                    substeps=interp_substeps,
-                )
-                for robot_action in interp_actions:
-                    robot_step_start = time.time()
-                    widowx_client.step_action(robot_action, blocking=args.blocking)
-                    if not args.blocking:
-                        dt = time.time() - robot_step_start
-                        if dt < robot_step_duration:
-                            time.sleep(robot_step_duration - dt)
+                if action_space_mode == "absolute":
+                    if curr_pose is None:
+                        if not warned_missing_pose:
+                            print("[WARN] Missing current pose in observation; falling back to direct step_action.")
+                            warned_missing_pose = True
+                        rel_action = model_action.copy()
+                    else:
+                        rel_action = _absolute_action_to_relative(model_action, curr_pose)
+                        curr_pose = model_action[:6].copy()
+                else:
+                    rel_action = model_action.copy()
 
-                prev_policy_action = action
+                rel_action = _clip_relative_action(rel_action)
+                widowx_client.step_action(rel_action, blocking=True)
+                last_tstep = time.time()
 
-                # Save visualization frame (camera_0).
                 cam0 = step_obs[rgb_keys[0]]
                 frame = np.moveaxis(cam0, 0, -1)
                 frame = np.clip(frame * 255.0, 0, 255).astype(np.uint8)
@@ -904,8 +939,8 @@ def main():
                 widowx_client,
                 initial_eep=args.initial_eep,
                 blocking=True,
-                retries=max(1, min(5, args.neutral_retries)),
-                retry_interval_s=args.startup_poll_interval,
+                retries=max(1, min(5, NEUTRAL_RETRIES)),
+                retry_interval_s=STARTUP_POLL_INTERVAL,
             )
         except Exception as e:
             print(f"[WARN] Failed to move to neutral: {e}")
@@ -922,8 +957,7 @@ def main():
         out_dir.mkdir(parents=True, exist_ok=True)
         ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         out_path = out_dir / f"{ts}_{method}_widowx_eval.mp4"
-        fps = float(policy_hz)
-        imageio.mimsave(str(out_path), saved_frames, fps=fps)
+        imageio.mimsave(str(out_path), saved_frames, fps=1.0 / step_duration)
         print(f"[INFO] Saved rollout video: {out_path}")
 
 
