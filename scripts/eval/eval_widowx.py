@@ -10,7 +10,7 @@ This script:
 
 # diffusion
 python scripts/eval/eval_widowx.py \
-  --checkpoint /data/BFN_data/checkpoints/diffusion_real_pusht.ckp \
+  --checkpoint /data/BFN_data/checkpoints/diffusion_real_pusht.ckpt \
   --method bfn \
   --policy-hz 10 \
   --robot-hz 30
