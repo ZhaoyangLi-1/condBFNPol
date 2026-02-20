@@ -45,7 +45,7 @@ RUN pip install --upgrade pip && \
     pip install -r requirements.txt
 
 # set python path
-ENV PYTHONPATH="/workspace/condBFNPol/src/diffusion-policy:/workspace/condBFNPol:${PYTHONPATH}"
+ENV PYTHONPATH=/workspace/condBFNPol/src/diffusion-policy:/workspace/condBFNPol:$PYTHONPATH
 ENV MUJOCO_GL=egl
 ENV PYOPENGL_PLATFORM=egl
 
