@@ -7,7 +7,26 @@ This script is intentionally minimal and conservative:
 - Runs WidowX rollout with bridge_data_robot-compatible relative actions.
 
 Typical usage:
-python scripts/eval/eval_widowx.py --checkpoint /path/to/checkpoint.ckpt
+python scripts/eval/eval_widowx.py \
+  --checkpoint /data/BFN_data/checkpoints/diffusion_pusht_real.ckpt \
+  --method diffusion \
+  --policy-hz 10 \
+  --robot-hz 10 \
+  --move-duration 0.2 \
+  --act-exec-horizon 1 \
+  --initial-eep 0.3 0.0 0.15 \
+  --blocking
+
+python scripts/eval/eval_widowx.py \
+  --checkpoint /data/BFN_data/checkpoints/bfn_pusht_real.ckpt \
+  --method bfn \
+  --policy-hz 10 \
+  --robot-hz 10 \
+  --move-duration 0.2 \
+  --act-exec-horizon 1 \
+  --initial-eep 0.3 0.0 0.15 \
+  --blocking
+
 """
 
 from __future__ import annotations
@@ -76,9 +95,9 @@ WIDOWX_DEFAULT_ROTATION = np.array(
     [[0.0, 0.0, 1.0], [0.0, 1.0, 0.0], [-1.0, 0.0, 0.0]], dtype=np.float64
 )
 
-# Keep rollout conservative and aligned with 10Hz preprocessed dataset.
-STEP_DURATION = 0.1
-MOVE_DURATION = 0.1
+# Keep startup behavior close to example_widowx.py defaults.
+STEP_DURATION = 0.2
+MOVE_DURATION = 0.2
 ACT_EXEC_HORIZON = 1
 RPC_TIMEOUT_MS = 8000
 STARTUP_TIMEOUT = 180.0
@@ -158,6 +177,20 @@ def _set_widowx_rpc_timeout_ms(widowx_client: Any, timeout_ms: int) -> bool:
         return False
 
 
+def _state_to_eep_transform(xyz_coor: List[float], zangle: float = 0.0) -> np.ndarray:
+    """Mirror example_widowx.py state_to_eep() for move() initialization."""
+    xyz = np.asarray(xyz_coor, dtype=np.float64).reshape(-1)
+    if xyz.shape[0] != 3:
+        raise ValueError(f"Expected xyz length 3, got {xyz.shape}")
+    tf = np.eye(4, dtype=np.float64)
+    tf[:3, 3] = xyz
+    if SciRotation is None:
+        raise RuntimeError("scipy is required for state_to_eep transform conversion.")
+    rz = SciRotation.from_euler("z", float(zangle)).as_matrix()
+    tf[:3, :3] = rz.dot(WIDOWX_DEFAULT_ROTATION)
+    return tf
+
+
 def _move_to_neutral(
     widowx_client: Any,
     initial_eep: List[float],
@@ -165,35 +198,53 @@ def _move_to_neutral(
     retries: int = 1,
     retry_interval_s: float = 0.5,
 ) -> None:
-    neutral_pose = np.asarray(list(initial_eep) + [0.0, 0.0, 0.0], dtype=np.float32)
+    neutral_tf = _state_to_eep_transform(initial_eep, zangle=0.0)
     errors: List[str] = []
     for attempt in range(1, max(1, int(retries)) + 1):
-        for name, fn in (
-            # Prefer explicit neutral/move path. reset() in widowx_env_service may jump to start_state.
-            ("go_to_neutral", lambda: getattr(widowx_client, "go_to_neutral", None)),
-            ("move", lambda: getattr(widowx_client, "move", None)),
-            ("reset", lambda: getattr(widowx_client, "reset", None)),
-        ):
-            method = fn()
-            if not callable(method):
-                continue
-            try:
-                if name == "move":
-                    status = method(neutral_pose, duration=1.0, blocking=blocking)
-                else:
-                    status = method()
+        try:
+            # Keep parity with example_widowx.py startup:
+            # reset -> open gripper -> move(state_to_eep(initial_eep, 0), duration=1.5)
+            reset_fn = getattr(widowx_client, "reset", None)
+            if callable(reset_fn):
+                status = reset_fn()
+                if not _status_is_success(status):
+                    errors.append(f"reset returned non-success status {status!r}")
+                    raise RuntimeError("reset failed")
+                time.sleep(2.5)
+
+            move_gripper_fn = getattr(widowx_client, "move_gripper", None)
+            if callable(move_gripper_fn):
+                move_gripper_fn(1.0)
+
+            move_fn = getattr(widowx_client, "move", None)
+            if callable(move_fn):
+                status = move_fn(neutral_tf, duration=1.5, blocking=blocking)
                 if _status_is_success(status):
                     return
-                errors.append(f"{name} returned non-success status {status!r}")
+                errors.append(f"move returned non-success status {status!r}")
+            else:
+                errors.append("move() is not available on WidowXClient")
+        except Exception as e:
+            errors.append(f"startup neutral sequence failed with {type(e).__name__}: {e}")
+
+        # Compatibility fallback for variants exposing go_to_neutral only.
+        go_to_neutral_fn = getattr(widowx_client, "go_to_neutral", None)
+        if callable(go_to_neutral_fn):
+            try:
+                status = go_to_neutral_fn()
+                if _status_is_success(status):
+                    return
+                errors.append(f"go_to_neutral returned non-success status {status!r}")
             except Exception as e:
-                errors.append(f"{name} failed with {type(e).__name__}: {e}")
+                errors.append(f"go_to_neutral failed with {type(e).__name__}: {e}")
+
         if attempt < retries:
             if attempt == 1 or attempt % 5 == 0:
                 print(f"[INFO] Waiting for WidowX neutral/reset to become available (attempt {attempt}/{retries})...")
             time.sleep(max(0.01, float(retry_interval_s)))
 
     if not errors:
-        raise AttributeError("WidowXClient does not support reset(), go_to_neutral(), or move().")
+        raise AttributeError("WidowXClient does not support reset()/move()/go_to_neutral().")
     raise RuntimeError(
         "Failed to move to neutral after retries. "
         f"Last error: {errors[-1]}"
@@ -551,6 +602,26 @@ def _infer_action_space(action7: np.ndarray) -> str:
     return "relative" if is_relative else "absolute"
 
 
+def _infer_action_space_from_policy(policy: Any) -> Optional[str]:
+    """Infer action representation from normalizer stats when available."""
+    try:
+        stats = policy.normalizer["action"].get_input_stats()
+        amin = np.asarray(stats["min"].detach().cpu().numpy(), dtype=np.float32).reshape(-1)
+        amax = np.asarray(stats["max"].detach().cpu().numpy(), dtype=np.float32).reshape(-1)
+        if amin.shape[0] < 6 or amax.shape[0] < 6:
+            return None
+        # Relative WidowX deltas are typically bounded to ~0.05m / 0.25rad.
+        rel_like = (
+            np.max(np.abs(amin[:3])) <= 0.12
+            and np.max(np.abs(amax[:3])) <= 0.12
+            and np.max(np.abs(amin[3:6])) <= 0.6
+            and np.max(np.abs(amax[3:6])) <= 0.6
+        )
+        return "relative" if rel_like else "absolute"
+    except Exception:
+        return None
+
+
 def _absolute_action_to_relative(
     target_action7: np.ndarray,
     current_pose6_rotvec: np.ndarray,
@@ -586,6 +657,33 @@ def _clip_relative_action(action7: np.ndarray) -> np.ndarray:
     if a.shape[0] != 7:
         raise ValueError(f"Expected 7D action, got {a.shape}")
     return np.clip(a, REL_ACTION_LOW, REL_ACTION_HIGH).astype(np.float32)
+
+
+def _absolute_action_to_relative_from_target_tf(
+    target_action7: np.ndarray,
+    current_target_tf: np.ndarray,
+) -> np.ndarray:
+    target = np.asarray(target_action7, dtype=np.float64).reshape(-1)
+    if target.shape[0] != 7:
+        raise ValueError(f"Expected target action shape (7,), got {target.shape}")
+    tf_target = _pose_rotvec6_to_transform(target[:6])
+    tf_delta = tf_target.dot(np.linalg.inv(current_target_tf))
+    if wx_tr is not None:
+        rel = wx_tr.transform2action_local(
+            tf_delta,
+            np.array([target[6]], dtype=np.float64),
+            current_target_tf[:3, 3],
+        )
+        return np.asarray(rel, dtype=np.float32).reshape(-1)
+
+    # Fallback if bridge transformation utils are unavailable.
+    if SciRotation is None:
+        raise RuntimeError("Cannot convert absolute->relative action without scipy or widowx transform utils.")
+    curr_pose = np.concatenate(
+        [current_target_tf[:3, 3], SciRotation.from_matrix(current_target_tf[:3, :3]).as_rotvec()],
+        axis=0,
+    )
+    return _absolute_action_to_relative(target_action7=target, current_pose6_rotvec=curr_pose)
 
 
 def _stack_obs_history(history: deque, keys: List[str]) -> Dict[str, np.ndarray]:
@@ -650,6 +748,8 @@ def _print_runtime_config(
     benchmark_cfg_path: Path,
     cfg: Any,
     ckpt_path: Path,
+    policy_hz: float,
+    robot_hz: float,
     step_duration: float,
     move_duration: float,
 ):
@@ -666,6 +766,8 @@ def _print_runtime_config(
     print(f"image_shape (C,H,W)  : {image_shape}")
     print(f"crop_shape (H,W)     : {crop_shape}")
     print(f"action_dim           : {int(cfg.shape_meta.action.shape[0])}")
+    print(f"policy_hz            : {policy_hz:.3f}")
+    print(f"robot_hz             : {robot_hz:.3f}")
     print(f"control_step_duration: {step_duration:.3f}")
     print(f"env move_duration    : {move_duration:.3f}")
     print("=" * 80)
@@ -686,9 +788,17 @@ def main():
     parser.add_argument(
         "--camera-topics",
         type=str,
-        default="/blue/image_raw,/D435/color/image_raw",
+        default="/D435/color/image_raw,/blue/image_raw",
         help="Comma-separated ROS camera topics.",
     )
+    parser.add_argument("--policy-hz", type=float, default=10.0, help="Policy control frequency (Hz).")
+    parser.add_argument("--robot-hz", type=float, default=10.0, help="Robot control frequency (Hz).")
+    parser.add_argument("--move-duration", type=float, default=MOVE_DURATION, help="WidowX move duration for each command.")
+    parser.add_argument("--act-exec-horizon", type=int, default=1, help="Number of predicted actions to execute per inference.")
+    parser.add_argument("--gripper-value", type=float, default=None, help="If set, override action gripper command in [0,1].")
+    parser.add_argument("--no-pitch-roll", action="store_true", help="Zero pitch/roll relative commands.")
+    parser.add_argument("--no-yaw", action="store_true", help="Zero yaw relative commands.")
+    parser.add_argument("--blocking", action="store_true", help="Compatibility flag; step commands are blocking in this runner.")
     parser.add_argument("--num-timesteps", type=int, default=120)
     parser.add_argument("--show-image", action="store_true")
     parser.add_argument("--video-save-path", type=str, default=None)
@@ -699,8 +809,23 @@ def main():
         print("[WARN] cv2 is not installed, disabling --show-image.")
         args.show_image = False
 
-    step_duration = float(STEP_DURATION)
-    move_duration = float(MOVE_DURATION)
+    if args.policy_hz <= 0.0:
+        raise ValueError(f"--policy-hz must be > 0, got {args.policy_hz}")
+    if args.robot_hz <= 0.0:
+        raise ValueError(f"--robot-hz must be > 0, got {args.robot_hz}")
+    if args.robot_hz + 1e-6 < args.policy_hz:
+        raise ValueError(f"--robot-hz ({args.robot_hz}) must be >= --policy-hz ({args.policy_hz})")
+    ratio = args.robot_hz / args.policy_hz
+    if abs(ratio - round(ratio)) > 1e-4:
+        raise ValueError(
+            f"--robot-hz/--policy-hz must be integer multiple, got {ratio:.6f} "
+            f"({args.robot_hz}/{args.policy_hz})"
+        )
+
+    step_duration = 1.0 / float(args.policy_hz)
+    move_duration = float(args.move_duration)
+    if move_duration <= 0.0:
+        raise ValueError(f"--move-duration must be > 0, got {move_duration}")
 
     device = _prep_device("cuda")
     ckpt_path = _resolve_checkpoint(args.checkpoint)
@@ -734,6 +859,8 @@ def main():
         benchmark_cfg_path=benchmark_cfg_path,
         cfg=benchmark_cfg,
         ckpt_path=ckpt_path,
+        policy_hz=float(args.policy_hz),
+        robot_hz=float(args.robot_hz),
         step_duration=step_duration,
         move_duration=move_duration,
     )
@@ -747,7 +874,9 @@ def main():
             f"Policy n_action_steps={policy.n_action_steps} != benchmark n_action_steps={n_action_steps}"
         )
 
-    act_exec_horizon = min(ACT_EXEC_HORIZON, n_action_steps)
+    if args.act_exec_horizon <= 0:
+        raise ValueError(f"--act-exec-horizon must be >= 1, got {args.act_exec_horizon}")
+    act_exec_horizon = min(int(args.act_exec_horizon), n_action_steps)
     obs_meta = benchmark_cfg.shape_meta.obs
     rgb_keys = [k for k, v in obs_meta.items() if v.get("type", "low_dim") == "rgb"]
     lowdim_keys = [k for k, v in obs_meta.items() if v.get("type", "low_dim") == "low_dim"]
@@ -774,8 +903,7 @@ def main():
         }
     )
     start_state = list(np.concatenate([np.asarray(args.initial_eep, dtype=np.float32), [0, 0, 0, 1]]))
-    env_params["start_state"] = start_state
-    # example_widowx.py writes this legacy key; keep both for compatibility.
+    # Keep init payload parity with example_widowx.py.
     env_params["state_state"] = start_state
 
     widowx_client = WidowXClient(host=args.ip, port=args.port)
@@ -798,8 +926,12 @@ def main():
     warned_missing = set()
     saved_frames: List[np.ndarray] = []
     reset_requested = False
-    action_space_mode: Optional[str] = None
+    action_space_mode: Optional[str] = _infer_action_space_from_policy(policy)
+    if action_space_mode is not None:
+        print(f"[INFO] Inferred model action space from normalizer stats: {action_space_mode}.")
     warned_missing_pose = False
+    target_tf_tracker: Optional[np.ndarray] = None
+    warned_tracker_resync = False
 
     def _read_obs_retry() -> Dict[str, Any]:
         while True:
@@ -894,6 +1026,20 @@ def main():
                 action_seq = action_seq[None]
 
             curr_pose = _extract_current_pose_rotvec_from_obs(raw_obs)
+            obs_tf = None
+            if curr_pose is not None:
+                obs_tf = _pose_rotvec6_to_transform(curr_pose)
+                if target_tf_tracker is None:
+                    target_tf_tracker = obs_tf.copy()
+                else:
+                    drift = float(np.linalg.norm(target_tf_tracker[:3, 3] - obs_tf[:3, 3]))
+                    if drift > 0.05:
+                        if not warned_tracker_resync:
+                            print(
+                                f"[WARN] Target tracker drift {drift:.3f}m vs observation; resyncing tracker to obs pose."
+                            )
+                            warned_tracker_resync = True
+                        target_tf_tracker = obs_tf.copy()
             exec_steps = min(act_exec_horizon, action_seq.shape[0], args.num_timesteps - t)
             for i in range(exec_steps):
                 model_action = np.asarray(action_seq[i], dtype=np.float32).reshape(-1)
@@ -907,16 +1053,27 @@ def main():
                     print(f"[INFO] Inferred model action space: {action_space_mode}.")
 
                 if action_space_mode == "absolute":
-                    if curr_pose is None:
+                    if target_tf_tracker is not None:
+                        rel_action = _absolute_action_to_relative_from_target_tf(model_action, target_tf_tracker)
+                        target_tf_tracker = _pose_rotvec6_to_transform(model_action[:6])
+                    elif curr_pose is not None:
+                        rel_action = _absolute_action_to_relative(model_action, curr_pose)
+                        target_tf_tracker = _pose_rotvec6_to_transform(model_action[:6])
+                    else:
                         if not warned_missing_pose:
                             print("[WARN] Missing current pose in observation; falling back to direct step_action.")
                             warned_missing_pose = True
                         rel_action = model_action.copy()
-                    else:
-                        rel_action = _absolute_action_to_relative(model_action, curr_pose)
-                        curr_pose = model_action[:6].copy()
                 else:
                     rel_action = model_action.copy()
+
+                if args.gripper_value is not None:
+                    rel_action[6] = float(np.clip(args.gripper_value, 0.0, 1.0))
+                if args.no_pitch_roll:
+                    rel_action[3] = 0.0
+                    rel_action[4] = 0.0
+                if args.no_yaw:
+                    rel_action[5] = 0.0
 
                 rel_action = _clip_relative_action(rel_action)
                 widowx_client.step_action(rel_action, blocking=True)

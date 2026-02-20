@@ -263,14 +263,21 @@ def get_gripper_from_policy_out(policy_out, target_len: int) -> np.ndarray | Non
     return None
 
 
-def extract_action(policy_out, obs: dict, target_len: int, default_gripper: float = DEFAULT_GRIPPER_OPEN) -> np.ndarray:
+def extract_action(
+    policy_out,
+    obs: dict,
+    target_len: int,
+    default_gripper: float = DEFAULT_GRIPPER_OPEN,
+    arm_action_source: str = "auto",
+) -> np.ndarray:
     """
     Build action array of shape (target_len, 7):
       [x, y, z, rotvec(3), gripper]
 
     Arm part:
-      - Prefer new_robot_transform if available -> 6D pose via transform_to_pose
-      - Otherwise use policy_out["actions"][:6]
+      - arm_action_source='relative': use policy_out["actions"][:6]
+      - arm_action_source='absolute': use policy_out["new_robot_transform"] -> 6D pose
+      - arm_action_source='auto': prefer relative deltas when they look like bridge step_action.
 
     Gripper part:
       - Prefer policy_out gripper (if available)
@@ -278,18 +285,46 @@ def extract_action(policy_out, obs: dict, target_len: int, default_gripper: floa
       - Else default open (broadcast)
     """
     # -------- arm (6d) --------
+    if arm_action_source not in {"auto", "relative", "absolute"}:
+        raise ValueError(f"Unsupported arm_action_source: {arm_action_source}")
+
     if policy_out is None:
         arm6 = np.zeros((target_len, 6), dtype=np.float64)
     else:
         if isinstance(policy_out, list) and len(policy_out) > 0:
             sample = policy_out[0]
-            if isinstance(sample, dict) and "new_robot_transform" in sample:
+            if not isinstance(sample, dict):
+                raise ValueError("policy_out format not recognized")
+
+            has_actions = "actions" in sample
+            has_tf = "new_robot_transform" in sample
+
+            if arm_action_source == "relative":
+                if not has_actions:
+                    raise ValueError("arm_action_source='relative' but policy_out has no 'actions' key")
+                arm6 = np.stack([np.asarray(p["actions"])[:6] for p in policy_out], axis=0)
+            elif arm_action_source == "absolute":
+                if not has_tf:
+                    raise ValueError("arm_action_source='absolute' but policy_out has no 'new_robot_transform' key")
                 Ts = np.stack([p["new_robot_transform"] for p in policy_out], axis=0)
                 arm6 = transform_to_pose(Ts)
-            elif isinstance(sample, dict) and "actions" in sample:
-                arm6 = np.stack([np.asarray(p["actions"])[:6] for p in policy_out], axis=0)
             else:
-                raise ValueError("policy_out format not recognized")
+                if has_actions:
+                    rel6 = np.stack([np.asarray(p["actions"])[:6] for p in policy_out], axis=0)
+                    rel_like = (
+                        np.max(np.abs(rel6[:, :3])) <= 0.12
+                        and np.max(np.abs(rel6[:, 3:6])) <= 0.6
+                    )
+                    if rel_like or not has_tf:
+                        arm6 = rel6
+                    else:
+                        Ts = np.stack([p["new_robot_transform"] for p in policy_out], axis=0)
+                        arm6 = transform_to_pose(Ts)
+                elif has_tf:
+                    Ts = np.stack([p["new_robot_transform"] for p in policy_out], axis=0)
+                    arm6 = transform_to_pose(Ts)
+                else:
+                    raise ValueError("policy_out format not recognized")
         else:
             raise ValueError("policy_out format not recognized")
 
@@ -593,10 +628,22 @@ def main() -> None:
         default=DEFAULT_GRIPPER_OPEN,
         help="Default gripper command used when unavailable in policy_out/obs (Option A).",
     )
+    parser.add_argument(
+        "--arm-action-source",
+        type=str,
+        default="auto",
+        choices=["auto", "relative", "absolute"],
+        help=(
+            "How to construct the 6D arm action from policy_out. "
+            "'relative' matches widowx step_action deltas; "
+            "'absolute' uses new_robot_transform poses."
+        ),
+    )
 
     args = parser.parse_args()
     if args.downsample < 1:
         raise ValueError("--downsample must be >= 1")
+    print(f"Arm action source: {args.arm_action_source}")
 
     reference_spec = None
     if not args.no_reference:
@@ -731,6 +778,7 @@ def main() -> None:
             obs=obs,
             target_len=len(timestamps_full),
             default_gripper=float(args.default_gripper_open),
+            arm_action_source=str(args.arm_action_source),
         )
 
         if args.target_hz is not None:
