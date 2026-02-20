@@ -14,9 +14,10 @@ python scripts/eval/eval_widowx.py \
   --method diffusion \
   --policy-hz 10 \
   --robot-hz 10 \
-  --move-duration 0.1 \
-  --blocking \
-  --act-exec-horizon 1
+  --move-duration 0.25 \
+  --no-yaw \
+  --act-exec-horizon 1 \
+  --blocking
 
 # bfn
 python scripts/eval/eval_widowx.py \
@@ -24,9 +25,10 @@ python scripts/eval/eval_widowx.py \
   --method bfn \
   --policy-hz 10 \
   --robot-hz 10 \
-  --move-duration 0.1 \
-  --blocking \
-  --act-exec-horizon 1
+  --move-duration 0.25 \
+  --no-yaw \
+  --act-exec-horizon 1 \
+  --blocking
 """
 
 from __future__ import annotations
@@ -594,7 +596,12 @@ def main():
     # WidowX runtime
     parser.add_argument("--ip", type=str, default="localhost")
     parser.add_argument("--port", type=int, default=5556)
-    parser.add_argument("--camera-topics", type=str, default="/blue/image_raw", help="Comma-separated ROS camera topics.")
+    parser.add_argument(
+        "--camera-topics",
+        type=str,
+        default="/blue/image_raw,/D435/color/image_raw",
+        help="Comma-separated ROS camera topics.",
+    )
     parser.add_argument("--client-image-size", type=int, default=None, help="Optional WidowX image_size init arg; used as flat image reshape hint.")
     parser.add_argument(
         "--step-duration",
