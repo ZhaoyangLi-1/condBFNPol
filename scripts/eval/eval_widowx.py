@@ -13,14 +13,20 @@ python scripts/eval/eval_widowx.py \
   --checkpoint /data/BFN_data/checkpoints/diffusion_pusht_real.ckpt \
   --method diffusion \
   --policy-hz 10 \
-  --robot-hz 30
+  --robot-hz 10 \
+  --move-duration 0.1 \
+  --blocking \
+  --act-exec-horizon 1
 
 # bfn
 python scripts/eval/eval_widowx.py \
   --checkpoint /data/BFN_data/checkpoints/bfn_pusht_real.ckpt \
   --method bfn \
   --policy-hz 10 \
-  --robot-hz 30
+  --robot-hz 10 \
+  --move-duration 0.1 \
+  --blocking \
+  --act-exec-horizon 1
 """
 
 from __future__ import annotations
