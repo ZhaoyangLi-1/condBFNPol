@@ -15,17 +15,29 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ninja-build \
     git \
     git-lfs \
+    wget \
     ffmpeg \
+    python3-opencv \
     libglib2.0-0 \
     libgl1 \
+    libgl1-mesa-glx \
+    libglvnd-dev \
     libegl1 \
     libglfw3 \
+    libosmesa6 \
+    libosmesa6-dev \
+    libglew2.2 \
+    libglew-dev \
     libsm6 \
     libxext6 \
     libxrender1 \
-    libosmesa6 \
-    libglew2.2 \
+    libxrender-dev \
     patchelf \
+    tmux \
+    unzip \
+    zip \
+    bzip2 \
+    vim \
     && rm -rf /var/lib/apt/lists/*
 
 RUN ln -sf /usr/bin/python3 /usr/bin/python && ln -sf /usr/bin/pip3 /usr/bin/pip
@@ -34,28 +46,29 @@ RUN git lfs install --system
 RUN python -m venv /opt/venv
 ENV PATH="/opt/venv/bin:${PATH}"
 
-WORKDIR /workspace/condBFNPol
+WORKDIR /workspace
 
-# Install heavy deps first to improve layer reuse.
+# Upgrade pip tools
 RUN pip install --upgrade pip setuptools wheel
+
+# Install PyTorch (CUDA 12.1)
 RUN pip install --index-url https://download.pytorch.org/whl/cu121 \
     torch==2.1.2 torchvision==0.16.2 torchaudio==2.1.2
 
-COPY requirements.txt /tmp/requirements.txt
+# Clone repository
+RUN git clone https://github.com/ZhaoyangLi-1/condBFNPol.git
+
+WORKDIR /workspace/condBFNPol
+
+# Install other dependencies
 RUN sed -E \
     -e '/^torch$/d' \
     -e '/^torchvision==/d' \
     -e '/^torchaudio==/d' \
-    -e '/real-stanford\/diffusion_policy\.git/d' \
-    /tmp/requirements.txt > /tmp/requirements.filtered.txt \
-    && pip install -r /tmp/requirements.filtered.txt
+    requirements.txt > requirements.filtered.txt \
+    && pip install -r requirements.filtered.txt
 
-COPY . /workspace/condBFNPol
-
-# Use the in-repo diffusion-policy source instead of remote editable dependency.
-RUN pip install -e /workspace/condBFNPol/src/diffusion-policy
-
-ENV PYTHONPATH="/workspace/condBFNPol/src/diffusion-policy:/workspace/condBFNPol:${PYTHONPATH}"
+ENV PYTHONPATH="/workspace/condBFNPol/src/diffusion-policy:/workspace/condBFNPol"
 ENV MUJOCO_GL=egl
 ENV PYOPENGL_PLATFORM=egl
 
