@@ -10,14 +10,14 @@ This script:
 
 # diffusion
 python scripts/eval/eval_widowx.py \
-  --checkpoint /data/BFN_data/checkpoints/diffusion_real_pusht.ckpt \
+  --checkpoint /data/BFN_data/checkpoints/diffusion_pusht_real.ckpt \
   --method bfn \
   --policy-hz 10 \
   --robot-hz 30
 
 # bfn
 python scripts/eval/eval_widowx.py \
-  --checkpoint /data/BFN_data/checkpoints/bfn_real_pusht.ckpt \
+  --checkpoint /data/BFN_data/checkpoints/bfn_pusht_real.ckpt \
   --method bfn \
   --policy-hz 10 \
   --robot-hz 30
@@ -320,7 +320,7 @@ def _load_policy_from_benchmark(
     OmegaConf.resolve(cfg.policy)
 
     policy = hydra.utils.instantiate(cfg.policy)
-    policy.load_state_dict(policy_state, strict=True)
+    policy.load_state_dict(policy_state)
     policy.to(device)
     policy.eval()
 
