@@ -40,9 +40,10 @@ WORKDIR /workspace
 RUN git clone https://github.com/ZhaoyangLi-1/condBFNPol.git
 
 # install requirements
+RUN pip install --upgrade pip uv
+
 WORKDIR /workspace/condBFNPol
-RUN pip install --upgrade pip && \
-    pip install -r requirements.txt
+RUN uv pip install --system -r requirements.txt
 
 # set python path
 ENV PYTHONPATH=/workspace/condBFNPol/src/diffusion-policy:/workspace/condBFNPol:$PYTHONPATH
