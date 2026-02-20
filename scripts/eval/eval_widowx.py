@@ -543,6 +543,7 @@ def _print_runtime_config(
     policy_hz: float,
     robot_hz: float,
     interp_substeps: int,
+    move_duration: float,
 ):
     image_shape = list(cfg.image_shape)
     crop_shape = list(cfg.crop_shape)
@@ -560,6 +561,7 @@ def _print_runtime_config(
     print(f"policy_hz            : {policy_hz:.3f}")
     print(f"robot_hz             : {robot_hz:.3f}")
     print(f"interp_substeps      : {interp_substeps}")
+    print(f"env move_duration    : {move_duration:.3f}")
     print("=" * 80)
 
 
@@ -600,6 +602,15 @@ def main():
         type=float,
         default=30.0,
         help="Robot execution rate after interpolation (must be integer multiple of --policy-hz).",
+    )
+    parser.add_argument(
+        "--move-duration",
+        type=float,
+        default=None,
+        help=(
+            "WidowX move duration (seconds) used by step_action. "
+            "Default: 1/--robot-hz."
+        ),
     )
     parser.add_argument("--num-timesteps", type=int, default=120)
     parser.add_argument("--act-exec-horizon", type=int, default=None, help="How many predicted actions to execute per inference. Default: benchmark n_action_steps.")
@@ -653,12 +664,30 @@ def main():
 
     # Infer policy method from checkpoint config if needed.
     payload_cfg = payload.get("cfg", None)
+    payload_method = _infer_method_from_cfg(payload_cfg)
     method = args.method
     if method == "auto":
-        inferred = _infer_method_from_cfg(payload_cfg)
-        if inferred is None:
+        if payload_method is None:
             raise RuntimeError("Cannot infer --method from checkpoint cfg. Please pass --method bfn|diffusion.")
-        method = inferred
+        method = payload_method
+    elif payload_method is not None and method != payload_method:
+        raise ValueError(
+            f"Checkpoint appears to be '{payload_method}' but --method was '{method}'. "
+            "Use --method auto or match the checkpoint type."
+        )
+
+    move_duration = robot_step_duration if args.move_duration is None else float(args.move_duration)
+    if move_duration <= 0.0:
+        raise ValueError(f"--move-duration must be > 0, got {move_duration}")
+    if move_duration < 0.1:
+        print(
+            f"[WARN] Very small move_duration={move_duration:.3f}s; this can cause fast/jerky motion and IK failures."
+        )
+    if not args.blocking and move_duration > robot_step_duration + 1e-6:
+        print(
+            "[WARN] --move-duration is larger than command period (1/--robot-hz) with non-blocking control. "
+            "Commands may overlap; consider --blocking or lowering --robot-hz."
+        )
 
     benchmark_cfg_path = _get_benchmark_cfg_path(method=method, override_path=args.benchmark_config)
     policy_state = _select_policy_state_dict(payload, prefer_ema=args.use_ema)
@@ -678,6 +707,7 @@ def main():
         policy_hz=policy_hz,
         robot_hz=robot_hz,
         interp_substeps=interp_substeps,
+        move_duration=move_duration,
     )
 
     # Benchmark-aligned hyperparameters.
@@ -706,7 +736,7 @@ def main():
         {
             "camera_topics": [{"name": t} for t in topics],
             "override_workspace_boundaries": DEFAULT_WORKSPACE_BOUNDS,
-            "move_duration": float(robot_step_duration),
+            "move_duration": float(move_duration),
         }
     )
     env_params["start_state"] = list(np.concatenate([np.asarray(args.initial_eep, dtype=np.float32), [0, 0, 0, 1]]))
