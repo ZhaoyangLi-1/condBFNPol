@@ -13,16 +13,16 @@ python scripts/eval/eval_widowx.py \
   --method auto \
   --config-source checkpoint \
   --camera-topics /D435/color/image_raw,/blue/image_raw \
-  --num-timesteps 3000 \
-  --non-blocking-rollout
+  --policy-hz 10 --robot-hz 30 \
+  --num-timesteps 3000
   
 python scripts/eval/eval_widowx.py \
   --checkpoint /data/BFN_data/checkpoints/bfn_pusht_real.ckpt \
   --method auto \
   --config-source checkpoint \
   --camera-topics /D435/color/image_raw,/blue/image_raw \
-  --num-timesteps 3000 \
-  --non-blocking-rollout
+  --policy-hz 10 --robot-hz 30 \
+  --num-timesteps 3000
 """
 
 from __future__ import annotations
@@ -769,7 +769,9 @@ def _print_runtime_config(
     ckpt_path: Path,
     policy_hz: float,
     robot_hz: float,
-    step_duration: float,
+    policy_step_duration: float,
+    robot_step_duration: float,
+    interp_substeps: int,
     move_duration: float,
     rollout_blocking: bool,
 ):
@@ -788,7 +790,9 @@ def _print_runtime_config(
     print(f"action_dim           : {int(cfg.shape_meta.action.shape[0])}")
     print(f"policy_hz            : {policy_hz:.3f}")
     print(f"robot_hz             : {robot_hz:.3f}")
-    print(f"control_step_duration: {step_duration:.3f}")
+    print(f"policy_step_duration : {policy_step_duration:.3f}")
+    print(f"robot_step_duration  : {robot_step_duration:.3f}")
+    print(f"interp_substeps      : {interp_substeps}")
     print(f"env move_duration    : {move_duration:.3f}")
     print(f"rollout blocking     : {rollout_blocking}")
     print("=" * 80)
@@ -871,20 +875,13 @@ def main():
         print("[WARN] cv2 is not installed, disabling --show-image.")
         args.show_image = False
 
-    if args.policy_hz <= 0.0:
-        raise ValueError(f"--policy-hz must be > 0, got {args.policy_hz}")
-    if args.robot_hz <= 0.0:
-        raise ValueError(f"--robot-hz must be > 0, got {args.robot_hz}")
-    if args.robot_hz + 1e-6 < args.policy_hz:
-        raise ValueError(f"--robot-hz ({args.robot_hz}) must be >= --policy-hz ({args.policy_hz})")
-    ratio = args.robot_hz / args.policy_hz
-    if abs(ratio - round(ratio)) > 1e-4:
-        raise ValueError(
-            f"--robot-hz/--policy-hz must be integer multiple, got {ratio:.6f} "
-            f"({args.robot_hz}/{args.policy_hz})"
-        )
-
-    step_duration = 1.0 / float(args.policy_hz)
+    policy_hz, robot_hz, interp_substeps = _resolve_control_frequencies(
+        step_duration_s=None,
+        policy_hz=float(args.policy_hz),
+        robot_hz=float(args.robot_hz),
+    )
+    step_duration = 1.0 / policy_hz
+    robot_step_duration = 1.0 / robot_hz
     move_duration = float(args.move_duration)
     rollout_blocking = not bool(args.non_blocking_rollout)
     if move_duration <= 0.0:
@@ -950,9 +947,11 @@ def main():
         cfg_source=cfg_source,
         cfg=eval_cfg,
         ckpt_path=ckpt_path,
-        policy_hz=float(args.policy_hz),
-        robot_hz=float(args.robot_hz),
-        step_duration=step_duration,
+        policy_hz=policy_hz,
+        robot_hz=robot_hz,
+        policy_step_duration=step_duration,
+        robot_step_duration=robot_step_duration,
+        interp_substeps=interp_substeps,
         move_duration=move_duration,
         rollout_blocking=rollout_blocking,
     )
@@ -1064,13 +1063,9 @@ def main():
         input("Press [Enter] to start real-robot evaluation...")
 
         t = 0
-        last_tstep = time.time() - step_duration
+        next_robot_tstep = time.time()
+        last_policy_rel_action: Optional[np.ndarray] = None
         while t < args.num_timesteps:
-            now = time.time()
-            if now < last_tstep + step_duration:
-                time.sleep(0.001)
-                continue
-
             raw_obs = _read_obs_retry()
 
             if args.show_image:
@@ -1160,10 +1155,21 @@ def main():
                     rel_action[5] = 0.0
 
                 rel_action = _clip_relative_action(rel_action)
-                if action_space_mode == "absolute" and curr_pose_exec is not None:
-                    curr_pose_exec = _apply_relative_action_to_pose(curr_pose_exec, rel_action)
-                widowx_client.step_action(rel_action, blocking=rollout_blocking)
-                last_tstep = time.time()
+                interp_start = rel_action if last_policy_rel_action is None else last_policy_rel_action
+                interp_actions = _interpolate_actions(interp_start, rel_action, interp_substeps)
+                # Keep gripper command stable while interpolating arm deltas.
+                interp_actions[:, 6] = rel_action[6]
+
+                for sub_action in interp_actions:
+                    now = time.time()
+                    if now < next_robot_tstep:
+                        time.sleep(next_robot_tstep - now)
+                    sub_rel_action = _clip_relative_action(np.asarray(sub_action, dtype=np.float32))
+                    widowx_client.step_action(sub_rel_action, blocking=rollout_blocking)
+                    if action_space_mode == "absolute" and curr_pose_exec is not None:
+                        curr_pose_exec = _apply_relative_action_to_pose(curr_pose_exec, sub_rel_action)
+                    next_robot_tstep = max(next_robot_tstep + robot_step_duration, time.time())
+                last_policy_rel_action = rel_action.copy()
 
                 cam0 = step_obs[rgb_keys[0]]
                 frame = np.moveaxis(cam0, 0, -1)
