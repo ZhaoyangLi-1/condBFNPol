@@ -13,18 +13,22 @@ python scripts/eval/eval_widowx.py \
   --method auto \
   --config-source checkpoint \
   --camera-topics /D435/color/image_raw,/blue/image_raw \
-  --policy-hz 10 --robot-hz 30 \
+  --policy-hz 10 --robot-hz 20 \
   --num-timesteps 3000 \
-  --non-blocking-rollout
+  --non-blocking-rollout \
+  --show-image \
+  --video-save-path /data/BFN_data/diffusion_results
   
 python scripts/eval/eval_widowx.py \
   --checkpoint /data/BFN_data/checkpoints/bfn_pusht_real.ckpt \
   --method auto \
   --config-source checkpoint \
   --camera-topics /D435/color/image_raw,/blue/image_raw \
-  --policy-hz 10 --robot-hz 30 \
+  --policy-hz 10 --robot-hz 20 \
   --num-timesteps 3000 \
-  --non-blocking-rollout
+  --non-blocking-rollout \
+  --show-image \
+  --video-save-path /data/BFN_data/bfn_results
 """
 
 from __future__ import annotations
@@ -747,21 +751,28 @@ def _resolve_control_frequencies(
     return policy_hz, robot_hz, interp_substeps
 
 
-def _interpolate_actions(
-    start_action: np.ndarray,
-    end_action: np.ndarray,
+def _split_relative_action(
+    rel_action: np.ndarray,
     substeps: int,
 ) -> np.ndarray:
-    start = np.asarray(start_action, dtype=np.float32).reshape(-1)
-    end = np.asarray(end_action, dtype=np.float32).reshape(-1)
-    if start.shape != end.shape:
-        raise ValueError(f"Action shape mismatch for interpolation: {start.shape} vs {end.shape}")
-    if substeps <= 1:
-        return end[None, :]
+    """
+    Split one relative 7D command into `substeps` micro-commands.
 
-    # Exclude alpha=0 so we don't resend the previous command.
-    alphas = np.linspace(0.0, 1.0, num=substeps + 1, dtype=np.float32)[1:]
-    return start[None, :] + (end - start)[None, :] * alphas[:, None]
+    `step_action` consumes relative deltas, so when robot_hz > policy_hz we
+    divide xyz/rot deltas across substeps to preserve the total commanded delta
+    for each policy step.
+    """
+    rel = np.asarray(rel_action, dtype=np.float32).reshape(-1)
+    if rel.shape != (7,):
+        raise ValueError(f"Expected 7D relative action, got {rel.shape}")
+    if substeps <= 1:
+        return rel[None, :]
+
+    out = np.repeat(rel[None, :], substeps, axis=0)
+    out[:, :6] = out[:, :6] / float(substeps)
+    # Gripper command is absolute in [0,1], keep it unchanged.
+    out[:, 6] = rel[6]
+    return out
 
 
 def _print_runtime_config(
@@ -997,7 +1008,7 @@ def main():
     )
     start_state = list(np.concatenate([np.asarray(args.initial_eep, dtype=np.float32), [0, 0, 0, 1]]))
     # Keep init payload parity with example_widowx.py.
-    env_params["state_state"] = start_state
+    env_params["start_state"] = start_state
 
     widowx_client = WidowXClient(host=args.ip, port=args.port)
     if _set_widowx_rpc_timeout_ms(widowx_client, RPC_TIMEOUT_MS):
@@ -1066,7 +1077,7 @@ def main():
 
         t = 0
         next_robot_tstep = time.time()
-        last_policy_rel_action: Optional[np.ndarray] = None
+        step_action_failures = 0
         while t < args.num_timesteps:
             raw_obs = _read_obs_retry()
 
@@ -1157,21 +1168,24 @@ def main():
                     rel_action[5] = 0.0
 
                 rel_action = _clip_relative_action(rel_action)
-                interp_start = rel_action if last_policy_rel_action is None else last_policy_rel_action
-                interp_actions = _interpolate_actions(interp_start, rel_action, interp_substeps)
-                # Keep gripper command stable while interpolating arm deltas.
-                interp_actions[:, 6] = rel_action[6]
+                sub_actions = _split_relative_action(rel_action, interp_substeps)
 
-                for sub_action in interp_actions:
+                for sub_action in sub_actions:
                     now = time.time()
                     if now < next_robot_tstep:
                         time.sleep(next_robot_tstep - now)
                     sub_rel_action = _clip_relative_action(np.asarray(sub_action, dtype=np.float32))
-                    widowx_client.step_action(sub_rel_action, blocking=rollout_blocking)
+                    step_status = widowx_client.step_action(sub_rel_action, blocking=rollout_blocking)
+                    if not _status_is_success(step_status):
+                        step_action_failures += 1
+                        if step_action_failures <= 5 or step_action_failures % 20 == 0:
+                            print(
+                                f"[WARN] step_action returned non-success status {step_status!r} "
+                                f"(failures={step_action_failures})."
+                            )
                     if action_space_mode == "absolute" and curr_pose_exec is not None:
                         curr_pose_exec = _apply_relative_action_to_pose(curr_pose_exec, sub_rel_action)
                     next_robot_tstep = max(next_robot_tstep + robot_step_duration, time.time())
-                last_policy_rel_action = rel_action.copy()
 
                 cam0 = step_obs[rgb_keys[0]]
                 frame = np.moveaxis(cam0, 0, -1)
