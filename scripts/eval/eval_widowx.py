@@ -13,14 +13,14 @@ python scripts/eval/eval_widowx.py \
   --method auto \
   --config-source checkpoint \
   --camera-topics /D435/color/image_raw,/blue/image_raw \
-  --num-timesteps 120
+  --num-timesteps 3000
   
 python scripts/eval/eval_widowx.py \
   --checkpoint /data/BFN_data/checkpoints/bfn_pusht_real.ckpt \
   --method auto \
   --config-source checkpoint \
   --camera-topics /D435/color/image_raw,/blue/image_raw \
-  --num-timesteps 120
+  --num-timesteps 3000
 """
 
 from __future__ import annotations
@@ -769,6 +769,7 @@ def _print_runtime_config(
     robot_hz: float,
     step_duration: float,
     move_duration: float,
+    rollout_blocking: bool,
 ):
     image_shape = list(cfg.image_shape)
     crop_shape = list(cfg.crop_shape)
@@ -787,6 +788,7 @@ def _print_runtime_config(
     print(f"robot_hz             : {robot_hz:.3f}")
     print(f"control_step_duration: {step_duration:.3f}")
     print(f"env move_duration    : {move_duration:.3f}")
+    print(f"rollout blocking     : {rollout_blocking}")
     print("=" * 80)
 
 
@@ -823,6 +825,14 @@ def main():
     parser.add_argument("--num-timesteps", type=int, default=120)
     parser.add_argument("--show-image", action="store_true")
     parser.add_argument("--video-save-path", type=str, default=None)
+    parser.add_argument(
+        "--non-blocking-rollout",
+        action="store_true",
+        help=(
+            "Do not block on each step_action command. "
+            "This increases throughput but can reduce motion stability."
+        ),
+    )
     parser.add_argument("--initial-eep", type=float, nargs=3, default=DEFAULT_INITIAL_EEP)
     parser.add_argument(
         "--benchmark-config",
@@ -874,6 +884,7 @@ def main():
 
     step_duration = 1.0 / float(args.policy_hz)
     move_duration = float(args.move_duration)
+    rollout_blocking = not bool(args.non_blocking_rollout)
     if move_duration <= 0.0:
         raise ValueError(f"--move-duration must be > 0, got {move_duration}")
 
@@ -941,6 +952,7 @@ def main():
         robot_hz=float(args.robot_hz),
         step_duration=step_duration,
         move_duration=move_duration,
+        rollout_blocking=rollout_blocking,
     )
 
     n_obs_steps = int(eval_cfg.n_obs_steps)
@@ -1148,7 +1160,7 @@ def main():
                 rel_action = _clip_relative_action(rel_action)
                 if action_space_mode == "absolute" and curr_pose_exec is not None:
                     curr_pose_exec = _apply_relative_action_to_pose(curr_pose_exec, rel_action)
-                widowx_client.step_action(rel_action, blocking=True)
+                widowx_client.step_action(rel_action, blocking=rollout_blocking)
                 last_tstep = time.time()
 
                 cam0 = step_obs[rgb_keys[0]]
