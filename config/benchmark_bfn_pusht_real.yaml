@@ -34,10 +34,10 @@ shape_meta:
     camera_1:
       shape: ${image_shape}
       type: rgb
-    robot_eef_pose:
-      # Dataset stores eef pose as 6D (xyz + rot), while action is 7D.
-      shape: [6]
-      type: low_dim
+    # robot_eef_pose:
+    #   # Dataset stores eef pose as 6D (xyz + rot), while action is 7D.
+    #   shape: [6]
+    #   type: low_dim
 
 # ================== Policy ==================
 policy:
@@ -75,7 +75,7 @@ optimizer:
   lr: 1.0e-5
   betas: [0.95, 0.999]
   eps: 1.0e-8
-  weight_decay: 2.0e-4
+  weight_decay: 3.0e-4
 
 # ================== Training ==================
 training:
@@ -84,11 +84,11 @@ training:
   debug: false
   resume: false
   lr_scheduler: cosine
-  lr_warmup_steps: 500
-  num_epochs: 100
+  lr_warmup_steps: 100
+  num_epochs: 30
   gradient_accumulate_every: 1
-  rollout_every: 20
-  checkpoint_every: 20
+  rollout_every: 10
+  checkpoint_every: 10
   val_every: 1
   sample_every: 5
   max_train_steps: null
