@@ -14,7 +14,8 @@ python scripts/eval/eval_widowx.py \
   --config-source checkpoint \
   --camera-topics /D435/color/image_raw,/blue/image_raw \
   --policy-hz 10 --robot-hz 30 \
-  --num-timesteps 3000
+  --num-timesteps 3000 \
+  --non-blocking-rollout
   
 python scripts/eval/eval_widowx.py \
   --checkpoint /data/BFN_data/checkpoints/bfn_pusht_real.ckpt \
@@ -22,7 +23,8 @@ python scripts/eval/eval_widowx.py \
   --config-source checkpoint \
   --camera-topics /D435/color/image_raw,/blue/image_raw \
   --policy-hz 10 --robot-hz 30 \
-  --num-timesteps 3000
+  --num-timesteps 3000 \
+  --non-blocking-rollout
 """
 
 from __future__ import annotations
@@ -94,7 +96,7 @@ WIDOWX_DEFAULT_ROTATION = np.array(
 
 # Keep startup behavior close to example_widowx.py defaults.
 STEP_DURATION = 0.033
-MOVE_DURATION = 0.09
+MOVE_DURATION = 0.033
 ACT_EXEC_HORIZON = 8
 RPC_TIMEOUT_MS = 8000
 STARTUP_TIMEOUT = 180.0
