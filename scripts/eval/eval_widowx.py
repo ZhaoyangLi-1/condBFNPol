@@ -8,27 +8,25 @@ This script is intentionally minimal and conservative:
 
 Typical usage:
 
-python /scr2/zhaoyang/condBFNPol/scripts/eval/eval_widowx.py \
+python scripts/eval/eval_widowx.py \
   --checkpoint /data/BFN_data/checkpoints/diffusion_pusht_real.ckpt \
   --method auto \
+  --config-source checkpoint \
   --camera-topics /D435/color/image_raw,/blue/image_raw \
-  --initial-eep 0.12 -0.02 0.24 \
-  --policy-hz 10 --robot-hz 10 --move-duration 0.2 \
-  --act-exec-horizon 1
+  --num-timesteps 120
   
-python /scr2/zhaoyang/condBFNPol/scripts/eval/eval_widowx.py \
+python scripts/eval/eval_widowx.py \
   --checkpoint /data/BFN_data/checkpoints/bfn_pusht_real.ckpt \
   --method auto \
+  --config-source checkpoint \
   --camera-topics /D435/color/image_raw,/blue/image_raw \
-  --initial-eep 0.12 -0.02 0.24 \
-  --policy-hz 10 --robot-hz 10 --move-duration 0.2 \
-  --act-exec-horizon 1
-
+  --num-timesteps 120
 """
 
 from __future__ import annotations
 
 import argparse
+import copy
 import sys
 import time
 from collections import deque
@@ -93,9 +91,9 @@ WIDOWX_DEFAULT_ROTATION = np.array(
 )
 
 # Keep startup behavior close to example_widowx.py defaults.
-STEP_DURATION = 0.2
-MOVE_DURATION = 0.2
-ACT_EXEC_HORIZON = 1
+STEP_DURATION = 0.1
+MOVE_DURATION = 0.09
+ACT_EXEC_HORIZON = 8
 RPC_TIMEOUT_MS = 8000
 STARTUP_TIMEOUT = 180.0
 STARTUP_POLL_INTERVAL = 1.0
@@ -371,15 +369,14 @@ def _select_policy_state_dict(payload: Dict[str, Any], prefer_ema: bool) -> Dict
     raise RuntimeError("Cannot find policy weights in checkpoint payload.")
 
 
-def _load_policy_from_benchmark(
+def _load_policy_from_cfg(
     method: str,
-    benchmark_cfg_path: Path,
+    cfg: Any,
     policy_state: Dict[str, torch.Tensor],
     device: torch.device,
     policy_steps: Optional[int],
 ) -> Tuple[torch.nn.Module, Any]:
     _register_omegaconf_resolvers()
-    cfg = OmegaConf.load(str(benchmark_cfg_path))
     # Resolve only the policy subtree to avoid unrelated training/logging-only interpolations.
     OmegaConf.resolve(cfg.policy)
 
@@ -765,7 +762,7 @@ def _interpolate_actions(
 
 def _print_runtime_config(
     method: str,
-    benchmark_cfg_path: Path,
+    cfg_source: str,
     cfg: Any,
     ckpt_path: Path,
     policy_hz: float,
@@ -779,7 +776,7 @@ def _print_runtime_config(
     print("WidowX Eval Runtime Config")
     print(f"method               : {method}")
     print(f"checkpoint           : {ckpt_path}")
-    print(f"benchmark config     : {benchmark_cfg_path}")
+    print(f"config source        : {cfg_source}")
     print(f"horizon              : {int(cfg.horizon)}")
     print(f"n_obs_steps          : {int(cfg.n_obs_steps)}")
     print(f"n_action_steps       : {int(cfg.n_action_steps)}")
@@ -811,18 +808,51 @@ def main():
         default="/D435/color/image_raw,/blue/image_raw",
         help="Comma-separated ROS camera topics.",
     )
-    parser.add_argument("--policy-hz", type=float, default=10.0, help="Policy control frequency (Hz).")
-    parser.add_argument("--robot-hz", type=float, default=10.0, help="Robot control frequency (Hz).")
+    parser.add_argument("--policy-hz", type=float, default=1.0 / STEP_DURATION, help="Policy control frequency (Hz).")
+    parser.add_argument("--robot-hz", type=float, default=1.0 / STEP_DURATION, help="Robot control frequency (Hz).")
     parser.add_argument("--move-duration", type=float, default=MOVE_DURATION, help="WidowX move duration for each command.")
-    parser.add_argument("--act-exec-horizon", type=int, default=1, help="Number of predicted actions to execute per inference.")
+    parser.add_argument(
+        "--act-exec-horizon",
+        type=int,
+        default=ACT_EXEC_HORIZON,
+        help="Number of predicted actions to execute per inference.",
+    )
     parser.add_argument("--gripper-value", type=float, default=None, help="If set, override action gripper command in [0,1].")
     parser.add_argument("--no-pitch-roll", action="store_true", help="Zero pitch/roll relative commands.")
     parser.add_argument("--no-yaw", action="store_true", help="Zero yaw relative commands.")
-    parser.add_argument("--blocking", action="store_true", help="Compatibility flag; step commands are blocking in this runner.")
     parser.add_argument("--num-timesteps", type=int, default=120)
     parser.add_argument("--show-image", action="store_true")
     parser.add_argument("--video-save-path", type=str, default=None)
     parser.add_argument("--initial-eep", type=float, nargs=3, default=DEFAULT_INITIAL_EEP)
+    parser.add_argument(
+        "--benchmark-config",
+        type=str,
+        default=None,
+        help=(
+            "Optional benchmark config path used when --config-source=benchmark "
+            "(or as fallback when checkpoint cfg is unavailable)."
+        ),
+    )
+    parser.add_argument(
+        "--config-source",
+        type=str,
+        default="checkpoint",
+        choices=["checkpoint", "benchmark"],
+        help=(
+            "Policy/shape config source. "
+            "'checkpoint' uses cfg embedded in the .ckpt for exact train-eval parity. "
+            "'benchmark' uses benchmark YAML."
+        ),
+    )
+    parser.add_argument(
+        "--image-size",
+        type=int,
+        default=None,
+        help=(
+            "WidowX service image_size for init. "
+            "Default: max(H,W) from eval config image_shape; fallback 256."
+        ),
+    )
     args = parser.parse_args()
 
     if args.show_image and cv2 is None:
@@ -864,11 +894,39 @@ def main():
             "Use --method auto or match the checkpoint type."
         )
 
-    benchmark_cfg_path = _get_benchmark_cfg_path(method=method, override_path=None)
+    benchmark_cfg_path = _get_benchmark_cfg_path(method=method, override_path=args.benchmark_config)
+    eval_cfg = None
+    cfg_source = ""
+    if args.config_source == "checkpoint":
+        if payload_cfg is None:
+            raise RuntimeError(
+                "Checkpoint has no cfg payload. "
+                "Use --config-source benchmark and optionally --benchmark-config."
+            )
+        try:
+            eval_cfg = copy.deepcopy(payload_cfg)
+            # Basic structural checks used by this runner.
+            _ = eval_cfg.policy
+            _ = eval_cfg.shape_meta.action.shape
+            _ = eval_cfg.shape_meta.obs
+            _ = eval_cfg.n_obs_steps
+            _ = eval_cfg.n_action_steps
+            _ = eval_cfg.image_shape
+            _ = eval_cfg.crop_shape
+            cfg_source = "checkpoint cfg"
+        except Exception as e:
+            raise RuntimeError(
+                f"Checkpoint cfg is incomplete for eval: {type(e).__name__}: {e}. "
+                "Use --config-source benchmark and optionally --benchmark-config."
+            )
+    else:
+        eval_cfg = OmegaConf.load(str(benchmark_cfg_path))
+        cfg_source = str(benchmark_cfg_path)
+
     policy_state = _select_policy_state_dict(payload, prefer_ema=True)
-    policy, benchmark_cfg = _load_policy_from_benchmark(
+    policy, eval_cfg = _load_policy_from_cfg(
         method=method,
-        benchmark_cfg_path=benchmark_cfg_path,
+        cfg=eval_cfg,
         policy_state=policy_state,
         device=device,
         policy_steps=None,
@@ -876,8 +934,8 @@ def main():
 
     _print_runtime_config(
         method=method,
-        benchmark_cfg_path=benchmark_cfg_path,
-        cfg=benchmark_cfg,
+        cfg_source=cfg_source,
+        cfg=eval_cfg,
         ckpt_path=ckpt_path,
         policy_hz=float(args.policy_hz),
         robot_hz=float(args.robot_hz),
@@ -885,8 +943,8 @@ def main():
         move_duration=move_duration,
     )
 
-    n_obs_steps = int(benchmark_cfg.n_obs_steps)
-    n_action_steps = int(benchmark_cfg.n_action_steps)
+    n_obs_steps = int(eval_cfg.n_obs_steps)
+    n_action_steps = int(eval_cfg.n_action_steps)
     if hasattr(policy, "n_obs_steps") and int(policy.n_obs_steps) != n_obs_steps:
         raise RuntimeError(f"Policy n_obs_steps={policy.n_obs_steps} != benchmark n_obs_steps={n_obs_steps}")
     if hasattr(policy, "n_action_steps") and int(policy.n_action_steps) != n_action_steps:
@@ -897,11 +955,11 @@ def main():
     if args.act_exec_horizon <= 0:
         raise ValueError(f"--act-exec-horizon must be >= 1, got {args.act_exec_horizon}")
     act_exec_horizon = min(int(args.act_exec_horizon), n_action_steps)
-    obs_meta = benchmark_cfg.shape_meta.obs
+    obs_meta = eval_cfg.shape_meta.obs
     rgb_keys = [k for k, v in obs_meta.items() if v.get("type", "low_dim") == "rgb"]
     lowdim_keys = [k for k, v in obs_meta.items() if v.get("type", "low_dim") == "low_dim"]
     all_obs_keys = rgb_keys + lowdim_keys
-    action_dim = int(benchmark_cfg.shape_meta.action.shape[0])
+    action_dim = int(eval_cfg.shape_meta.action.shape[0])
     if action_dim != 7:
         raise RuntimeError(f"Expected action_dim=7 for WidowX, got {action_dim}.")
 
@@ -932,7 +990,19 @@ def main():
     else:
         print("[WARN] Could not override WidowX RPC timeout; using library default.")
 
-    init_status = widowx_client.init(env_params, image_size=256)
+    if args.image_size is not None:
+        init_image_size = int(args.image_size)
+    else:
+        try:
+            im_shape = [int(x) for x in eval_cfg.image_shape]
+            init_image_size = max(int(im_shape[1]), int(im_shape[2]))
+        except Exception:
+            init_image_size = 256
+    if init_image_size <= 0:
+        raise ValueError(f"--image-size must be > 0, got {init_image_size}")
+    print(f"[INFO] widowx_client.init image_size={init_image_size}")
+
+    init_status = widowx_client.init(env_params, image_size=init_image_size)
     if not _status_is_success(init_status):
         print(f"[WARN] widowx_client.init returned non-success status {init_status!r}; waiting for readiness anyway.")
 

@@ -176,17 +176,25 @@ def make_target_hz_indices(
 
 
 def _as_gripper_series(x, target_len: int) -> np.ndarray:
-    """Coerce a possible scalar/len-1/len-T array to shape (T,) float64, else raise."""
+    """Coerce gripper source to shape (T,) float64 with len alignment."""
     if x is None:
         raise ValueError("gripper source is None")
     arr = np.asarray(x)
     if arr.ndim == 0:
         return np.full((target_len,), float(arr), dtype=np.float64)
     if arr.ndim >= 1:
-        if arr.shape[0] == target_len:
-            return arr.astype(np.float64).reshape((target_len,))
-        if arr.shape[0] == 1:
-            return np.full((target_len,), float(arr.reshape(-1)[0]), dtype=np.float64)
+        flat = arr.astype(np.float64).reshape((arr.shape[0], -1))[:, 0]
+        if flat.shape[0] == target_len:
+            return flat
+        if flat.shape[0] == target_len - 1 and flat.shape[0] > 0:
+            return np.concatenate([flat, flat[-1:]], axis=0)
+        if flat.shape[0] == 1:
+            return np.full((target_len,), float(flat[0]), dtype=np.float64)
+        if flat.shape[0] > target_len:
+            return flat[:target_len]
+        if 1 < flat.shape[0] < target_len:
+            pad = np.full((target_len - flat.shape[0],), float(flat[-1]), dtype=np.float64)
+            return np.concatenate([flat, pad], axis=0)
     raise ValueError(f"Unsupported gripper shape {arr.shape} for target_len={target_len}")
 
 
@@ -879,6 +887,5 @@ if __name__ == "__main__":
     main()
 
 """
-python ./dataset/formalize_data.py \
-  --overwrite --no-reference --target-hz 20
+python dataset/formalize_data.py --src /scr2/zhaoyang/BFN_data/pusht_real_raw --dst /scr2/zhaoyang/BFN_data/pusht_real --overwrite --target-hz 10  --arm-action-source relative
 """
