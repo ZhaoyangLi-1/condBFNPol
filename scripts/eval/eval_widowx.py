@@ -10,7 +10,9 @@ python scripts/eval/eval_widowx.py \
   --action_mode 2trans \
   --step_duration 0.1 \
   --act_exec_horizon 8 \
-  --im_size 480
+  --im_size 480 \
+  --widowx_init_timeout_ms 180000 \
+  --widowx_init_retries 8
 """
 
 from __future__ import annotations
@@ -105,6 +107,41 @@ flags.DEFINE_integer(
 )
 flags.DEFINE_string("ip", "localhost", "Robot IP")
 flags.DEFINE_integer("port", 5556, "Robot port")
+flags.DEFINE_integer(
+    "widowx_init_retries",
+    5,
+    "Number of init retries when WidowX returns a non-success status.",
+)
+flags.DEFINE_integer(
+    "widowx_init_timeout_ms",
+    120000,
+    "Req/rep timeout used during WidowX init RPC (milliseconds).",
+)
+flags.DEFINE_integer(
+    "widowx_rpc_timeout_ms",
+    10000,
+    "Req/rep timeout used after init for regular RPCs (milliseconds).",
+)
+flags.DEFINE_float(
+    "widowx_init_retry_sleep",
+    1.0,
+    "Seconds to sleep between init retries.",
+)
+flags.DEFINE_integer(
+    "widowx_reset_retries",
+    3,
+    "Number of retries for reset() when WidowX returns non-success status.",
+)
+flags.DEFINE_integer(
+    "widowx_reset_timeout_ms",
+    30000,
+    "Req/rep timeout used during reset RPC (milliseconds).",
+)
+flags.DEFINE_float(
+    "widowx_reset_retry_sleep",
+    1.0,
+    "Seconds to sleep between reset retries.",
+)
 flags.DEFINE_enum(
     "action_mode",
     "2trans",
@@ -197,6 +234,83 @@ def _cfg_get(cfg: Any, key: str, default: Any = None) -> Any:
         return cfg.get(key, default)
     except Exception:
         return default
+
+
+def _status_name(status: Any, WidowXStatus: Any) -> str:
+    for name in ("SUCCESS", "NO_CONNECTION", "EXECUTION_FAILURE", "NOT_INITIALIZED"):
+        if hasattr(WidowXStatus, name) and status == getattr(WidowXStatus, name):
+            return name
+    return str(status)
+
+
+def _set_widowx_reqrep_timeout_ms(widowx_client: Any, timeout_ms: int) -> None:
+    """Best-effort update of underlying req/rep timeout used by widowx_envs."""
+    try:
+        action_client = getattr(widowx_client, "_WidowXClient__client", None)
+        if action_client is None:
+            return
+        reqrep_client = getattr(action_client, "client", None)
+        if reqrep_client is None:
+            return
+        reqrep_client.timeout_ms = int(timeout_ms)
+        reqrep_client.reset_socket()
+    except Exception:
+        # Keep compatibility across SDK variants that may hide these internals.
+        pass
+
+
+def _init_widowx_with_retry(
+    widowx_client: Any,
+    env_params: Dict[str, Any],
+    image_size: int,
+    WidowXStatus: Any,
+) -> Any:
+    retries = max(1, int(FLAGS.widowx_init_retries))
+    retry_sleep = max(0.0, float(FLAGS.widowx_init_retry_sleep))
+    init_timeout_ms = max(1, int(FLAGS.widowx_init_timeout_ms))
+    rpc_timeout_ms = max(1, int(FLAGS.widowx_rpc_timeout_ms))
+
+    _set_widowx_reqrep_timeout_ms(widowx_client, init_timeout_ms)
+    last_status = None
+
+    for attempt in range(1, retries + 1):
+        last_status = widowx_client.init(env_params, image_size=image_size)
+        if last_status == WidowXStatus.SUCCESS:
+            _set_widowx_reqrep_timeout_ms(widowx_client, rpc_timeout_ms)
+            return last_status
+
+        print(
+            f"[WARN] WidowX init attempt {attempt}/{retries} failed with "
+            f"status={_status_name(last_status, WidowXStatus)}."
+        )
+        if attempt < retries and retry_sleep > 0.0:
+            time.sleep(retry_sleep)
+
+    _set_widowx_reqrep_timeout_ms(widowx_client, rpc_timeout_ms)
+    return last_status
+
+
+def _reset_widowx_with_retry(widowx_client: Any, WidowXStatus: Any) -> Any:
+    retries = max(1, int(FLAGS.widowx_reset_retries))
+    retry_sleep = max(0.0, float(FLAGS.widowx_reset_retry_sleep))
+    reset_timeout_ms = max(1, int(FLAGS.widowx_reset_timeout_ms))
+    rpc_timeout_ms = max(1, int(FLAGS.widowx_rpc_timeout_ms))
+
+    _set_widowx_reqrep_timeout_ms(widowx_client, max(reset_timeout_ms, rpc_timeout_ms))
+    last_status = None
+    for attempt in range(1, retries + 1):
+        last_status = widowx_client.reset()
+        if last_status == WidowXStatus.SUCCESS:
+            break
+        print(
+            f"[WARN] WidowX reset attempt {attempt}/{retries} failed with "
+            f"status={_status_name(last_status, WidowXStatus)}."
+        )
+        if attempt < retries and retry_sleep > 0.0:
+            time.sleep(retry_sleep)
+
+    _set_widowx_reqrep_timeout_ms(widowx_client, rpc_timeout_ms)
+    return last_status
 
 
 def _resolve_checkpoint_path(path_or_dir: str) -> str:
@@ -664,9 +778,19 @@ def main(_):
     env_params["start_state"] = list(start_state)
 
     widowx_client = WidowXClient(host=FLAGS.ip, port=FLAGS.port)
-    init_status = widowx_client.init(env_params, image_size=FLAGS.im_size)
+    init_status = _init_widowx_with_retry(
+        widowx_client=widowx_client,
+        env_params=env_params,
+        image_size=FLAGS.im_size,
+        WidowXStatus=WidowXStatus,
+    )
     if init_status != WidowXStatus.SUCCESS:
-        raise RuntimeError(f"WidowX init failed with status={init_status}")
+        raise RuntimeError(
+            "WidowX init failed after "
+            f"{max(1, int(FLAGS.widowx_init_retries))} attempts with "
+            f"status={_status_name(init_status, WidowXStatus)}. "
+            f"Check server reachability at {FLAGS.ip}:{FLAGS.port}."
+        )
     if FLAGS.initial_eep is not None and not FLAGS.run_initial_absolute_move:
         print(
             "[INFO] Using reset(start_state) only; skip optional absolute move "
@@ -702,9 +826,15 @@ def main(_):
 
         input("Press [Enter] to start rollout.")
 
-        reset_status = widowx_client.reset()
+        reset_status = _reset_widowx_with_retry(
+            widowx_client=widowx_client,
+            WidowXStatus=WidowXStatus,
+        )
         if reset_status != WidowXStatus.SUCCESS:
-            print(f"[ERROR] Reset failed with status={reset_status}, skip rollout.")
+            print(
+                "[ERROR] Reset failed with status="
+                f"{_status_name(reset_status, WidowXStatus)}, skip rollout."
+            )
             rollout_idx += 1
             continue
         time.sleep(2.5)
@@ -723,7 +853,8 @@ def main(_):
                     break
                 print(
                     f"[WARN] initial absolute move failed "
-                    f"(attempt {attempt}/{retries}, status={move_status})."
+                    f"(attempt {attempt}/{retries}, "
+                    f"status={_status_name(move_status, WidowXStatus)})."
                 )
             if move_status != WidowXStatus.SUCCESS:
                 print(
@@ -824,7 +955,8 @@ def main(_):
                     )
                     if step_status != WidowXStatus.SUCCESS:
                         raise RuntimeError(
-                            f"WidowX step_action failed: status={step_status}, "
+                            "WidowX step_action failed: status="
+                            f"{_status_name(step_status, WidowXStatus)}, "
                             f"env_action={env_action.tolist()}"
                         )
 
