@@ -290,7 +290,9 @@ def _init_widowx_with_retry(
     return last_status
 
 
-def _reset_widowx_with_retry(widowx_client: Any, WidowXStatus: Any) -> Any:
+def _reset_widowx_with_retry(
+    widowx_client: Any, WidowXStatus: Any, i_traj: int | None = None
+) -> Any:
     retries = max(1, int(FLAGS.widowx_reset_retries))
     retry_sleep = max(0.0, float(FLAGS.widowx_reset_retry_sleep))
     reset_timeout_ms = max(1, int(FLAGS.widowx_reset_timeout_ms))
@@ -298,8 +300,21 @@ def _reset_widowx_with_retry(widowx_client: Any, WidowXStatus: Any) -> Any:
 
     _set_widowx_reqrep_timeout_ms(widowx_client, max(reset_timeout_ms, rpc_timeout_ms))
     last_status = None
+    warned_itraj_fallback = False
     for attempt in range(1, retries + 1):
-        last_status = widowx_client.reset()
+        if i_traj is None:
+            last_status = widowx_client.reset()
+        else:
+            try:
+                last_status = widowx_client.reset(itraj=int(i_traj))
+            except TypeError:
+                if not warned_itraj_fallback:
+                    print(
+                        "[WARN] widowx_client.reset(itraj=...) is not supported by "
+                        "this widowx_envs version; falling back to reset()."
+                    )
+                    warned_itraj_fallback = True
+                last_status = widowx_client.reset()
         if last_status == WidowXStatus.SUCCESS:
             break
         print(
@@ -747,7 +762,6 @@ def main(_):
 
     assert isinstance(FLAGS.initial_eep, list)
     initial_eep = [float(e) for e in FLAGS.initial_eep]
-    start_state = np.concatenate([initial_eep, [0, 0, 0, 1]], axis=0)
 
     env_params = WidowXConfigs.DefaultEnvParams.copy()
     env_params.update(
@@ -775,8 +789,6 @@ def main(_):
             "action_clipping": None,
         }
     )
-    env_params["start_state"] = list(start_state)
-
     widowx_client = WidowXClient(host=FLAGS.ip, port=FLAGS.port)
     init_status = _init_widowx_with_retry(
         widowx_client=widowx_client,
@@ -793,8 +805,8 @@ def main(_):
         )
     if FLAGS.initial_eep is not None and not FLAGS.run_initial_absolute_move:
         print(
-            "[INFO] Using reset(start_state) only; skip optional absolute move "
-            "to avoid IK failures on incompatible roll/pitch/yaw."
+            "[INFO] Using collect-style reset path (reset with trajectory index). "
+            "Optional absolute move is disabled."
         )
     
     rollout_idx = 0
@@ -825,6 +837,19 @@ def main(_):
             cv2.waitKey(100)
 
         input("Press [Enter] to start rollout.")
+
+        reset_status = _reset_widowx_with_retry(
+            widowx_client=widowx_client,
+            WidowXStatus=WidowXStatus,
+            i_traj=rollout_idx,
+        )
+        if reset_status != WidowXStatus.SUCCESS:
+            print(
+                "[ERROR] Reset failed with status="
+                f"{_status_name(reset_status, WidowXStatus)}, skip rollout."
+            )
+            rollout_idx += 1
+            continue
 
         if FLAGS.initial_eep is not None and FLAGS.run_initial_absolute_move:
             widowx_client.move_gripper(1.0)  # open gripper
