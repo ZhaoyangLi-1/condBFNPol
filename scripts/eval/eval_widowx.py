@@ -70,7 +70,7 @@ flags.DEFINE_integer(
     "Override BFN n_timesteps when > 0",
 )
 
-flags.DEFINE_integer("im_size", 128, "WidowX service image size")
+flags.DEFINE_integer("im_size", 480, "WidowX service image size")
 flags.DEFINE_integer("num_timesteps", 120, "Number of control steps per rollout")
 flags.DEFINE_integer("num_rollouts", 1, "Number of rollouts; <=0 means infinite")
 flags.DEFINE_float("step_duration", 0.2, "Control period in seconds")
@@ -108,7 +108,7 @@ flags.DEFINE_string(
     "Path that contains widowx_envs and utils.py",
 )
 
-CAMERA_TOPICS = [{"name": "/blue/image_raw"}]
+CAMERA_TOPICS = [ {"name": "/D435/color/image_raw"}, {"name": "/blue/image_raw"}]
 WORKSPACE_BOUNDS = [[0.1, -0.15, -0.01, -1.57, 0], [0.45, 0.25, 0.25, 1.57, 0]]
 
 
