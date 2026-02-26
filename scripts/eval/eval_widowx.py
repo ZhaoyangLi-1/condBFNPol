@@ -13,7 +13,9 @@ python scripts/eval/eval_widowx.py \
   --im_size 480 \
   --widowx_init_timeout_ms 180000 \
   --widowx_init_retries 8 \
-  --video_save_path /data/BFN_data/diffusion_results
+  --video_save_path /data/BFN_data/diffusion_results \
+  --num_timesteps 700
+  
 
 python scripts/eval/eval_widowx.py \
   --checkpoint /data/BFN_data/checkpoints/bfn_real_pusht.ckpt \
@@ -24,7 +26,8 @@ python scripts/eval/eval_widowx.py \
   --im_size 480 \
   --widowx_init_timeout_ms 180000 \
   --widowx_init_retries 8 \
-  --video_save_path /data/BFN_data/bfn_results
+  --video_save_path /data/BFN_data/bfn_results \
+  --num_timesteps 400
 
 """
 
@@ -168,6 +171,11 @@ flags.DEFINE_float("fixed_gripper", 0.0, "Fixed gripper command for 2trans env m
 
 flags.DEFINE_bool("show_image", False, "Show camera image")
 flags.DEFINE_string("video_save_path", None, "Directory to save rollout videos")
+flags.DEFINE_bool(
+    "save_two_camera_videos",
+    False,
+    "Also save separate cam0/cam1 videos when video_save_path is set.",
+)
 flags.DEFINE_bool("no_pitch_roll", False, "Zero out pitch/roll action dims")
 flags.DEFINE_bool("no_yaw", False, "Zero out yaw action dim")
 flags.DEFINE_float(
@@ -571,6 +579,32 @@ def _extract_widowx_rgb_obs(raw_obs: Dict[str, Any], im_size: int) -> np.ndarray
     return rgb_sources[sorted(rgb_sources.keys())[0]]
 
 
+def _extract_two_camera_rgb(raw_obs: Dict[str, Any], im_size: int) -> Tuple[np.ndarray | None, np.ndarray | None]:
+    rgb_sources = _extract_widowx_rgb_sources(raw_obs, im_size)
+
+    cam0 = None
+    for key in ("external_img", "full_image_0", "image_0", "over_shoulder_img", "wrist_img"):
+        if key in rgb_sources:
+            cam0 = rgb_sources[key]
+            break
+    if cam0 is None and rgb_sources:
+        cam0 = rgb_sources[sorted(rgb_sources.keys())[0]]
+
+    cam1 = None
+    for key in ("over_shoulder_img", "full_image_1", "image_1", "external_img", "wrist_img"):
+        if key in rgb_sources and rgb_sources[key] is not cam0:
+            cam1 = rgb_sources[key]
+            break
+    if cam1 is None and rgb_sources:
+        for key in sorted(rgb_sources.keys()):
+            candidate = rgb_sources[key]
+            if candidate is not cam0:
+                cam1 = candidate
+                break
+
+    return cam0, cam1
+
+
 def _resize_and_format_rgb(base_rgb: np.ndarray, shape: Any) -> np.ndarray:
     if not isinstance(shape, (list, tuple)) or len(shape) != 3:
         raise ValueError(f"Unexpected rgb shape metadata: {shape}")
@@ -709,7 +743,6 @@ def _predict_action_sequence(
 
     if actions.ndim == 1:
         actions = actions[None]
-
     return actions
 
 
@@ -897,6 +930,8 @@ def main(_):
 
         last_tstep = time.time()
         images: List[np.ndarray] = []
+        cam0_images: List[np.ndarray] = []
+        cam1_images: List[np.ndarray] = []
         obs_hist = deque(maxlen=max(1, loaded.n_obs_steps))
 
         is_gripper_closed = False
@@ -919,6 +954,12 @@ def main(_):
                     obs_shape_meta=obs_shape_meta,
                     im_size=FLAGS.im_size,
                 )
+                if FLAGS.save_two_camera_videos:
+                    cam0_rgb, cam1_rgb = _extract_two_camera_rgb(raw_obs, FLAGS.im_size)
+                    if cam0_rgb is not None:
+                        cam0_images.append(cam0_rgb)
+                    if cam1_rgb is not None:
+                        cam1_images.append(cam1_rgb)
 
                 if FLAGS.show_image:
                     cv2.imshow("img_view", cv2.cvtColor(vis_rgb, cv2.COLOR_RGB2BGR))
@@ -994,6 +1035,9 @@ def main(_):
             print(traceback.format_exc(), file=sys.stderr)
 
         _save_rollout_video(images, loaded.name)
+        if FLAGS.save_two_camera_videos:
+            _save_rollout_video(cam0_images, f"{loaded.name}_cam0")
+            _save_rollout_video(cam1_images, f"{loaded.name}_cam1")
         rollout_idx += 1
 
 
