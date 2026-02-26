@@ -4,14 +4,13 @@
 This script borrows the control flow of scripts/eval/example_widowx.py but
 loads PyTorch workspace checkpoints trained in this repository.
 
-python /scr2/zhaoyang/condBFNPol/scripts/eval/eval_widowx.py \
-  --checkpoint <ckpt source> \
+python scripts/eval/eval_widowx.py \
+  --checkpoint /data/BFN_data/checkpoints/diffusion_real_pusht.ckpt \
   --widowx_envs_path /scr2/zhaoyang/bridge_data_robot_pusht/widowx_envs \
   --action_mode 2trans \
   --step_duration 0.1 \
   --act_exec_horizon 8 \
   --im_size 480
-
 """
 
 from __future__ import annotations
@@ -61,11 +60,16 @@ from omegaconf import OmegaConf
 
 FLAGS = flags.FLAGS
 
+# flags.DEFINE_multi_string(
+#     "checkpoint",
+#     None,
+#     "Checkpoint file or run directory (can pass multiple for policy selection).",
+#     required=True,
+# )
 flags.DEFINE_multi_string(
     "checkpoint",
-    None,
+    "/data/BFN_data/checkpoints/diffusion_real_pusht.ckpt",
     "Checkpoint file or run directory (can pass multiple for policy selection).",
-    required=True,
 )
 flags.DEFINE_string("device", "cuda:0", "Torch device, e.g. cuda:0 or cpu")
 flags.DEFINE_bool("use_ema", True, "Use ema_model when available")
@@ -87,7 +91,7 @@ flags.DEFINE_float("step_duration", 0.1, "Control period in seconds")
 flags.DEFINE_integer("act_exec_horizon", 8, "How many planned actions to execute")
 
 flags.DEFINE_bool("blocking", False, "Use blocking controller")
-flags.DEFINE_spaceseplist("initial_eep", [0.3, 0.0, 0.15], "Initial position")
+flags.DEFINE_spaceseplist("initial_eep", [0.3, 0.0, 0.02], "Initial position")
 flags.DEFINE_string("ip", "localhost", "Robot IP")
 flags.DEFINE_integer("port", 5556, "Robot port")
 flags.DEFINE_enum(
@@ -204,22 +208,46 @@ def _load_policy_from_checkpoint(
         open(checkpoint_path, "rb"), pickle_module=dill, map_location="cpu"
     )
     cfg = payload["cfg"]
+    policy = hydra.utils.instantiate(cfg.policy)
 
-    workspace_cls = hydra.utils.get_class(cfg._target_)
-    workspace = workspace_cls(cfg)
-    workspace.load_payload(payload, exclude_keys=None, include_keys=None)
+    state_dicts = payload.get("state_dicts", {})
+    load_candidates: List[Tuple[str, Dict[str, torch.Tensor]]] = []
+    if FLAGS.use_ema and isinstance(state_dicts.get("ema_model"), dict):
+        load_candidates.append(("ema_model", state_dicts["ema_model"]))
+    if isinstance(state_dicts.get("model"), dict):
+        load_candidates.append(("model", state_dicts["model"]))
 
-    if FLAGS.use_ema and hasattr(workspace, "ema_model") and workspace.ema_model is not None:
-        policy = workspace.ema_model
-    elif hasattr(workspace, "model"):
-        policy = workspace.model
-    else:
-        raise AttributeError(
-            "Workspace has neither 'model' nor available 'ema_model'."
+    if not load_candidates:
+        raise KeyError(
+            f"Checkpoint has no model/ema_model state_dicts: {checkpoint_path}"
         )
+
+    loaded_source = None
+    last_load_error: Exception | None = None
+    for source, state in load_candidates:
+        try:
+            state = {
+                k.replace("_orig_mod.", ""): v
+                for k, v in state.items()
+            }
+            try:
+                policy.load_state_dict(state, strict=False)
+            except TypeError:
+                # Some custom classes only accept (state_dict)
+                policy.load_state_dict(state)
+            loaded_source = source
+            break
+        except Exception as exc:
+            last_load_error = exc
+
+    if loaded_source is None:
+        raise RuntimeError(
+            "Failed to load checkpoint state_dict into policy model."
+        ) from last_load_error
 
     policy = policy.to(device)
     policy.eval()
+    print(f"[INFO] Loaded weights from state_dicts['{loaded_source}']")
 
     if FLAGS.num_inference_steps > 0 and hasattr(policy, "num_inference_steps"):
         policy.num_inference_steps = int(FLAGS.num_inference_steps)
@@ -591,7 +619,7 @@ def main(_):
 
     widowx_client = WidowXClient(host=FLAGS.ip, port=FLAGS.port)
     widowx_client.init(env_params, image_size=FLAGS.im_size)
-
+    
     rollout_idx = 0
     while FLAGS.num_rollouts <= 0 or rollout_idx < FLAGS.num_rollouts:
         if len(policies) == 1:
