@@ -3,12 +3,22 @@
 
 This script borrows the control flow of scripts/eval/example_widowx.py but
 loads PyTorch workspace checkpoints trained in this repository.
+
+python /scr2/zhaoyang/condBFNPol/scripts/eval/eval_widowx.py \
+  --checkpoint <ckpt source> \
+  --widowx_envs_path /scr2/zhaoyang/bridge_data_robot_pusht/widowx_envs \
+  --action_mode 2trans \
+  --step_duration 0.1 \
+  --act_exec_horizon 8 \
+  --im_size 480
+
 """
 
 from __future__ import annotations
 
 import importlib.util
 import os
+import re
 import sys
 import time
 import traceback
@@ -73,13 +83,23 @@ flags.DEFINE_integer(
 flags.DEFINE_integer("im_size", 480, "WidowX service image size")
 flags.DEFINE_integer("num_timesteps", 120, "Number of control steps per rollout")
 flags.DEFINE_integer("num_rollouts", 1, "Number of rollouts; <=0 means infinite")
-flags.DEFINE_float("step_duration", 0.2, "Control period in seconds")
+flags.DEFINE_float("step_duration", 0.1, "Control period in seconds")
 flags.DEFINE_integer("act_exec_horizon", 8, "How many planned actions to execute")
 
 flags.DEFINE_bool("blocking", False, "Use blocking controller")
 flags.DEFINE_spaceseplist("initial_eep", [0.3, 0.0, 0.15], "Initial position")
 flags.DEFINE_string("ip", "localhost", "Robot IP")
 flags.DEFINE_integer("port", 5556, "Robot port")
+flags.DEFINE_enum(
+    "action_mode",
+    "2trans",
+    ["2trans", "3trans", "3trans1rot", "3trans3rot"],
+    "WidowX env action_mode for step_action payload projection.",
+)
+flags.DEFINE_bool("lock_z", True, "Enable Z locking in env params")
+flags.DEFINE_float("fixed_z_height", 0.02, "Fixed z height used when lock_z is True")
+flags.DEFINE_float("neutral_z_height", 0.02, "Neutral z height")
+flags.DEFINE_float("fixed_gripper", 0.0, "Fixed gripper command for 2trans env mode")
 
 flags.DEFINE_bool("show_image", False, "Show camera image")
 flags.DEFINE_string("video_save_path", None, "Directory to save rollout videos")
@@ -139,26 +159,7 @@ def _load_widowx_dependencies():
             "Set --widowx_envs_path correctly."
         ) from exc
 
-    state_to_eep = None
-    utils_py = widowx_envs_path / "utils.py"
-    if utils_py.is_file():
-        spec = importlib.util.spec_from_file_location("widowx_eval_utils", str(utils_py))
-        if spec is not None and spec.loader is not None:
-            module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)
-            state_to_eep = getattr(module, "state_to_eep", None)
-
-    if state_to_eep is None:
-        try:
-            from utils import state_to_eep as imported_state_to_eep  # type: ignore
-
-            state_to_eep = imported_state_to_eep
-        except Exception as exc:
-            raise ImportError(
-                "Failed to import state_to_eep from widowx utils.py."
-            ) from exc
-
-    return WidowXClient, WidowXStatus, WidowXConfigs, state_to_eep
+    return WidowXClient, WidowXStatus, WidowXConfigs
 
 
 def _cfg_get(cfg: Any, key: str, default: Any = None) -> Any:
@@ -264,29 +265,114 @@ def _to_uint8_rgb(img: np.ndarray) -> np.ndarray:
     return np.clip(arr, 0, 255).astype(np.uint8)
 
 
-def _extract_widowx_rgb_obs(raw_obs: Dict[str, Any], im_size: int) -> np.ndarray:
+def _reshape_flattened_image(flat: np.ndarray, im_size: int) -> np.ndarray:
+    side = int(im_size)
+    if side <= 0 or flat.size != 3 * side * side:
+        inferred_side = int(round(np.sqrt(flat.size / 3.0)))
+        if inferred_side > 0 and 3 * inferred_side * inferred_side == flat.size:
+            side = inferred_side
+        else:
+            raise ValueError(
+                f"Cannot reshape flattened image of size {flat.size} with im_size={im_size}"
+            )
+    img = flat.reshape(3, side, side).transpose(1, 2, 0)
+    return _to_uint8_rgb(img)
+
+
+def _extract_widowx_rgb_sources(raw_obs: Dict[str, Any], im_size: int) -> Dict[str, np.ndarray]:
+    sources: Dict[str, np.ndarray] = {}
+
+    # Fast image transfer keys used by widowx_env_service.
+    for key in ("external_img", "over_shoulder_img", "wrist_img"):
+        if key in raw_obs and raw_obs[key] is not None:
+            sources[key] = _to_uint8_rgb(np.asarray(raw_obs[key]))
+
+    # Optional full_image from other wrappers: shape usually (N, H, W, C).
     if "full_image" in raw_obs and raw_obs["full_image"] is not None:
-        return _to_uint8_rgb(np.asarray(raw_obs["full_image"]))
+        full_image = np.asarray(raw_obs["full_image"])
+        if full_image.ndim == 4:
+            for i in range(full_image.shape[0]):
+                sources[f"full_image_{i}"] = _to_uint8_rgb(full_image[i])
+        elif full_image.ndim == 3:
+            sources["full_image_0"] = _to_uint8_rgb(full_image)
 
+    # "image" may be flattened CHW float image(s) from BridgeDataRailRLPrivateWidowX.
     if "image" in raw_obs and raw_obs["image"] is not None:
-        img = np.asarray(raw_obs["image"])
-        if img.ndim == 1:
-            side = int(im_size)
-            if side <= 0 or img.size != 3 * side * side:
-                inferred_side = int(round(np.sqrt(img.size / 3.0)))
-                if inferred_side > 0 and 3 * inferred_side * inferred_side == img.size:
-                    side = inferred_side
-                else:
-                    raise ValueError(
-                        f"Cannot reshape flattened image of size {img.size} with im_size={im_size}"
-                    )
-            img = img.reshape(3, side, side).transpose(1, 2, 0)
-            return _to_uint8_rgb(img)
+        image_arr = np.asarray(raw_obs["image"])
+        if image_arr.ndim == 1:
+            sources.setdefault("image_0", _reshape_flattened_image(image_arr, im_size))
+        elif image_arr.ndim == 2:
+            for i in range(image_arr.shape[0]):
+                try:
+                    sources.setdefault(f"image_{i}", _reshape_flattened_image(image_arr[i], im_size))
+                except Exception:
+                    continue
+        elif image_arr.ndim == 3:
+            # Could be single HWC/CHW or a stack of CHW.
+            if image_arr.shape[-1] == 3:
+                sources.setdefault("image_0", _to_uint8_rgb(image_arr))
+            elif image_arr.shape[0] == 3:
+                sources.setdefault("image_0", _to_uint8_rgb(image_arr))
+            else:
+                for i in range(image_arr.shape[0]):
+                    try:
+                        sources.setdefault(f"image_{i}", _to_uint8_rgb(image_arr[i]))
+                    except Exception:
+                        continue
+        elif image_arr.ndim == 4:
+            for i in range(image_arr.shape[0]):
+                try:
+                    sources.setdefault(f"image_{i}", _to_uint8_rgb(image_arr[i]))
+                except Exception:
+                    continue
 
-        if img.ndim == 3:
-            return _to_uint8_rgb(img)
+    if not sources:
+        raise ValueError(
+            "WidowX observation does not contain image keys among "
+            "{external_img, over_shoulder_img, wrist_img, full_image, image}"
+        )
+    return sources
 
-    raise ValueError("WidowX observation does not contain a parsable image")
+
+def _rgb_key_to_camera_index(obs_key: str) -> int | None:
+    match = re.search(r"(\d+)$", obs_key)
+    if match:
+        return int(match.group(1))
+    return None
+
+
+def _select_rgb_source_for_obs_key(obs_key: str, rgb_sources: Dict[str, np.ndarray]) -> np.ndarray:
+    key_lower = obs_key.lower()
+    # semantic fallback first
+    if "wrist" in key_lower and "wrist_img" in rgb_sources:
+        return rgb_sources["wrist_img"]
+    if "shoulder" in key_lower and "over_shoulder_img" in rgb_sources:
+        return rgb_sources["over_shoulder_img"]
+
+    cam_idx = _rgb_key_to_camera_index(obs_key)
+    preferred_order: List[str] = []
+    if cam_idx == 0:
+        preferred_order = ["external_img", "full_image_0", "image_0", "over_shoulder_img", "wrist_img"]
+    elif cam_idx == 1:
+        preferred_order = ["over_shoulder_img", "full_image_1", "image_1", "external_img", "wrist_img"]
+    elif cam_idx == 2:
+        preferred_order = ["wrist_img", "full_image_2", "image_2", "external_img", "over_shoulder_img"]
+
+    for source_key in preferred_order:
+        if source_key in rgb_sources:
+            return rgb_sources[source_key]
+
+    # Last fallback: first available source (stable order by key).
+    return rgb_sources[sorted(rgb_sources.keys())[0]]
+
+
+def _extract_widowx_rgb_obs(raw_obs: Dict[str, Any], im_size: int) -> np.ndarray:
+    rgb_sources = _extract_widowx_rgb_sources(raw_obs, im_size)
+    if "external_img" in rgb_sources:
+        return rgb_sources["external_img"]
+    if "over_shoulder_img" in rgb_sources:
+        return rgb_sources["over_shoulder_img"]
+    return rgb_sources[sorted(rgb_sources.keys())[0]]
 
 
 def _resize_and_format_rgb(base_rgb: np.ndarray, shape: Any) -> np.ndarray:
@@ -344,7 +430,8 @@ def _extract_low_dim(
 def _build_policy_obs_frame(
     raw_obs: Dict[str, Any], obs_shape_meta: Dict[str, Any], im_size: int
 ) -> Tuple[Dict[str, np.ndarray], np.ndarray]:
-    base_rgb = _extract_widowx_rgb_obs(raw_obs, im_size)
+    rgb_sources = _extract_widowx_rgb_sources(raw_obs, im_size)
+    vis_rgb = _extract_widowx_rgb_obs(raw_obs, im_size)
     state_vec = np.asarray(raw_obs.get("state", []), dtype=np.float32).reshape(-1)
 
     obs_frame: Dict[str, np.ndarray] = {}
@@ -355,11 +442,27 @@ def _build_policy_obs_frame(
             raise KeyError(f"Missing shape metadata for obs key: {key}")
 
         if obs_type == "rgb":
-            obs_frame[key] = _resize_and_format_rgb(base_rgb, shape)
+            key_rgb = _select_rgb_source_for_obs_key(key, rgb_sources)
+            obs_frame[key] = _resize_and_format_rgb(key_rgb, shape)
         else:
             obs_frame[key] = _extract_low_dim(raw_obs, key, shape, state_vec)
 
-    return obs_frame, base_rgb
+    return obs_frame, vis_rgb
+
+
+def _project_action_to_env_mode(action_7d: np.ndarray, action_mode: str) -> np.ndarray:
+    if action_mode == "2trans":
+        return action_7d[:2]
+    if action_mode == "3trans":
+        return np.array([action_7d[0], action_7d[1], action_7d[2], action_7d[6]], dtype=np.float64)
+    if action_mode == "3trans1rot":
+        return np.array(
+            [action_7d[0], action_7d[1], action_7d[2], action_7d[5], action_7d[6]],
+            dtype=np.float64,
+        )
+    if action_mode == "3trans3rot":
+        return action_7d
+    raise ValueError(f"Unsupported action_mode: {action_mode}")
 
 
 def _stack_obs_history(obs_history: deque) -> Dict[str, np.ndarray]:
@@ -425,7 +528,7 @@ def main(_):
         logging.warning("CUDA not available, fallback to CPU")
         device = torch.device("cpu")
 
-    WidowXClient, WidowXStatus, WidowXConfigs, state_to_eep = _load_widowx_dependencies()
+    WidowXClient, WidowXStatus, WidowXConfigs = _load_widowx_dependencies()
 
     policies: List[LoadedPolicy] = []
     for idx, ckpt_input in enumerate(FLAGS.checkpoint):
@@ -464,9 +567,27 @@ def main(_):
             "camera_topics": CAMERA_TOPICS,
             "override_workspace_boundaries": WORKSPACE_BOUNDS,
             "move_duration": float(FLAGS.step_duration),
+            "action_mode": FLAGS.action_mode,
+            "skip_move_to_neutral": False,
+            "move_to_rand_start_freq": -1,
+            "fix_zangle": 0.1,
+            "adaptive_wait": True,
+            "fixed_z_height": float(FLAGS.fixed_z_height),
+            "neutral_z_height": float(FLAGS.neutral_z_height),
+            "z_lock_feedback_gain": 0.2,
+            "z_lock_max_delta": 0.0015,
+            "z_lock_deadband": 0.002,
+            "xy_action_deadband": 0.0015,
+            "vr_vertical_reject_ratio": 0.6,
+            "vr_xy_step_deadband": 0.0015,
+            "vr_xy_step_clip": 0.008,
+            "vr_xy_scale": 0.9,
+            "fixed_gripper": float(FLAGS.fixed_gripper),
+            "lock_z": bool(FLAGS.lock_z),
+            "action_clipping": None,
         }
     )
-    env_params["state_state"] = list(start_state)
+    env_params["start_state"] = list(start_state)
 
     widowx_client = WidowXClient(host=FLAGS.ip, port=FLAGS.port)
     widowx_client.init(env_params, image_size=FLAGS.im_size)
@@ -504,8 +625,11 @@ def main(_):
         time.sleep(2.5)
 
         if FLAGS.initial_eep is not None:
-            initial_pose = state_to_eep(initial_eep, 0)
             widowx_client.move_gripper(1.0)  # open gripper
+            initial_pose = np.array(
+                [initial_eep[0], initial_eep[1], initial_eep[2], 0.0, 0.0, 0.0],
+                dtype=np.float64,
+            )
             move_status = None
             while move_status != WidowXStatus.SUCCESS:
                 move_status = widowx_client.move(initial_pose, duration=1.5)
@@ -561,13 +685,12 @@ def main(_):
 
                 exec_horizon = min(int(FLAGS.act_exec_horizon), actions.shape[0])
                 for i in range(exec_horizon):
-                    action = np.asarray(actions[i], dtype=np.float64).reshape(-1)
-                    if action.size < 7:
-                        raise ValueError(
-                            f"Policy action dim {action.size} < 7, cannot execute on WidowX"
-                        )
-                    if action.size > 7:
-                        action = action[:7]
+                    raw_action = np.asarray(actions[i], dtype=np.float64).reshape(-1)
+                    action = np.zeros((7,), dtype=np.float64)
+                    copy_dim = min(7, raw_action.size)
+                    action[:copy_dim] = raw_action[:copy_dim]
+                    if raw_action.size == 2 and FLAGS.action_mode == "2trans":
+                        action[6] = float(FLAGS.fixed_gripper)
 
                     if fixed_std.size == action.size:
                         action += np.random.normal(0.0, fixed_std)
@@ -595,7 +718,8 @@ def main(_):
                     if FLAGS.no_yaw:
                         action[5] = 0.0
 
-                    widowx_client.step_action(action, blocking=FLAGS.blocking)
+                    env_action = _project_action_to_env_mode(action, FLAGS.action_mode)
+                    widowx_client.step_action(env_action, blocking=FLAGS.blocking)
 
                     images.append(vis_rgb)
                     t += 1
