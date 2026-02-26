@@ -92,6 +92,17 @@ flags.DEFINE_integer("act_exec_horizon", 8, "How many planned actions to execute
 
 flags.DEFINE_bool("blocking", False, "Use blocking controller")
 flags.DEFINE_spaceseplist("initial_eep", [0.3, 0.0, 0.02], "Initial position")
+flags.DEFINE_bool(
+    "run_initial_absolute_move",
+    False,
+    "After reset, call absolute move([x,y,z,roll,pitch,yaw]) to initial_eep. "
+    "Disabled by default because [x,y,z,0,0,0] is often IK-infeasible on WidowX.",
+)
+flags.DEFINE_integer(
+    "max_initial_move_retries",
+    3,
+    "Maximum retries for optional absolute initial move.",
+)
 flags.DEFINE_string("ip", "localhost", "Robot IP")
 flags.DEFINE_integer("port", 5556, "Robot port")
 flags.DEFINE_enum(
@@ -109,6 +120,21 @@ flags.DEFINE_bool("show_image", False, "Show camera image")
 flags.DEFINE_string("video_save_path", None, "Directory to save rollout videos")
 flags.DEFINE_bool("no_pitch_roll", False, "Zero out pitch/roll action dims")
 flags.DEFINE_bool("no_yaw", False, "Zero out yaw action dim")
+flags.DEFINE_float(
+    "safety_max_xy_delta",
+    0.008,
+    "Safety clip for |dx|,|dy| in 2trans mode (meters). Set <=0 to disable.",
+)
+flags.DEFINE_float(
+    "safety_max_xyz_delta",
+    0.02,
+    "Safety clip for |dx|,|dy|,|dz| in non-2trans modes (meters). Set <=0 to disable.",
+)
+flags.DEFINE_float(
+    "safety_max_rot_delta",
+    0.25,
+    "Safety clip for |droll|,|dpitch|,|dyaw| in non-2trans modes (radians). Set <=0 to disable.",
+)
 
 flags.DEFINE_integer(
     "sticky_gripper_num_steps",
@@ -493,6 +519,26 @@ def _project_action_to_env_mode(action_7d: np.ndarray, action_mode: str) -> np.n
     raise ValueError(f"Unsupported action_mode: {action_mode}")
 
 
+def _safety_clip_action(action_7d: np.ndarray, action_mode: str) -> np.ndarray:
+    action = np.asarray(action_7d, dtype=np.float64).copy()
+
+    if action_mode == "2trans":
+        if FLAGS.safety_max_xy_delta > 0:
+            lim = float(FLAGS.safety_max_xy_delta)
+            action[:2] = np.clip(action[:2], -lim, lim)
+        # 2trans should only use planar translation deltas.
+        action[2:6] = 0.0
+        return action
+
+    if FLAGS.safety_max_xyz_delta > 0:
+        lim_xyz = float(FLAGS.safety_max_xyz_delta)
+        action[:3] = np.clip(action[:3], -lim_xyz, lim_xyz)
+    if FLAGS.safety_max_rot_delta > 0:
+        lim_rot = float(FLAGS.safety_max_rot_delta)
+        action[3:6] = np.clip(action[3:6], -lim_rot, lim_rot)
+    return action
+
+
 def _stack_obs_history(obs_history: deque) -> Dict[str, np.ndarray]:
     if len(obs_history) == 0:
         raise ValueError("obs_history is empty")
@@ -618,7 +664,14 @@ def main(_):
     env_params["start_state"] = list(start_state)
 
     widowx_client = WidowXClient(host=FLAGS.ip, port=FLAGS.port)
-    widowx_client.init(env_params, image_size=FLAGS.im_size)
+    init_status = widowx_client.init(env_params, image_size=FLAGS.im_size)
+    if init_status != WidowXStatus.SUCCESS:
+        raise RuntimeError(f"WidowX init failed with status={init_status}")
+    if FLAGS.initial_eep is not None and not FLAGS.run_initial_absolute_move:
+        print(
+            "[INFO] Using reset(start_state) only; skip optional absolute move "
+            "to avoid IK failures on incompatible roll/pitch/yaw."
+        )
     
     rollout_idx = 0
     while FLAGS.num_rollouts <= 0 or rollout_idx < FLAGS.num_rollouts:
@@ -649,18 +702,36 @@ def main(_):
 
         input("Press [Enter] to start rollout.")
 
-        widowx_client.reset()
+        reset_status = widowx_client.reset()
+        if reset_status != WidowXStatus.SUCCESS:
+            print(f"[ERROR] Reset failed with status={reset_status}, skip rollout.")
+            rollout_idx += 1
+            continue
         time.sleep(2.5)
 
-        if FLAGS.initial_eep is not None:
+        if FLAGS.initial_eep is not None and FLAGS.run_initial_absolute_move:
             widowx_client.move_gripper(1.0)  # open gripper
             initial_pose = np.array(
                 [initial_eep[0], initial_eep[1], initial_eep[2], 0.0, 0.0, 0.0],
                 dtype=np.float64,
             )
             move_status = None
-            while move_status != WidowXStatus.SUCCESS:
+            retries = max(1, int(FLAGS.max_initial_move_retries))
+            for attempt in range(1, retries + 1):
                 move_status = widowx_client.move(initial_pose, duration=1.5)
+                if move_status == WidowXStatus.SUCCESS:
+                    break
+                print(
+                    f"[WARN] initial absolute move failed "
+                    f"(attempt {attempt}/{retries}, status={move_status})."
+                )
+            if move_status != WidowXStatus.SUCCESS:
+                print(
+                    "[ERROR] initial absolute move failed; "
+                    "set --run_initial_absolute_move=false (recommended) or adjust pose."
+                )
+                rollout_idx += 1
+                continue
 
         if hasattr(policy, "reset"):
             try:
@@ -746,8 +817,16 @@ def main(_):
                     if FLAGS.no_yaw:
                         action[5] = 0.0
 
+                    action = _safety_clip_action(action, FLAGS.action_mode)
                     env_action = _project_action_to_env_mode(action, FLAGS.action_mode)
-                    widowx_client.step_action(env_action, blocking=FLAGS.blocking)
+                    step_status = widowx_client.step_action(
+                        env_action, blocking=FLAGS.blocking
+                    )
+                    if step_status != WidowXStatus.SUCCESS:
+                        raise RuntimeError(
+                            f"WidowX step_action failed: status={step_status}, "
+                            f"env_action={env_action.tolist()}"
+                        )
 
                     images.append(vis_rgb)
                     t += 1
