@@ -12,7 +12,20 @@ python scripts/eval/eval_widowx.py \
   --act_exec_horizon 8 \
   --im_size 480 \
   --widowx_init_timeout_ms 180000 \
-  --widowx_init_retries 8
+  --widowx_init_retries 8 \
+  --video_save_path /data/BFN_data/diffusion_results
+
+python scripts/eval/eval_widowx.py \
+  --checkpoint /data/BFN_data/checkpoints/bfn_real_pusht.ckpt \
+  --widowx_envs_path /scr2/zhaoyang/bridge_data_robot_pusht/widowx_envs \
+  --action_mode 2trans \
+  --step_duration 0.1 \
+  --act_exec_horizon 8 \
+  --im_size 480 \
+  --widowx_init_timeout_ms 180000 \
+  --widowx_init_retries 8 \
+  --video_save_path /data/BFN_data/bfn_results
+
 """
 
 from __future__ import annotations
@@ -87,7 +100,7 @@ flags.DEFINE_integer(
 )
 
 flags.DEFINE_integer("im_size", 480, "WidowX service image size")
-flags.DEFINE_integer("num_timesteps", 120, "Number of control steps per rollout")
+flags.DEFINE_integer("num_timesteps", 700, "Number of control steps per rollout")
 flags.DEFINE_integer("num_rollouts", 1, "Number of rollouts; <=0 means infinite")
 flags.DEFINE_float("step_duration", 0.1, "Control period in seconds")
 flags.DEFINE_integer("act_exec_horizon", 8, "How many planned actions to execute")
