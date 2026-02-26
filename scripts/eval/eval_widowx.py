@@ -826,19 +826,6 @@ def main(_):
 
         input("Press [Enter] to start rollout.")
 
-        reset_status = _reset_widowx_with_retry(
-            widowx_client=widowx_client,
-            WidowXStatus=WidowXStatus,
-        )
-        if reset_status != WidowXStatus.SUCCESS:
-            print(
-                "[ERROR] Reset failed with status="
-                f"{_status_name(reset_status, WidowXStatus)}, skip rollout."
-            )
-            rollout_idx += 1
-            continue
-        time.sleep(2.5)
-
         if FLAGS.initial_eep is not None and FLAGS.run_initial_absolute_move:
             widowx_client.move_gripper(1.0)  # open gripper
             initial_pose = np.array(
