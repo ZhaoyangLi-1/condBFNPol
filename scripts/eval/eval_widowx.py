@@ -14,7 +14,6 @@ python scripts/eval/eval_widowx.py \
   --widowx_init_timeout_ms 180000 \
   --widowx_init_retries 8 \
   --video_save_path /data/BFN_data/diffusion_results \
-  --num_timesteps 700 \
   -- save_two_camera_videos
   
 
@@ -28,7 +27,6 @@ python scripts/eval/eval_widowx.py \
   --widowx_init_timeout_ms 180000 \
   --widowx_init_retries 8 \
   --video_save_path /data/BFN_data/bfn_results \
-  --num_timesteps 700 \
   save_two_camera_videos
 
 """
@@ -109,9 +107,28 @@ flags.DEFINE_integer(
 )
 
 flags.DEFINE_integer("im_size", 480, "WidowX service image size")
-flags.DEFINE_integer("num_timesteps", 300, "Number of policy control steps per rollout")
 flags.DEFINE_integer("num_rollouts", 1, "Number of rollouts; <=0 means infinite")
 flags.DEFINE_float("step_duration", 0.1, "Control period in seconds")
+flags.DEFINE_float(
+    "max_duration",
+    60.0,
+    "Max duration for each rollout in seconds.",
+)
+flags.DEFINE_spaceseplist(
+    "term_pose_xy",
+    [],
+    "Optional fixed termination XY. Leave empty to auto-align to post-reset robot pose.",
+)
+flags.DEFINE_float(
+    "term_dist_thresh",
+    0.03,
+    "EEF XY distance threshold to consider entering termination area (meters).",
+)
+flags.DEFINE_float(
+    "term_hold_sec",
+    0.5,
+    "Required dwell time in termination area before auto-termination (seconds).",
+)
 flags.DEFINE_float(
     "robot_exec_hz",
     10.0,
@@ -871,6 +888,33 @@ def _poll_stop_key(show_image: bool, stdin_fd: int | None) -> bool:
     return False
 
 
+def _extract_eef_xy(raw_obs: Dict[str, Any]) -> np.ndarray | None:
+    for key in ("eef_pos", "ee_pos", "agent_pos", "state", "proprio"):
+        if key not in raw_obs or raw_obs[key] is None:
+            continue
+        arr = np.asarray(raw_obs[key], dtype=np.float64).reshape(-1)
+        if arr.size >= 2:
+            return arr[:2]
+    return None
+
+
+def _get_current_eef_xy_with_retry(
+    widowx_client: Any,
+    max_wait_sec: float = 2.0,
+    poll_interval_sec: float = 0.05,
+) -> np.ndarray | None:
+    deadline = time.monotonic() + max(0.1, float(max_wait_sec))
+    poll_interval_sec = max(0.01, float(poll_interval_sec))
+    while time.monotonic() < deadline:
+        raw_obs = widowx_client.get_observation()
+        if raw_obs is not None:
+            eef_xy = _extract_eef_xy(raw_obs)
+            if eef_xy is not None:
+                return np.asarray(eef_xy, dtype=np.float64).reshape(-1)[:2]
+        time.sleep(poll_interval_sec)
+    return None
+
+
 def _interpolate_actions_to_robot_rate(
     prev_action: np.ndarray | None,
     next_action: np.ndarray,
@@ -940,6 +984,18 @@ def main(_):
         f"policy_hz={policy_hz:.6f}, robot_exec_hz={robot_exec_hz:.6f}, "
         f"interp_substeps={interp_substeps}, robot_step_duration={robot_step_duration:.6f}s"
     )
+    term_pose_xy_override: np.ndarray | None = None
+    if len(FLAGS.term_pose_xy) > 0:
+        term_pose_xy_override = np.array([float(v) for v in FLAGS.term_pose_xy], dtype=np.float64).reshape(-1)
+        if term_pose_xy_override.size < 2:
+            raise ValueError("--term_pose_xy must contain at least two numbers: x y")
+        term_pose_xy_override = term_pose_xy_override[:2]
+    if FLAGS.term_dist_thresh <= 0:
+        raise ValueError("--term_dist_thresh must be > 0")
+    if FLAGS.term_hold_sec <= 0:
+        raise ValueError("--term_hold_sec must be > 0")
+    if FLAGS.max_duration <= 0:
+        raise ValueError("--max_duration must be > 0")
 
     device = torch.device(FLAGS.device)
     if device.type == "cuda" and not torch.cuda.is_available():
@@ -1113,6 +1169,30 @@ def main(_):
                 )
                 rollout_idx += 1
                 continue
+        fallback_term_pose_xy = np.array(initial_eep[:2], dtype=np.float64)
+        if term_pose_xy_override is not None:
+            rollout_term_pose_xy = term_pose_xy_override.copy()
+            print(
+                "[INFO] Using fixed termination XY from --term_pose_xy: "
+                f"{np.array2string(rollout_term_pose_xy, precision=6, suppress_small=True)}"
+            )
+        else:
+            rollout_term_pose_xy = _get_current_eef_xy_with_retry(
+                widowx_client=widowx_client,
+                max_wait_sec=2.0,
+                poll_interval_sec=0.05,
+            )
+            if rollout_term_pose_xy is None:
+                rollout_term_pose_xy = fallback_term_pose_xy
+                print(
+                    "[WARN] Failed to read post-reset EEF XY; "
+                    f"fallback termination XY={rollout_term_pose_xy.tolist()} from --initial_eep."
+                )
+            else:
+                print(
+                    "[INFO] Auto-aligned termination XY to post-reset robot pose: "
+                    f"{np.array2string(rollout_term_pose_xy, precision=6, suppress_small=True)}"
+                )
 
         if hasattr(policy, "reset"):
             try:
@@ -1134,10 +1214,17 @@ def main(_):
 
         t = 0
         stop_this_rollout = False
+        stop_reason: str | None = None
+        rollout_t_start = time.monotonic()
+        term_area_start_timestamp = float("inf")
+        warned_missing_eef_xy = False
         stdin_fd, stdin_old_attrs = _enter_terminal_cbreak_mode()
-        print("[INFO] Press 's' to stop evaluation and save video.")
+        print(
+            "[INFO] Stop modes: press 's', timeout by --max_duration, "
+            "or dwell in termination area."
+        )
         try:
-            while t < FLAGS.num_timesteps:
+            while True:
                 if not FLAGS.blocking and time.time() <= last_tstep + FLAGS.step_duration:
                     time.sleep(0.001)
                     continue
@@ -1165,7 +1252,34 @@ def main(_):
                     print("[INFO] Stop requested by user; ending rollout early.")
                     stop_this_rollout = True
                     stop_requested = True
+                    stop_reason = "manual"
                     break
+                elapsed = time.monotonic() - rollout_t_start
+                if elapsed > float(FLAGS.max_duration):
+                    print("[INFO] Terminated by timeout.")
+                    stop_this_rollout = True
+                    stop_reason = "timeout"
+                    break
+
+                eef_xy = _extract_eef_xy(raw_obs)
+                if eef_xy is None:
+                    if not warned_missing_eef_xy:
+                        print("[WARN] Could not extract EEF XY from observation; disabling term-area stop.")
+                        warned_missing_eef_xy = True
+                    term_area_start_timestamp = float("inf")
+                else:
+                    dist = np.linalg.norm(eef_xy - rollout_term_pose_xy, axis=-1)
+                    now = time.monotonic()
+                    if dist < float(FLAGS.term_dist_thresh):
+                        if term_area_start_timestamp > now:
+                            term_area_start_timestamp = now
+                        elif (now - term_area_start_timestamp) > float(FLAGS.term_hold_sec):
+                            print("[INFO] Terminated by reaching termination area.")
+                            stop_this_rollout = True
+                            stop_reason = "term_area"
+                            break
+                    else:
+                        term_area_start_timestamp = float("inf")
 
                 if len(obs_hist) == 0:
                     obs_hist.extend([obs_frame] * max(1, loaded.n_obs_steps))
@@ -1256,6 +1370,12 @@ def main(_):
                             print("[INFO] Stop requested by user; ending rollout early.")
                             stop_this_rollout = True
                             stop_requested = True
+                            stop_reason = "manual"
+                            break
+                        if (time.monotonic() - rollout_t_start) > float(FLAGS.max_duration):
+                            print("[INFO] Terminated by timeout.")
+                            stop_this_rollout = True
+                            stop_reason = "timeout"
                             break
                     if stop_this_rollout:
                         break
@@ -1264,7 +1384,7 @@ def main(_):
 
                     images.append(vis_rgb)
                     t += 1
-                    if t >= FLAGS.num_timesteps or stop_this_rollout:
+                    if stop_this_rollout:
                         break
                 if stop_this_rollout:
                     break
@@ -1278,6 +1398,12 @@ def main(_):
         if FLAGS.save_two_camera_videos:
             _save_rollout_video(cam0_images, f"{loaded.name}_cam0")
             _save_rollout_video(cam1_images, f"{loaded.name}_cam1")
+        if stop_reason == "manual":
+            print("[INFO] Rollout ended by user request (S key).")
+        elif stop_reason == "timeout":
+            print("[INFO] Rollout ended by timeout condition.")
+        elif stop_reason == "term_area":
+            print("[INFO] Rollout ended by termination-area condition.")
         rollout_idx += 1
         if stop_requested:
             print("[INFO] Evaluation stopped by user request.")
