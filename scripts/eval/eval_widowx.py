@@ -97,12 +97,12 @@ flags.DEFINE_string("device", "cuda:0", "Torch device, e.g. cuda:0 or cpu")
 flags.DEFINE_bool("use_ema", True, "Use ema_model when available")
 flags.DEFINE_integer(
     "num_inference_steps",
-    -1,
+    100,
     "Override diffusion num_inference_steps when > 0",
 )
 flags.DEFINE_integer(
     "bfn_n_timesteps",
-    -1,
+    20,
     "Override BFN n_timesteps when > 0",
 )
 
