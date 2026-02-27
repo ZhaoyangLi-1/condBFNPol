@@ -27,7 +27,7 @@ python scripts/eval/eval_widowx.py \
   --widowx_init_timeout_ms 180000 \
   --widowx_init_retries 8 \
   --video_save_path /data/BFN_data/bfn_results \
-  save_two_camera_videos
+  -- save_two_camera_videos
 
 """
 
