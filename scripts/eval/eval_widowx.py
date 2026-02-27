@@ -7,14 +7,13 @@ loads PyTorch workspace checkpoints trained in this repository.
 python scripts/eval/eval_widowx.py \
   --checkpoint /data/BFN_data/checkpoints/diffusion_real_pusht.ckpt \
   --widowx_envs_path /scr2/zhaoyang/bridge_data_robot_pusht/widowx_envs \
-  --action_mode 3trans3rot \
+  --action_mode 2trans \
   --step_duration 0.1 \
   --act_exec_horizon 8 \
   --im_size 480 \
   --widowx_init_timeout_ms 180000 \
   --widowx_init_retries 8 \
-  --video_save_path /data/BFN_data/diffusion_results \
-  -- save_two_camera_videos
+  --video_save_path /data/BFN_data/diffusion_results
   
 
 python scripts/eval/eval_widowx.py \
@@ -26,8 +25,9 @@ python scripts/eval/eval_widowx.py \
   --im_size 480 \
   --widowx_init_timeout_ms 180000 \
   --widowx_init_retries 8 \
-  --video_save_path /data/BFN_data/bfn_results \
-  -- save_two_camera_videos
+  --video_save_path /data/BFN_data/bfn_results
+
+When --video_save_path is set, cam0/cam1 videos are always saved separately.
 
 """
 
@@ -126,7 +126,7 @@ flags.DEFINE_float(
 )
 flags.DEFINE_float(
     "term_hold_sec",
-    0.5,
+    1.0,
     "Required dwell time in termination area before auto-termination (seconds).",
 )
 flags.DEFINE_float(
@@ -214,26 +214,31 @@ flags.DEFINE_bool(
 
 flags.DEFINE_bool("show_image", False, "Show camera image")
 flags.DEFINE_string("video_save_path", None, "Directory to save rollout videos")
+flags.DEFINE_float(
+    "video_fps_scale",
+    0.33,
+    "Saved video speed scale relative to policy rate (1.0=real-time, <1 slower).",
+)
 flags.DEFINE_bool(
     "save_two_camera_videos",
-    False,
-    "Also save separate cam0/cam1 videos when video_save_path is set.",
+    True,
+    "Deprecated/ignored. Cam0/cam1 videos are always saved when video_save_path is set.",
 )
 flags.DEFINE_bool("no_pitch_roll", False, "Zero out pitch/roll action dims")
 flags.DEFINE_bool("no_yaw", False, "Zero out yaw action dim")
 flags.DEFINE_float(
     "safety_max_xy_delta",
-    1,
+    0.1,
     "Safety clip for |dx|,|dy| in 2trans mode (meters). Set <=0 to disable.",
 )
 flags.DEFINE_float(
     "safety_max_xyz_delta",
-    1,
+    0.1,
     "Safety clip for |dx|,|dy|,|dz| in non-2trans modes (meters). Set <=0 to disable.",
 )
 flags.DEFINE_float(
     "safety_max_rot_delta",
-    1,
+    0.1,
     "Safety clip for |droll|,|dpitch|,|dyaw| in non-2trans modes (radians). Set <=0 to disable.",
 )
 
@@ -949,7 +954,7 @@ def _save_rollout_video(images: List[np.ndarray], policy_name: str):
         FLAGS.video_save_path,
         f"{curr_time}_{safe_name}_sticky_{FLAGS.sticky_gripper_num_steps}.mp4",
     )
-    fps = max(1.0, (1.0 / FLAGS.step_duration) * 3.0)
+    fps = max(1.0, (1.0 / FLAGS.step_duration) * max(0.01, float(FLAGS.video_fps_scale)))
     imageio.mimsave(save_path, images, fps=fps)
     print(f"Saved video to: {save_path}")
 
@@ -1202,7 +1207,6 @@ def main(_):
 
         last_tstep = time.time()
         last_exec_tstep = last_tstep - robot_step_duration
-        images: List[np.ndarray] = []
         cam0_images: List[np.ndarray] = []
         cam1_images: List[np.ndarray] = []
         obs_hist = deque(maxlen=max(1, loaded.n_obs_steps))
@@ -1218,6 +1222,7 @@ def main(_):
         rollout_t_start = time.monotonic()
         term_area_start_timestamp = float("inf")
         warned_missing_eef_xy = False
+        warned_missing_camera_stream = False
         stdin_fd, stdin_old_attrs = _enter_terminal_cbreak_mode()
         print(
             "[INFO] Stop modes: press 's', timeout by --max_duration, "
@@ -1239,12 +1244,19 @@ def main(_):
                     obs_shape_meta=obs_shape_meta,
                     im_size=FLAGS.im_size,
                 )
-                if FLAGS.save_two_camera_videos:
-                    cam0_rgb, cam1_rgb = _extract_two_camera_rgb(raw_obs, FLAGS.im_size)
-                    if cam0_rgb is not None:
-                        cam0_images.append(cam0_rgb)
-                    if cam1_rgb is not None:
-                        cam1_images.append(cam1_rgb)
+                cam0_rgb, cam1_rgb = _extract_two_camera_rgb(raw_obs, FLAGS.im_size)
+                if cam0_rgb is None:
+                    cam0_rgb = vis_rgb
+                if cam1_rgb is None:
+                    if not warned_missing_camera_stream:
+                        print(
+                            "[WARN] Second camera stream not found in observation; "
+                            "cam1 video will mirror cam0 frames."
+                        )
+                        warned_missing_camera_stream = True
+                    cam1_rgb = cam0_rgb
+                cam0_images.append(cam0_rgb)
+                cam1_images.append(cam1_rgb)
 
                 if FLAGS.show_image:
                     cv2.imshow("img_view", cv2.cvtColor(vis_rgb, cv2.COLOR_RGB2BGR))
@@ -1382,7 +1394,6 @@ def main(_):
 
                     prev_policy_action = action.copy()
 
-                    images.append(vis_rgb)
                     t += 1
                     if stop_this_rollout:
                         break
@@ -1394,10 +1405,8 @@ def main(_):
         finally:
             _restore_terminal_mode(stdin_fd, stdin_old_attrs)
 
-        _save_rollout_video(images, loaded.name)
-        if FLAGS.save_two_camera_videos:
-            _save_rollout_video(cam0_images, f"{loaded.name}_cam0")
-            _save_rollout_video(cam1_images, f"{loaded.name}_cam1")
+        _save_rollout_video(cam0_images, f"{loaded.name}_cam0")
+        _save_rollout_video(cam1_images, f"{loaded.name}_cam1")
         if stop_reason == "manual":
             print("[INFO] Rollout ended by user request (S key).")
         elif stop_reason == "timeout":
