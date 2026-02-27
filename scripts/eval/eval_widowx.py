@@ -7,14 +7,15 @@ loads PyTorch workspace checkpoints trained in this repository.
 python scripts/eval/eval_widowx.py \
   --checkpoint /data/BFN_data/checkpoints/diffusion_real_pusht.ckpt \
   --widowx_envs_path /scr2/zhaoyang/bridge_data_robot_pusht/widowx_envs \
-  --action_mode 2trans \
+  --action_mode 3trans3rot \
   --step_duration 0.1 \
   --act_exec_horizon 8 \
   --im_size 480 \
   --widowx_init_timeout_ms 180000 \
   --widowx_init_retries 8 \
   --video_save_path /data/BFN_data/diffusion_results \
-  --num_timesteps 700
+  --num_timesteps 700 \
+  -- save_two_camera_videos
   
 
 python scripts/eval/eval_widowx.py \
@@ -27,7 +28,8 @@ python scripts/eval/eval_widowx.py \
   --widowx_init_timeout_ms 180000 \
   --widowx_init_retries 8 \
   --video_save_path /data/BFN_data/bfn_results \
-  --num_timesteps 400
+  --num_timesteps 700 \
+  save_two_camera_videos
 
 """
 
@@ -36,9 +38,13 @@ from __future__ import annotations
 import importlib.util
 import os
 import re
+import select
+import socket
 import sys
+import termios
 import time
 import traceback
+import tty
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
@@ -103,12 +109,22 @@ flags.DEFINE_integer(
 )
 
 flags.DEFINE_integer("im_size", 480, "WidowX service image size")
-flags.DEFINE_integer("num_timesteps", 700, "Number of control steps per rollout")
+flags.DEFINE_integer("num_timesteps", 300, "Number of policy control steps per rollout")
 flags.DEFINE_integer("num_rollouts", 1, "Number of rollouts; <=0 means infinite")
 flags.DEFINE_float("step_duration", 0.1, "Control period in seconds")
+flags.DEFINE_float(
+    "robot_exec_hz",
+    10.0,
+    "Robot command execution frequency in Hz after linear interpolation.",
+)
 flags.DEFINE_integer("act_exec_horizon", 8, "How many planned actions to execute")
+flags.DEFINE_bool(
+    "allow_unpaced_action_chunks",
+    False,
+    "If false, cap act_exec_horizon to 1 when blocking=False to avoid over-commanding.",
+)
 
-flags.DEFINE_bool("blocking", False, "Use blocking controller")
+flags.DEFINE_bool("blocking", True, "Use blocking controller")
 flags.DEFINE_spaceseplist("initial_eep", [0.3, 0.0, 0.02], "Initial position")
 flags.DEFINE_bool(
     "run_initial_absolute_move",
@@ -168,6 +184,16 @@ flags.DEFINE_bool("lock_z", True, "Enable Z locking in env params")
 flags.DEFINE_float("fixed_z_height", 0.02, "Fixed z height used when lock_z is True")
 flags.DEFINE_float("neutral_z_height", 0.02, "Neutral z height")
 flags.DEFINE_float("fixed_gripper", 0.0, "Fixed gripper command for 2trans env mode")
+flags.DEFINE_spaceseplist(
+    "camera_topics",
+    ["/D435/color/image_raw", "/blue/image_raw"],
+    "ROS RGB image topics passed to WidowX env init.",
+)
+flags.DEFINE_bool(
+    "skip_move_to_neutral",
+    False,
+    "Pass through skip_move_to_neutral to WidowX env init.",
+)
 
 flags.DEFINE_bool("show_image", False, "Show camera image")
 flags.DEFINE_string("video_save_path", None, "Directory to save rollout videos")
@@ -180,17 +206,17 @@ flags.DEFINE_bool("no_pitch_roll", False, "Zero out pitch/roll action dims")
 flags.DEFINE_bool("no_yaw", False, "Zero out yaw action dim")
 flags.DEFINE_float(
     "safety_max_xy_delta",
-    0.008,
+    1,
     "Safety clip for |dx|,|dy| in 2trans mode (meters). Set <=0 to disable.",
 )
 flags.DEFINE_float(
     "safety_max_xyz_delta",
-    0.02,
+    1,
     "Safety clip for |dx|,|dy|,|dz| in non-2trans modes (meters). Set <=0 to disable.",
 )
 flags.DEFINE_float(
     "safety_max_rot_delta",
-    0.25,
+    1,
     "Safety clip for |droll|,|dpitch|,|dyaw| in non-2trans modes (radians). Set <=0 to disable.",
 )
 
@@ -216,7 +242,6 @@ flags.DEFINE_string(
     "Path that contains widowx_envs and utils.py",
 )
 
-CAMERA_TOPICS = [ {"name": "/D435/color/image_raw"}, {"name": "/blue/image_raw"}]
 WORKSPACE_BOUNDS = [[0.1, -0.15, -0.01, -1.57, 0], [0.45, 0.25, 0.25, 1.57, 0]]
 
 
@@ -228,6 +253,7 @@ class LoadedPolicy:
     shape_meta: Dict[str, Any]
     n_obs_steps: int
     n_action_steps: int
+    action_input_std: np.ndarray | None = None
 
 
 def _load_widowx_dependencies():
@@ -280,6 +306,14 @@ def _set_widowx_reqrep_timeout_ms(widowx_client: Any, timeout_ms: int) -> None:
         pass
 
 
+def _tcp_port_reachable(host: str, port: int, timeout_s: float = 1.0) -> bool:
+    try:
+        with socket.create_connection((host, int(port)), timeout=max(0.05, float(timeout_s))):
+            return True
+    except Exception:
+        return False
+
+
 def _init_widowx_with_retry(
     widowx_client: Any,
     env_params: Dict[str, Any],
@@ -295,15 +329,29 @@ def _init_widowx_with_retry(
     last_status = None
 
     for attempt in range(1, retries + 1):
+        print(
+            f"[INFO] WidowX init attempt {attempt}/{retries} "
+            f"(timeout={init_timeout_ms} ms, server={FLAGS.ip}:{FLAGS.port})"
+        )
+        t0 = time.time()
         last_status = widowx_client.init(env_params, image_size=image_size)
+        elapsed = time.time() - t0
         if last_status == WidowXStatus.SUCCESS:
             _set_widowx_reqrep_timeout_ms(widowx_client, rpc_timeout_ms)
             return last_status
 
         print(
             f"[WARN] WidowX init attempt {attempt}/{retries} failed with "
-            f"status={_status_name(last_status, WidowXStatus)}."
+            f"status={_status_name(last_status, WidowXStatus)} "
+            f"after {elapsed:.2f}s."
         )
+        no_connection = getattr(WidowXStatus, "NO_CONNECTION", None)
+        if last_status == no_connection:
+            print(
+                "[HINT] No response from WidowX action server. "
+                "Make sure `widowx_env_service --server` is running "
+                f"and reachable at {FLAGS.ip}:{FLAGS.port}."
+            )
         if attempt < retries and retry_sleep > 0.0:
             time.sleep(retry_sleep)
 
@@ -377,9 +425,25 @@ def _resolve_checkpoint_path(path_or_dir: str) -> str:
     return str(candidates[-1])
 
 
+def _extract_action_input_std_from_state_dict(
+    state_dict: Dict[str, Any],
+) -> np.ndarray | None:
+    std = state_dict.get("normalizer.params_dict.action.input_stats.std", None)
+    if isinstance(std, torch.Tensor):
+        return std.detach().to("cpu").numpy().astype(np.float64)
+
+    normalizer = state_dict.get("normalizer", None)
+    if isinstance(normalizer, dict):
+        nested_std = normalizer.get("params_dict.action.input_stats.std", None)
+        if isinstance(nested_std, torch.Tensor):
+            return nested_std.detach().to("cpu").numpy().astype(np.float64)
+
+    return None
+
+
 def _load_policy_from_checkpoint(
     checkpoint_path: str, device: torch.device
-) -> Tuple[Any, Dict[str, Any], int, int]:
+) -> Tuple[Any, Dict[str, Any], int, int, np.ndarray | None]:
     payload = torch.load(
         open(checkpoint_path, "rb"), pickle_module=dill, map_location="cpu"
     )
@@ -399,9 +463,11 @@ def _load_policy_from_checkpoint(
         )
 
     loaded_source = None
+    action_input_std = None
     last_load_error: Exception | None = None
     for source, state in load_candidates:
         try:
+            action_input_std = _extract_action_input_std_from_state_dict(state)
             state = {
                 k.replace("_orig_mod.", ""): v
                 for k, v in state.items()
@@ -446,7 +512,7 @@ def _load_policy_from_checkpoint(
     n_action_steps = int(
         getattr(policy, "n_action_steps", _cfg_get(cfg, "n_action_steps", 1))
     )
-    return policy, shape_meta, n_obs_steps, n_action_steps
+    return policy, shape_meta, n_obs_steps, n_action_steps, action_input_std
 
 
 def _to_uint8_rgb(img: np.ndarray) -> np.ndarray:
@@ -577,6 +643,23 @@ def _extract_widowx_rgb_obs(raw_obs: Dict[str, Any], im_size: int) -> np.ndarray
     if "over_shoulder_img" in rgb_sources:
         return rgb_sources["over_shoulder_img"]
     return rgb_sources[sorted(rgb_sources.keys())[0]]
+
+
+def _build_camera_topics_from_flags() -> List[Dict[str, str]]:
+    topics: List[Dict[str, str]] = []
+    for topic in FLAGS.camera_topics:
+        # Support both:
+        #   --camera_topics=/a,/b
+        #   --camera_topics="/a /b"
+        #   --camera_topics=/a --camera_topics=/b
+        pieces = re.split(r"[,\s]+", str(topic).strip())
+        for piece in pieces:
+            topic_str = piece.strip()
+            if topic_str:
+                topics.append({"name": topic_str})
+    if not topics:
+        raise ValueError("--camera_topics must include at least one non-empty topic.")
+    return topics
 
 
 def _extract_two_camera_rgb(raw_obs: Dict[str, Any], im_size: int) -> Tuple[np.ndarray | None, np.ndarray | None]:
@@ -746,6 +829,71 @@ def _predict_action_sequence(
     return actions
 
 
+def _enter_terminal_cbreak_mode() -> Tuple[int | None, Any]:
+    if not sys.stdin.isatty():
+        return None, None
+    try:
+        fd = sys.stdin.fileno()
+        old_attrs = termios.tcgetattr(fd)
+        tty.setcbreak(fd)
+        return fd, old_attrs
+    except Exception:
+        return None, None
+
+
+def _restore_terminal_mode(fd: int | None, old_attrs: Any) -> None:
+    if fd is None or old_attrs is None:
+        return
+    try:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_attrs)
+    except Exception:
+        pass
+
+
+def _poll_stop_key(show_image: bool, stdin_fd: int | None) -> bool:
+    if show_image:
+        key = cv2.waitKey(1) & 0xFF
+        if key in (ord("s"), ord("S")):
+            return True
+
+    if stdin_fd is not None:
+        try:
+            ready, _, _ = select.select([stdin_fd], [], [], 0.0)
+        except Exception:
+            ready = []
+        if ready:
+            try:
+                ch = os.read(stdin_fd, 1).decode("utf-8", errors="ignore")
+            except Exception:
+                ch = ""
+            if ch.lower() == "s":
+                return True
+    return False
+
+
+def _interpolate_actions_to_robot_rate(
+    prev_action: np.ndarray | None,
+    next_action: np.ndarray,
+    num_substeps: int,
+) -> List[np.ndarray]:
+    num_substeps = max(1, int(num_substeps))
+    next_action = np.asarray(next_action, dtype=np.float64).reshape(-1)
+
+    if prev_action is None or num_substeps == 1:
+        return [next_action.copy() for _ in range(num_substeps)]
+
+    prev_action = np.asarray(prev_action, dtype=np.float64).reshape(-1)
+    interpolated: List[np.ndarray] = []
+    for k in range(1, num_substeps + 1):
+        alpha = float(k) / float(num_substeps)
+        sub_action = (1.0 - alpha) * prev_action + alpha * next_action
+        # Keep the gripper command discrete/sticky at the current policy step value.
+        if sub_action.size > 0 and next_action.size > 0:
+            sub_action[-1] = next_action[-1]
+        interpolated.append(sub_action)
+    return interpolated
+
+
 def _save_rollout_video(images: List[np.ndarray], policy_name: str):
     if FLAGS.video_save_path is None or len(images) == 0:
         return
@@ -771,6 +919,27 @@ def main(_):
         fixed_std = np.zeros(7, dtype=np.float64)
     if FLAGS.act_exec_horizon <= 0:
         raise ValueError("--act_exec_horizon must be >= 1")
+    if FLAGS.step_duration <= 0:
+        raise ValueError("--step_duration must be > 0")
+    if FLAGS.robot_exec_hz <= 0:
+        raise ValueError("--robot_exec_hz must be > 0")
+
+    policy_hz = 1.0 / float(FLAGS.step_duration)
+    interp_substeps = max(1, int(round(float(FLAGS.robot_exec_hz) / policy_hz)))
+    robot_exec_hz = policy_hz * float(interp_substeps)
+    robot_step_duration = float(FLAGS.step_duration) / float(interp_substeps)
+    requested_exec_hz = float(FLAGS.robot_exec_hz)
+    if abs(robot_exec_hz - requested_exec_hz) > 1e-6:
+        print(
+            "[WARN] Requested --robot_exec_hz is not an integer multiple of policy Hz "
+            f"({policy_hz:.6f}). Using nearest feasible robot Hz={robot_exec_hz:.6f} "
+            f"with {interp_substeps} substeps."
+        )
+    print(
+        "[INFO] Control rate setup: "
+        f"policy_hz={policy_hz:.6f}, robot_exec_hz={robot_exec_hz:.6f}, "
+        f"interp_substeps={interp_substeps}, robot_step_duration={robot_step_duration:.6f}s"
+    )
 
     device = torch.device(FLAGS.device)
     if device.type == "cuda" and not torch.cuda.is_available():
@@ -782,7 +951,7 @@ def main(_):
     policies: List[LoadedPolicy] = []
     for idx, ckpt_input in enumerate(FLAGS.checkpoint):
         resolved_ckpt = _resolve_checkpoint_path(ckpt_input)
-        policy, shape_meta, n_obs_steps, n_action_steps = _load_policy_from_checkpoint(
+        policy, shape_meta, n_obs_steps, n_action_steps, action_input_std = _load_policy_from_checkpoint(
             resolved_ckpt, device
         )
 
@@ -796,27 +965,35 @@ def main(_):
                 shape_meta=shape_meta,
                 n_obs_steps=n_obs_steps,
                 n_action_steps=n_action_steps,
+                action_input_std=action_input_std,
             )
         )
         print(
             f"Loaded policy[{idx}]: {name}, n_obs_steps={n_obs_steps}, "
             f"n_action_steps={n_action_steps}"
         )
+        if isinstance(action_input_std, np.ndarray):
+            print(
+                "[INFO] Action input std from checkpoint: "
+                f"{np.array2string(action_input_std, precision=6, suppress_small=True)}"
+            )
 
     if not policies:
         raise RuntimeError("No policy loaded")
 
     assert isinstance(FLAGS.initial_eep, list)
     initial_eep = [float(e) for e in FLAGS.initial_eep]
+    camera_topics = _build_camera_topics_from_flags()
+    print(f"[INFO] Using camera topics: {[cam['name'] for cam in camera_topics]}")
 
     env_params = WidowXConfigs.DefaultEnvParams.copy()
     env_params.update(
         {
-            "camera_topics": CAMERA_TOPICS,
+            "camera_topics": camera_topics,
             "override_workspace_boundaries": WORKSPACE_BOUNDS,
-            "move_duration": float(FLAGS.step_duration),
+            "move_duration": robot_step_duration,
             "action_mode": FLAGS.action_mode,
-            "skip_move_to_neutral": False,
+            "skip_move_to_neutral": bool(FLAGS.skip_move_to_neutral),
             "move_to_rand_start_freq": -1,
             "fix_zangle": 0.1,
             "adaptive_wait": True,
@@ -835,6 +1012,12 @@ def main(_):
             "action_clipping": None,
         }
     )
+    if not _tcp_port_reachable(FLAGS.ip, FLAGS.port, timeout_s=1.0):
+        print(
+            "[WARN] Preflight TCP check failed for WidowX server at "
+            f"{FLAGS.ip}:{FLAGS.port}. "
+            "Init may timeout unless the action server is started."
+        )
     widowx_client = WidowXClient(host=FLAGS.ip, port=FLAGS.port)
     init_status = _init_widowx_with_retry(
         widowx_client=widowx_client,
@@ -856,6 +1039,7 @@ def main(_):
         )
     
     rollout_idx = 0
+    stop_requested = False
     while FLAGS.num_rollouts <= 0 or rollout_idx < FLAGS.num_rollouts:
         if len(policies) == 1:
             policy_idx = 0
@@ -867,6 +1051,14 @@ def main(_):
 
         loaded = policies[policy_idx]
         policy = loaded.policy
+        if isinstance(loaded.action_input_std, np.ndarray) and loaded.action_input_std.size >= 7:
+            # Many Bridge Push-T checkpoints are effectively XY-only despite action shape [7].
+            if np.all(np.abs(loaded.action_input_std[2:]) < 1e-12) and FLAGS.action_mode != "2trans":
+                print(
+                    "[WARN] Checkpoint action stats indicate only XY deltas were trained "
+                    f"(std={np.array2string(loaded.action_input_std, precision=6, suppress_small=True)}). "
+                    "Consider --action_mode=2trans for closer train/eval matching."
+                )
 
         obs_shape_meta = loaded.shape_meta.get("obs", None)
         if obs_shape_meta is None:
@@ -929,15 +1121,21 @@ def main(_):
                 pass
 
         last_tstep = time.time()
+        last_exec_tstep = last_tstep - robot_step_duration
         images: List[np.ndarray] = []
         cam0_images: List[np.ndarray] = []
         cam1_images: List[np.ndarray] = []
         obs_hist = deque(maxlen=max(1, loaded.n_obs_steps))
 
+        prev_policy_action: np.ndarray | None = None
         is_gripper_closed = False
         num_consecutive_gripper_change_actions = 0
+        warned_unpaced_horizon = False
 
         t = 0
+        stop_this_rollout = False
+        stdin_fd, stdin_old_attrs = _enter_terminal_cbreak_mode()
+        print("[INFO] Press 's' to stop evaluation and save video.")
         try:
             while t < FLAGS.num_timesteps:
                 if not FLAGS.blocking and time.time() <= last_tstep + FLAGS.step_duration:
@@ -963,7 +1161,11 @@ def main(_):
 
                 if FLAGS.show_image:
                     cv2.imshow("img_view", cv2.cvtColor(vis_rgb, cv2.COLOR_RGB2BGR))
-                    cv2.waitKey(1)
+                if _poll_stop_key(FLAGS.show_image, stdin_fd):
+                    print("[INFO] Stop requested by user; ending rollout early.")
+                    stop_this_rollout = True
+                    stop_requested = True
+                    break
 
                 if len(obs_hist) == 0:
                     obs_hist.extend([obs_frame] * max(1, loaded.n_obs_steps))
@@ -980,6 +1182,19 @@ def main(_):
                 )
 
                 exec_horizon = min(int(FLAGS.act_exec_horizon), actions.shape[0])
+                if (
+                    not FLAGS.blocking
+                    and not FLAGS.allow_unpaced_action_chunks
+                    and exec_horizon > 1
+                ):
+                    if not warned_unpaced_horizon:
+                        print(
+                            "[WARN] blocking=False with act_exec_horizon>1 can over-command the robot; "
+                            "capping executed horizon to 1. "
+                            "Set --allow_unpaced_action_chunks=true to override."
+                        )
+                        warned_unpaced_horizon = True
+                    exec_horizon = 1
                 for i in range(exec_horizon):
                     raw_action = np.asarray(actions[i], dtype=np.float64).reshape(-1)
                     action = np.zeros((7,), dtype=np.float64)
@@ -1015,30 +1230,58 @@ def main(_):
                         action[5] = 0.0
 
                     action = _safety_clip_action(action, FLAGS.action_mode)
-                    env_action = _project_action_to_env_mode(action, FLAGS.action_mode)
-                    step_status = widowx_client.step_action(
-                        env_action, blocking=FLAGS.blocking
+                    sub_actions = _interpolate_actions_to_robot_rate(
+                        prev_action=prev_policy_action,
+                        next_action=action,
+                        num_substeps=interp_substeps,
                     )
-                    if step_status != WidowXStatus.SUCCESS:
-                        raise RuntimeError(
-                            "WidowX step_action failed: status="
-                            f"{_status_name(step_status, WidowXStatus)}, "
-                            f"env_action={env_action.tolist()}"
+                    for sub_action in sub_actions:
+                        if not FLAGS.blocking:
+                            wait_s = (last_exec_tstep + robot_step_duration) - time.time()
+                            if wait_s > 0.0:
+                                time.sleep(wait_s)
+                        sub_action = _safety_clip_action(sub_action, FLAGS.action_mode)
+                        env_action = _project_action_to_env_mode(sub_action, FLAGS.action_mode)
+                        step_status = widowx_client.step_action(
+                            env_action, blocking=FLAGS.blocking
                         )
+                        if step_status != WidowXStatus.SUCCESS:
+                            raise RuntimeError(
+                                "WidowX step_action failed: status="
+                                f"{_status_name(step_status, WidowXStatus)}, "
+                                f"env_action={env_action.tolist()}"
+                            )
+                        last_exec_tstep = time.time()
+                        if _poll_stop_key(FLAGS.show_image, stdin_fd):
+                            print("[INFO] Stop requested by user; ending rollout early.")
+                            stop_this_rollout = True
+                            stop_requested = True
+                            break
+                    if stop_this_rollout:
+                        break
+
+                    prev_policy_action = action.copy()
 
                     images.append(vis_rgb)
                     t += 1
-                    if t >= FLAGS.num_timesteps:
+                    if t >= FLAGS.num_timesteps or stop_this_rollout:
                         break
+                if stop_this_rollout:
+                    break
 
         except Exception:
             print(traceback.format_exc(), file=sys.stderr)
+        finally:
+            _restore_terminal_mode(stdin_fd, stdin_old_attrs)
 
         _save_rollout_video(images, loaded.name)
         if FLAGS.save_two_camera_videos:
             _save_rollout_video(cam0_images, f"{loaded.name}_cam0")
             _save_rollout_video(cam1_images, f"{loaded.name}_cam1")
         rollout_idx += 1
+        if stop_requested:
+            print("[INFO] Evaluation stopped by user request.")
+            break
 
 
 if __name__ == "__main__":
