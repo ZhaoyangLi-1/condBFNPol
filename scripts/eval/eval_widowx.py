@@ -24,7 +24,7 @@ python scripts/eval/eval_widowx.py \
   --step_duration 0.1 \
   --act_exec_horizon 8 \
   --im_size 480 \
-  --bfn_n_timesteps 20 \
+  --num_inference_steps20 \
   --widowx_init_timeout_ms 180000 \
   --widowx_init_retries 8 \
   --video_save_path /data/BFN_data/bfn_results
@@ -36,7 +36,7 @@ When --video_save_path is set, cam0/cam1 videos are always saved separately.
 from __future__ import annotations
 
 import importlib.util
-import json                          
+import json                          # ← 【改动1a】新增 import
 import os
 import re
 import select
@@ -288,6 +288,7 @@ class LoadedPolicy:
     n_obs_steps: int
     n_action_steps: int
     action_input_std: np.ndarray | None = None
+    nfe_info: Dict[str, Any] | None = None
 
 
 def _load_widowx_dependencies():
@@ -482,13 +483,6 @@ def _load_policy_from_checkpoint(
         open(checkpoint_path, "rb"), pickle_module=dill, map_location="cpu"
     )
     cfg = payload["cfg"]
-    # Consistency-policy checkpoints require inference_mode=True at construction
-    # to avoid loading teacher-only assets during evaluation.
-    try:
-        if "inference_mode" in cfg.policy:
-            cfg.policy.inference_mode = True
-    except Exception:
-        pass
     policy = hydra.utils.instantiate(cfg.policy)
 
     state_dicts = payload.get("state_dicts", {})
@@ -852,18 +846,290 @@ def _stack_obs_history(obs_history: deque) -> Dict[str, np.ndarray]:
 
 
 # =====================================================================
-# Revise _predict_action_sequence，add CUDA JIT warmup timing exclusion and return inference time in milliseconds.
+# NFE (Number of Function Evaluations) Estimation & Runtime Counting
+# =====================================================================
+
+def _detect_policy_type(policy: Any) -> str:
+    """Detect the policy family from its class hierarchy and attributes.
+    
+    Returns one of:
+        "consistency_policy"  — CTM student (single/multi-step via chaining)
+        "edm"                 — EDM teacher (Karras ODE solver, Euler/Heun)
+        "diffusion_ddpm_ddim" — HuggingFace-scheduler Diffusion Policy (DDPM/DDiM)
+        "bfn"                 — Bayesian Flow Network policy
+        "unknown"
+    """
+    cls_name = type(policy).__name__.lower()
+    cls_mro = [c.__name__.lower() for c in type(policy).__mro__]
+    mro_str = " ".join(cls_mro)
+
+    # Consistency Policy (CTM student)
+    if hasattr(policy, "chaining_times") or hasattr(policy, "chain"):
+        return "consistency_policy"
+    if "ctm" in cls_name or "consistency" in cls_name:
+        return "consistency_policy"
+
+    # BFN — check before diffusion because BFN also has n_timesteps
+    if hasattr(policy, "n_timesteps") and (
+        "bfn" in cls_name
+        or "bayesian" in cls_name
+        or "bfn" in mro_str
+        or hasattr(policy, "sigma_1")
+        or hasattr(policy, "beta_1")
+    ):
+        return "bfn"
+
+    # EDM teacher (Karras scheduler with bins)
+    if hasattr(policy, "noise_scheduler") and hasattr(
+        getattr(policy, "noise_scheduler", None), "bins"
+    ):
+        return "edm"
+
+    # HuggingFace-scheduler Diffusion Policy (DDPM / DDiM)
+    if hasattr(policy, "num_inference_steps") and hasattr(policy, "noise_scheduler"):
+        return "diffusion_ddpm_ddim"
+
+    # Fallback heuristic on class name
+    if "edm" in cls_name:
+        return "edm"
+    if "diffusion" in cls_name or "ddpm" in cls_name or "ddim" in cls_name:
+        return "diffusion_ddpm_ddim"
+    if "bfn" in cls_name or "bayesian" in cls_name:
+        return "bfn"
+
+    return "unknown"
+
+
+def _estimate_nfe(policy: Any) -> Dict[str, Any]:
+    """Analytically estimate NFE from policy config/attributes.
+    
+    Returns a dict with:
+        "nfe": int           — estimated number of network forward passes per predict_action
+        "policy_type": str   — detected policy type
+        "details": str       — human-readable explanation
+        "breakdown": dict    — type-specific breakdown fields
+    """
+    ptype = _detect_policy_type(policy)
+    result: Dict[str, Any] = {
+        "nfe": None,
+        "policy_type": ptype,
+        "details": "",
+        "breakdown": {},
+    }
+
+    if ptype == "consistency_policy":
+        # Single-step: 1 _forward call (T → 0)
+        # Multi-step (chaining): 1 + len(chaining_times) - 1
+        # chaining_times format: ['D', t1, t2, ...] where first element is mode flag
+        chain_enabled = getattr(policy, "chain", False)
+        chaining_times = getattr(policy, "chaining_times", None)
+        if chain_enabled and chaining_times is not None and len(chaining_times) > 1:
+            # chaining_times[0] is mode flag ('D' or 'C'), rest are time values
+            n_chain = len(chaining_times) - 1  # exclude the mode flag
+            nfe = 1 + n_chain  # initial T→0 + one per chaining step
+            result["nfe"] = nfe
+            result["details"] = (
+                f"Consistency Policy with {n_chain}-step chaining: "
+                f"1 (initial T→0) + {n_chain} (chaining) = {nfe} NFE"
+            )
+            result["breakdown"] = {
+                "initial_step": 1,
+                "chaining_steps": n_chain,
+                "chaining_times": [str(t) for t in chaining_times],
+            }
+        else:
+            result["nfe"] = 1
+            result["details"] = "Consistency Policy single-step: 1 NFE"
+            result["breakdown"] = {"initial_step": 1, "chaining_steps": 0}
+
+    elif ptype == "edm":
+        # EDM uses Karras scheduler with `bins` discretization steps.
+        # Loop: for b, next_b in zip(timesteps[:-1], timesteps[1:]) → (bins-1) iterations
+        # Each iteration calls scheduler.step → solver-dependent NFE per step:
+        #   Euler: 1 model call per step
+        #   Heun:  2 model calls per step
+        scheduler = getattr(policy, "noise_scheduler", None)
+        bins = getattr(scheduler, "bins", None)
+        solver = getattr(scheduler, "solver", "heun")
+        if bins is not None:
+            n_iterations = int(bins) - 1
+            if solver in ("heun", "second_order"):
+                nfe_per_step = 2
+            elif solver in ("euler", "first_order"):
+                nfe_per_step = 1
+            elif solver == "third":
+                nfe_per_step = 3
+            elif solver == "fourth":
+                nfe_per_step = 4
+            elif solver == "second_order_corr":
+                nfe_per_step = 2  # corrector also uses 2
+            else:
+                nfe_per_step = 2  # default assume Heun
+            nfe = n_iterations * nfe_per_step
+            result["nfe"] = nfe
+            result["details"] = (
+                f"EDM teacher: {n_iterations} solver iterations × "
+                f"{nfe_per_step} model calls/step ({solver}) = {nfe} NFE"
+            )
+            result["breakdown"] = {
+                "bins": int(bins),
+                "solver_iterations": n_iterations,
+                "solver": solver,
+                "nfe_per_step": nfe_per_step,
+            }
+        else:
+            result["details"] = "EDM teacher: could not determine bins"
+
+    elif ptype == "diffusion_ddpm_ddim":
+        # HuggingFace scheduler: loop over scheduler.timesteps after set_timesteps(N)
+        # Each iteration: 1 model forward pass
+        num_steps = getattr(policy, "num_inference_steps", None)
+        scheduler = getattr(policy, "noise_scheduler", None)
+        sched_name = type(scheduler).__name__ if scheduler else "unknown"
+        if num_steps is not None:
+            nfe = int(num_steps)
+            result["nfe"] = nfe
+            result["details"] = (
+                f"Diffusion Policy ({sched_name}): "
+                f"{nfe} denoising steps × 1 model call/step = {nfe} NFE"
+            )
+            result["breakdown"] = {
+                "num_inference_steps": int(num_steps),
+                "scheduler": sched_name,
+                "nfe_per_step": 1,
+            }
+        else:
+            result["details"] = f"Diffusion Policy ({sched_name}): num_inference_steps not found"
+
+    elif ptype == "bfn":
+        # BFN sample loop: for i in range(1, n_timesteps+1) → n_timesteps calls
+        # Plus 1 final prediction after loop
+        n_timesteps = getattr(policy, "n_timesteps", None)
+        if n_timesteps is not None:
+            nfe = int(n_timesteps) + 1  # loop + final
+            result["nfe"] = nfe
+            result["details"] = (
+                f"BFN: {n_timesteps} iterative steps + 1 final prediction = {nfe} NFE"
+            )
+            result["breakdown"] = {
+                "n_timesteps": int(n_timesteps),
+                "loop_calls": int(n_timesteps),
+                "final_call": 1,
+            }
+        else:
+            result["details"] = "BFN: n_timesteps not found"
+
+    else:
+        result["details"] = f"Unknown policy type ({type(policy).__name__}): NFE not estimated"
+
+    return result
+
+
+class _NFECounter:
+    """Runtime NFE counter using PyTorch forward hooks.
+    
+    Attaches a forward hook to the core network module inside a policy
+    to count actual forward() invocations during one predict_action() call.
+    
+    Usage:
+        counter = _NFECounter(policy)
+        counter.reset()
+        policy.predict_action(obs)
+        nfe = counter.count
+        counter.remove()
+    """
+
+    def __init__(self, policy: Any):
+        self.count = 0
+        self._hooks: list = []
+        self._target_module = self._find_core_network(policy)
+        if self._target_module is not None:
+            hook = self._target_module.register_forward_hook(self._hook_fn)
+            self._hooks.append(hook)
+
+    def _hook_fn(self, module, input, output):
+        self.count += 1
+
+    def reset(self):
+        self.count = 0
+
+    def remove(self):
+        for h in self._hooks:
+            h.remove()
+        self._hooks.clear()
+
+    @staticmethod
+    def _find_core_network(policy: Any):
+        """Find the innermost denoising network (UNet / MLP) to hook.
+        
+        We look for the network that gets called once per 'function evaluation',
+        i.e. the noise-prediction or data-prediction backbone.
+        Priority: policy.model.model → policy.model → policy.nets['policy']
+        """
+        # CTM / EDM style: policy.model is the UNet
+        model = getattr(policy, "model", None)
+        if model is not None and isinstance(model, torch.nn.Module):
+            # Some wrappers have model.model as the actual network
+            inner = getattr(model, "model", None)
+            if inner is not None and isinstance(inner, torch.nn.Module):
+                return inner
+            return model
+
+        # BFN style: the net is inside the BFN object
+        # policy may hold a bfn attribute or unet_wrapper
+        for attr_name in ("unet_wrapper", "bfn", "net", "noise_pred_net"):
+            candidate = getattr(policy, attr_name, None)
+            if candidate is not None and isinstance(candidate, torch.nn.Module):
+                return candidate
+
+        # HuggingFace Diffusion Policy: policy.model
+        # (already covered above)
+
+        return None
+
+
+def _measure_nfe_runtime(
+    policy: Any,
+    obs_np: Dict[str, np.ndarray],
+    device: torch.device,
+) -> int:
+    """Do a single predict_action call and count actual NFE via hooks.
+    
+    NOTE: This performs an actual inference — use during warmup only.
+    Returns the measured NFE count.
+    """
+    counter = _NFECounter(policy)
+    counter.reset()
+    try:
+        obs_torch = {
+            k: torch.from_numpy(v).unsqueeze(0).to(device=device, dtype=torch.float32)
+            for k, v in obs_np.items()
+        }
+        with torch.no_grad():
+            policy.predict_action(obs_torch)
+        return counter.count
+    finally:
+        counter.remove()
+
+
+# =====================================================================
+# 【改动2】修改 _predict_action_sequence，加入 CUDA 同步计时
 # =====================================================================
 def _predict_action_sequence(
     policy: Any, obs_np: Dict[str, np.ndarray], device: torch.device
 ) -> Tuple[np.ndarray, float]:
+    """Run policy inference and return (actions, inference_time_ms).
+    
+    返回值从原来的 np.ndarray 变为 Tuple[np.ndarray, float]，
+    第二个元素是本次推理的墙钟时间（毫秒）。
+    """
     obs_torch = {
         k: torch.from_numpy(v).unsqueeze(0).to(device=device, dtype=torch.float32)
         for k, v in obs_np.items()
     }
 
     with torch.no_grad():
-        # ---- Begin Timing ----
+        # ---- 计时开始 ----
         if device.type == "cuda":
             torch.cuda.synchronize(device)        # 确保之前的 GPU 操作完成
         t_start = time.perf_counter()
@@ -873,7 +1139,7 @@ def _predict_action_sequence(
         if device.type == "cuda":
             torch.cuda.synchronize(device)        # 等待 GPU 推理完成
         t_end = time.perf_counter()
-        # ---- End Timing ----
+        # ---- 计时结束 ----
 
         inference_time_ms = (t_end - t_start) * 1000.0
 
@@ -995,19 +1261,21 @@ def _save_rollout_video(images: List[np.ndarray], policy_name: str):
 
 
 # =====================================================================
-# Print and save statistics about inference timing, with support for excluding initial warmup steps and returning detailed stats in a dictionary.
+# 【改动3a】新增：打印和保存推理时间统计
 # =====================================================================
 def _print_inference_timing_stats(
     inference_times_ms: List[float],
     policy_name: str,
     warmup_steps: int,
+    nfe_info: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
-    """Print and return inference timing statistics.
+    """Print and return inference timing statistics with NFE info.
     
     Args:
         inference_times_ms: All inference times (including warmup)
         policy_name: Name for display
         warmup_steps: Number of initial steps to exclude from statistics
+        nfe_info: NFE estimation dict from _estimate_nfe() (optional)
     """
     total_calls = len(inference_times_ms)
     if total_calls == 0:
@@ -1031,12 +1299,14 @@ def _print_inference_timing_stats(
             f"(warmup={warmup_steps} not excluded: insufficient calls)"
         )
 
+    mean_ms = float(np.mean(measured_times))
+
     stats = {
         "policy_name": policy_name,
         "total_calls": total_calls,
         "warmup_excluded": min(warmup_steps, total_calls),
         "measured_calls": len(measured_times),
-        "mean_ms": float(np.mean(measured_times)),
+        "mean_ms": mean_ms,
         "std_ms": float(np.std(measured_times)),
         "median_ms": float(np.median(measured_times)),
         "min_ms": float(np.min(measured_times)),
@@ -1044,9 +1314,32 @@ def _print_inference_timing_stats(
         "p5_ms": float(np.percentile(measured_times, 5)),
         "p95_ms": float(np.percentile(measured_times, 95)),
         "p99_ms": float(np.percentile(measured_times, 99)),
-        "hz": float(1000.0 / np.mean(measured_times)) if np.mean(measured_times) > 0 else 0.0,
+        "hz": float(1000.0 / mean_ms) if mean_ms > 0 else 0.0,
         "all_times_ms": [float(t) for t in all_times],
     }
+
+    # ---- NFE fields ----
+    if nfe_info is not None:
+        stats["nfe"] = nfe_info.get("nfe")
+        stats["nfe_policy_type"] = nfe_info.get("policy_type", "unknown")
+        stats["nfe_details"] = nfe_info.get("details", "")
+        stats["nfe_breakdown"] = nfe_info.get("breakdown", {})
+        stats["nfe_measured_runtime"] = nfe_info.get("nfe_measured_runtime")
+        # Derived: ms per NFE, NFE per second
+        nfe_val = nfe_info.get("nfe")
+        if nfe_val is not None and nfe_val > 0 and mean_ms > 0:
+            stats["ms_per_nfe"] = round(mean_ms / nfe_val, 3)
+
+    # ---- Print ----
+    nfe_str = ""
+    if nfe_info and nfe_info.get("nfe") is not None:
+        nfe_val = nfe_info["nfe"]
+        nfe_rt = nfe_info.get("nfe_measured_runtime")
+        nfe_str = f"  NFE:    {nfe_val:>8d}      ({nfe_info.get('details', '')})\n"
+        if nfe_rt is not None and nfe_rt != nfe_val:
+            nfe_str += f"  NFE(rt):{nfe_rt:>8d}      (runtime-measured via forward hooks)\n"
+        if stats.get("ms_per_nfe"):
+            nfe_str += f"  ms/NFE: {stats['ms_per_nfe']:8.3f} ms\n"
 
     print(
         f"[TIMING] ========== Inference Latency: {policy_name} ==========\n"
@@ -1058,6 +1351,7 @@ def _print_inference_timing_stats(
         f"  P5:     {stats['p5_ms']:8.2f} ms\n"
         f"  P95:    {stats['p95_ms']:8.2f} ms\n"
         f"  P99:    {stats['p99_ms']:8.2f} ms\n"
+        + nfe_str +
         f"[TIMING] =================================================="
     )
     return stats
@@ -1147,6 +1441,11 @@ def main(_):
 
         ckpt_path = Path(resolved_ckpt)
         name = f"{ckpt_path.parent.name}/{ckpt_path.name}"
+
+        # ---- NFE estimation (analytical) ----
+        nfe_info = _estimate_nfe(policy)
+        print(f"[NFE] {nfe_info['details']}")
+
         policies.append(
             LoadedPolicy(
                 name=name,
@@ -1156,6 +1455,7 @@ def main(_):
                 n_obs_steps=n_obs_steps,
                 n_action_steps=n_action_steps,
                 action_input_std=action_input_std,
+                nfe_info=nfe_info,
             )
         )
         print(
@@ -1445,6 +1745,26 @@ def main(_):
                 )
                 inference_times_ms.append(infer_ms)
 
+                # Runtime NFE measurement: hook-count on the first step
+                if len(inference_times_ms) == 1 and loaded.nfe_info is not None:
+                    try:
+                        nfe_rt = _measure_nfe_runtime(policy, stacked_obs, device)
+                        loaded.nfe_info["nfe_measured_runtime"] = nfe_rt
+                        analytical = loaded.nfe_info.get("nfe")
+                        if analytical is not None and nfe_rt != analytical:
+                            print(
+                                f"[NFE] Runtime-measured NFE={nfe_rt} differs from "
+                                f"analytical estimate={analytical}. "
+                                f"Using runtime value as ground truth."
+                            )
+                            loaded.nfe_info["nfe"] = nfe_rt
+                            loaded.nfe_info["nfe_analytical"] = analytical
+                            loaded.nfe_info["details"] += f" [corrected by runtime: {nfe_rt}]"
+                        else:
+                            print(f"[NFE] Runtime verification: NFE={nfe_rt} ✓")
+                    except Exception as exc:
+                        print(f"[NFE] Runtime measurement failed: {exc}")
+
                 # 实时打印每步推理延迟（可选，便于观察）
                 if len(inference_times_ms) <= FLAGS.inference_warmup_steps:
                     print(f"  [TIMING] step {len(inference_times_ms):4d} (warmup): {infer_ms:.2f} ms")
@@ -1562,6 +1882,7 @@ def main(_):
             inference_times_ms=inference_times_ms,
             policy_name=loaded.name,
             warmup_steps=FLAGS.inference_warmup_steps,
+            nfe_info=loaded.nfe_info,
         )
         _save_timing_json(
             stats=timing_stats,
