@@ -887,5 +887,5 @@ if __name__ == "__main__":
     main()
 
 """
-python dataset/formalize_data.py --src /scr2/zhaoyang/BFN_data/pusht_real_raw --dst /scr2/zhaoyang/BFN_data/pusht_real --overwrite --target-hz 10  --arm-action-source relative
+python dataset/formalize_data.py --src /scr2/zhaoyang/BFN_data/pusht_real_raw --dst /scr2/zhaoyang/BFN_data/pusht_real --overwrite --target-hz 20  --arm-action-source relative
 """

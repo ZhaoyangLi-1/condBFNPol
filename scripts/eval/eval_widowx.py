@@ -36,6 +36,7 @@ When --video_save_path is set, cam0/cam1 videos are always saved separately.
 from __future__ import annotations
 
 import importlib.util
+import json                          
 import os
 import re
 import select
@@ -264,6 +265,15 @@ flags.DEFINE_string(
     "widowx_envs_path",
     "/home/liralab-widowx/bridge_data_robot/widowx_envs",
     "Path that contains widowx_envs and utils.py",
+)
+
+# =====================================================================
+# 【改动1b】新增 flag：推理预热次数
+# =====================================================================
+flags.DEFINE_integer(
+    "inference_warmup_steps",
+    10,
+    "Number of warmup inference calls to exclude from timing (CUDA JIT etc.).",
 )
 
 WORKSPACE_BOUNDS = [[0.1, -0.15, -0.01, -1.57, 0], [0.45, 0.25, 0.25, 1.57, 0]]
@@ -834,23 +844,39 @@ def _stack_obs_history(obs_history: deque) -> Dict[str, np.ndarray]:
     return stacked
 
 
+# =====================================================================
+# Revise _predict_action_sequence，add CUDA JIT warmup timing exclusion and return inference time in milliseconds.
+# =====================================================================
 def _predict_action_sequence(
     policy: Any, obs_np: Dict[str, np.ndarray], device: torch.device
-) -> np.ndarray:
+) -> Tuple[np.ndarray, float]:
     obs_torch = {
         k: torch.from_numpy(v).unsqueeze(0).to(device=device, dtype=torch.float32)
         for k, v in obs_np.items()
     }
 
     with torch.no_grad():
+        # ---- Begin Timing ----
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)        # 确保之前的 GPU 操作完成
+        t_start = time.perf_counter()
+
         result = policy.predict_action(obs_torch)
+
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)        # 等待 GPU 推理完成
+        t_end = time.perf_counter()
+        # ---- End Timing ----
+
+        inference_time_ms = (t_end - t_start) * 1000.0
+
         if "action" not in result:
             raise KeyError("policy.predict_action output missing 'action' key")
         actions = result["action"][0].detach().to("cpu").numpy()
 
     if actions.ndim == 1:
         actions = actions[None]
-    return actions
+    return actions, inference_time_ms
 
 
 def _enter_terminal_cbreak_mode() -> Tuple[int | None, Any]:
@@ -959,6 +985,100 @@ def _save_rollout_video(images: List[np.ndarray], policy_name: str):
     fps = max(1.0, (1.0 / FLAGS.step_duration) * max(0.01, float(FLAGS.video_fps_scale)))
     imageio.mimsave(save_path, images, fps=fps)
     print(f"Saved video to: {save_path}")
+
+
+# =====================================================================
+# Print and save statistics about inference timing, with support for excluding initial warmup steps and returning detailed stats in a dictionary.
+# =====================================================================
+def _print_inference_timing_stats(
+    inference_times_ms: List[float],
+    policy_name: str,
+    warmup_steps: int,
+) -> Dict[str, Any]:
+    """Print and return inference timing statistics.
+    
+    Args:
+        inference_times_ms: All inference times (including warmup)
+        policy_name: Name for display
+        warmup_steps: Number of initial steps to exclude from statistics
+    """
+    total_calls = len(inference_times_ms)
+    if total_calls == 0:
+        print("[TIMING] No inference calls recorded.")
+        return {}
+
+    all_times = np.array(inference_times_ms)
+
+    # Exclude warmup steps from statistics
+    if warmup_steps > 0 and total_calls > warmup_steps:
+        measured_times = all_times[warmup_steps:]
+        print(
+            f"[TIMING] Total inference calls: {total_calls}, "
+            f"warmup excluded: {warmup_steps}, "
+            f"measured: {len(measured_times)}"
+        )
+    else:
+        measured_times = all_times
+        print(
+            f"[TIMING] Total inference calls: {total_calls} "
+            f"(warmup={warmup_steps} not excluded: insufficient calls)"
+        )
+
+    stats = {
+        "policy_name": policy_name,
+        "total_calls": total_calls,
+        "warmup_excluded": min(warmup_steps, total_calls),
+        "measured_calls": len(measured_times),
+        "mean_ms": float(np.mean(measured_times)),
+        "std_ms": float(np.std(measured_times)),
+        "median_ms": float(np.median(measured_times)),
+        "min_ms": float(np.min(measured_times)),
+        "max_ms": float(np.max(measured_times)),
+        "p5_ms": float(np.percentile(measured_times, 5)),
+        "p95_ms": float(np.percentile(measured_times, 95)),
+        "p99_ms": float(np.percentile(measured_times, 99)),
+        "hz": float(1000.0 / np.mean(measured_times)) if np.mean(measured_times) > 0 else 0.0,
+        "all_times_ms": [float(t) for t in all_times],
+    }
+
+    print(
+        f"[TIMING] ========== Inference Latency: {policy_name} ==========\n"
+        f"  Mean:   {stats['mean_ms']:8.2f} ms  (Hz: {stats['hz']:.1f})\n"
+        f"  Std:    {stats['std_ms']:8.2f} ms\n"
+        f"  Median: {stats['median_ms']:8.2f} ms\n"
+        f"  Min:    {stats['min_ms']:8.2f} ms\n"
+        f"  Max:    {stats['max_ms']:8.2f} ms\n"
+        f"  P5:     {stats['p5_ms']:8.2f} ms\n"
+        f"  P95:    {stats['p95_ms']:8.2f} ms\n"
+        f"  P99:    {stats['p99_ms']:8.2f} ms\n"
+        f"[TIMING] =================================================="
+    )
+    return stats
+
+
+def _save_timing_json(
+    stats: Dict[str, Any],
+    policy_name: str,
+    save_dir: str | None,
+) -> None:
+    """Save timing statistics to a JSON file."""
+    if not stats:
+        return
+    if save_dir is None:
+        save_dir = "."
+    os.makedirs(save_dir, exist_ok=True)
+    curr_time = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    safe_name = policy_name.replace("/", "_").replace(" ", "_")
+    json_path = os.path.join(save_dir, f"{curr_time}_{safe_name}_timing.json")
+
+    # Remove raw times from JSON to keep file small (optional)
+    stats_to_save = {k: v for k, v in stats.items() if k != "all_times_ms"}
+    stats_to_save["timestamp"] = curr_time
+    stats_to_save["device"] = FLAGS.device
+
+    with open(json_path, "w") as f:
+        json.dump(stats_to_save, f, indent=2)
+    print(f"[TIMING] Saved timing stats to: {json_path}")
 
 
 def main(_):
@@ -1218,6 +1338,11 @@ def main(_):
         num_consecutive_gripper_change_actions = 0
         warned_unpaced_horizon = False
 
+        # =====================================================================
+        # 【改动3b】初始化推理时间记录列表
+        # =====================================================================
+        inference_times_ms: List[float] = []
+
         t = 0
         stop_this_rollout = False
         stop_reason: str | None = None
@@ -1303,11 +1428,27 @@ def main(_):
                 stacked_obs = _stack_obs_history(obs_hist)
                 last_tstep = time.time()
 
-                actions = _predict_action_sequence(
+                # =============================================================
+                # 【改动3c】调用修改后的函数，收集推理时间
+                # =============================================================
+                actions, infer_ms = _predict_action_sequence(
                     policy=policy,
                     obs_np=stacked_obs,
                     device=device,
                 )
+                inference_times_ms.append(infer_ms)
+
+                # 实时打印每步推理延迟（可选，便于观察）
+                if len(inference_times_ms) <= FLAGS.inference_warmup_steps:
+                    print(f"  [TIMING] step {len(inference_times_ms):4d} (warmup): {infer_ms:.2f} ms")
+                elif len(inference_times_ms) % 10 == 0:
+                    # 每10步打印一次，避免刷屏
+                    recent = inference_times_ms[FLAGS.inference_warmup_steps:]
+                    print(
+                        f"  [TIMING] step {len(inference_times_ms):4d}: "
+                        f"{infer_ms:.2f} ms  "
+                        f"(running avg: {np.mean(recent):.2f} ms)"
+                    )
 
                 exec_horizon = min(int(FLAGS.act_exec_horizon), actions.shape[0])
                 if (
@@ -1406,6 +1547,20 @@ def main(_):
             print(traceback.format_exc(), file=sys.stderr)
         finally:
             _restore_terminal_mode(stdin_fd, stdin_old_attrs)
+
+        # =================================================================
+        # 【改动3d】rollout 结束后打印统计 + 保存 JSON
+        # =================================================================
+        timing_stats = _print_inference_timing_stats(
+            inference_times_ms=inference_times_ms,
+            policy_name=loaded.name,
+            warmup_steps=FLAGS.inference_warmup_steps,
+        )
+        _save_timing_json(
+            stats=timing_stats,
+            policy_name=loaded.name,
+            save_dir=FLAGS.video_save_path,
+        )
 
         _save_rollout_video(cam0_images, f"{loaded.name}_cam0")
         _save_rollout_video(cam1_images, f"{loaded.name}_cam1")
