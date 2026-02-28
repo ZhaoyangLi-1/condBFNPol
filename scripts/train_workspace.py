@@ -24,6 +24,9 @@ import sys
 # Add project root to path
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, project_root)
+dp_root = os.path.join(project_root, "src", "diffusion-policy")
+if os.path.isdir(dp_root) and dp_root not in sys.path:
+    sys.path.insert(0, dp_root)
 
 import hydra
 from omegaconf import OmegaConf, DictConfig

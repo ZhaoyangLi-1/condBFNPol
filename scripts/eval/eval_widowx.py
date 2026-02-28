@@ -482,6 +482,13 @@ def _load_policy_from_checkpoint(
         open(checkpoint_path, "rb"), pickle_module=dill, map_location="cpu"
     )
     cfg = payload["cfg"]
+    # Consistency-policy checkpoints require inference_mode=True at construction
+    # to avoid loading teacher-only assets during evaluation.
+    try:
+        if "inference_mode" in cfg.policy:
+            cfg.policy.inference_mode = True
+    except Exception:
+        pass
     policy = hydra.utils.instantiate(cfg.policy)
 
     state_dicts = payload.get("state_dicts", {})

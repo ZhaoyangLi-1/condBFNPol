@@ -84,7 +84,7 @@ training:
   debug: false
   resume: false
   lr_scheduler: cosine
-  lr_warmup_steps: 200
+  lr_warmup_steps: 300
   num_epochs: 100
   gradient_accumulate_every: 1
   rollout_every: 2
