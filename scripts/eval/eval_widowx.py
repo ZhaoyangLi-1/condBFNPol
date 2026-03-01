@@ -14,7 +14,31 @@ python scripts/eval/eval_widowx.py \
   --num_inference_steps 100 \
   --widowx_init_timeout_ms 180000 \
   --widowx_init_retries 8 \
-  --video_save_path /data/BFN_data/diffusion_results
+  --video_save_path /data/BFN_data/ddpm_results
+
+  
+python scripts/eval/eval_widowx.py \
+  --checkpoint /data/BFN_data/checkpoints/ddim_real_pusht.ckpt \
+  --widowx_envs_path /scr2/zhaoyang/bridge_data_robot_pusht/widowx_envs \
+  --action_mode 2trans \
+  --step_duration 0.1 \
+  --act_exec_horizon 8 \
+  --im_size 480 \
+  --widowx_init_timeout_ms 180000 \
+  --widowx_init_retries 8 \
+  --video_save_path /data/BFN_data/ddim_results
+
+  
+python scripts/eval/eval_widowx.py \
+  --checkpoint /data/BFN_data/checkpoints/consistency_real_pusht.ckpt \
+  --widowx_envs_path /scr2/zhaoyang/bridge_data_robot_pusht/widowx_envs \
+  --action_mode 2trans \
+  --step_duration 0.1 \
+  --act_exec_horizon 8 \
+  --im_size 480 \
+  --widowx_init_timeout_ms 180000 \
+  --widowx_init_retries 8 \
+  --video_save_path /data/BFN_data/consistency_policy_results
   
 
 python scripts/eval/eval_widowx.py \
@@ -24,7 +48,7 @@ python scripts/eval/eval_widowx.py \
   --step_duration 0.1 \
   --act_exec_horizon 8 \
   --im_size 480 \
-  --bfn_n_timesteps 10 \
+  --bfn_n_timesteps 5 \
   --widowx_init_timeout_ms 180000 \
   --widowx_init_retries 8 \
   --video_save_path /data/BFN_data/bfn_results
@@ -100,12 +124,12 @@ flags.DEFINE_string("device", "cuda:0", "Torch device, e.g. cuda:0 or cpu")
 flags.DEFINE_bool("use_ema", True, "Use ema_model when available")
 flags.DEFINE_integer(
     "num_inference_steps",
-    100,
+    -1,
     "Override diffusion num_inference_steps when > 0",
 )
 flags.DEFINE_integer(
     "bfn_n_timesteps",
-    20,
+    -1,
     "Override BFN n_timesteps when > 0",
 )
 
@@ -483,6 +507,20 @@ def _load_policy_from_checkpoint(
         open(checkpoint_path, "rb"), pickle_module=dill, map_location="cpu"
     )
     cfg = payload["cfg"]
+    if "consistency" in str(checkpoint_path).lower():
+        forced_teacher_path = "/data/BFN_data/checkpoints/diffusion_real_pusht.ckpt"
+        cfg["teacher_path"] = forced_teacher_path
+        if "policy" in cfg:
+            cfg["policy"]["teacher_path"] = forced_teacher_path
+            cfg["policy"]["edm"] = str(FLAGS.checkpoint[0])
+            cfg["policy"]["inference_mode"] = True
+        if "training" in cfg:
+            cfg["training"]["inference_mode"] = True
+        print(
+            "[INFO] Consistency checkpoint detected; overriding teacher/edm paths "
+            "and forcing inference_mode=True: "
+            f"teacher_path={forced_teacher_path}, edm={str(FLAGS.checkpoint[0])}"
+        )
     policy = hydra.utils.instantiate(cfg.policy)
 
     state_dicts = payload.get("state_dicts", {})

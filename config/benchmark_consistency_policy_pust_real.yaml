@@ -22,7 +22,7 @@ crop_shape: [384, 512]
 dataset_path: /ariesdv0/zhaoyang/BFN_data/pusht_real
 
 # Teacher diffusion checkpoint used for distillation / warm start.
-teacher_path: /ariesdv0/zhaoyang/BFN_outputs/2026.02.27/08.39.14_diffusion_real_image_seed42/checkpoints/epoch=0056-val_loss=0.056.ckpt
+teacher_path: /data/BFN_data/checkpoints/diffusion_real_pusht.ckpt
 
 # ================== Shape Meta ==================
 shape_meta:
