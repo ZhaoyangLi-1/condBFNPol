@@ -67,6 +67,7 @@ class CTMPPUnetHybridImagePolicy(BaseImagePolicy):
             ctm_sampler = "ctm",
             #chaining args
             chaining_times = ['D', 27, 54],
+            enable_chaining = False,
             inference_mode = False,
             ):
         super().__init__()
@@ -250,6 +251,8 @@ class CTMPPUnetHybridImagePolicy(BaseImagePolicy):
 
         self.chaining_times = chaining_times
         self.chain = False #DEFAULT is False, you have to enable this yourself when you want it
+        if enable_chaining:
+            self.enable_chaining()
 
         print("Using losses: ", self.losses)
 
