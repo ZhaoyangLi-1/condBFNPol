@@ -95,10 +95,10 @@ ema:
 # ================== Optimizer ==================
 optimizer:
   _target_: torch.optim.AdamW
-  lr: 1.0e-4
+  lr: 1.0e-5
   betas: [0.95, 0.999]
   eps: 1.0e-8
-  weight_decay: 1.0e-6
+  weight_decay: 5.0e-5
 
 # ================== Training ==================
 training:
@@ -110,7 +110,7 @@ training:
   inference_mode: false
   online_rollouts: false
   lr_scheduler: cosine
-  lr_warmup_steps: 200
+  lr_warmup_steps: 300
   num_epochs: 100
   p_epochs: 100
   gradient_accumulate_every: 1
