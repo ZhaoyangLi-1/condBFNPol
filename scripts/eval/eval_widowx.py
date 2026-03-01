@@ -153,7 +153,7 @@ flags.DEFINE_float(
 )
 flags.DEFINE_float(
     "term_hold_sec",
-    1.0,
+    0.5,
     "Required dwell time in termination area before auto-termination (seconds).",
 )
 flags.DEFINE_float(
