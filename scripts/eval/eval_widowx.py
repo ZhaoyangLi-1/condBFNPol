@@ -48,7 +48,7 @@ python scripts/eval/eval_widowx.py \
   --step_duration 0.1 \
   --act_exec_horizon 8 \
   --im_size 480 \
-  --bfn_n_timesteps 5 \
+  --bfn_n_timesteps 10 \
   --widowx_init_timeout_ms 180000 \
   --widowx_init_retries 8 \
   --video_save_path /data/BFN_data/bfn_results
