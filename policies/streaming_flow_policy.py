@@ -51,6 +51,12 @@ class StreamingFlowPolicy(BasePolicy):
         sigma0: float = 0.1,
         device: str = "cpu",
         dtype: str = "float32",
+        clip_actions: bool = True,
+        normalizer: Optional[Any] = None,
+        # Vision/preprocessing specific parameters (not passed to BasePolicy)
+        crop_shape: Optional[List[int]] = None,
+        obs_encoder_group_norm: bool = True,
+        eval_fixed_crop: bool = True,
         **kwargs
     ):
         """Initialize Streaming Flow Policy.
@@ -66,13 +72,25 @@ class StreamingFlowPolicy(BasePolicy):
             sigma0: Initial Gaussian tube standard deviation
             device: Device to run on
             dtype: Data type
+            clip_actions: Whether to clip actions
+            normalizer: Optional normalizer
+            crop_shape: Image crop shape for vision processing
+            obs_encoder_group_norm: Whether to use group norm in obs encoder
+            eval_fixed_crop: Whether to use fixed crop during evaluation
         """
+        # Only pass BasePolicy-compatible arguments
         super().__init__(
             action_space=action_space,
             device=device,
             dtype=dtype,
-            **kwargs
+            clip_actions=clip_actions,
+            normalizer=normalizer
         )
+        
+        # Store streaming flow policy specific parameters
+        self.crop_shape = crop_shape
+        self.obs_encoder_group_norm = obs_encoder_group_norm
+        self.eval_fixed_crop = eval_fixed_crop
         
         self.shape_meta = shape_meta
         self.horizon = horizon
