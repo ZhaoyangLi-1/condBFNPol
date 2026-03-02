@@ -8,7 +8,7 @@ defaults:
 
 _target_: workspaces.train_diffusion_unet_hybrid_workspace.TrainDiffusionUnetHybridWorkspace
 
-name: benchmark_diffusion_pusht_real_image_480x640
+name: benchmark_diffusion_ddpm_pusht_real_image_480x640
 exp_name: bfn_vs_diffusion
 output_root: ${oc.env:BFN_OUTPUT_ROOT,/ariesdv0/zhaoyang/BFN_outputs}
 dataset_root: ${oc.env:BFN_DATA_ROOT,/ariesdv0/zhaoyang/BFN_data}
@@ -163,11 +163,12 @@ logging:
   project: pusht_bfn_vs_diffusion
   resume: true
   mode: online
-  name: ${now:%Y.%m.%d-%H.%M.%S}_diffusion_real_image_seed${training.seed}
+  name: ${now:%Y.%m.%d-%H.%M.%S}_diffusion_ddpm_real_image_seed${training.seed}
   tags:
     - benchmark
     - pusht_real
     - diffusion
+    - ddpm
     - image_lowdim
     - res_480x640
     - pusht_real
@@ -178,7 +179,7 @@ logging:
 # ================== Hydra ==================
 hydra:
   run:
-    dir: "${output_root}/${now:%Y.%m.%d}/${now:%H.%M.%S}_diffusion_real_image_seed${training.seed}"
+    dir: "${output_root}/${now:%Y.%m.%d}/${now:%H.%M.%S}_diffusion_ddpm_real_image_seed${training.seed}"
   sweep:
     dir: outputs/benchmark/${now:%Y-%m-%d}
-    subdir: diffusion_real_image_seed${training.seed}
+    subdir: diffusion_ddpm_real_image_seed${training.seed}
