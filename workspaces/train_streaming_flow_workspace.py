@@ -175,19 +175,8 @@ class TrainStreamingFlowWorkspace(BaseWorkspace):
         self.global_step = 0
         self.epoch = 0
         
-        # WandB logging
-        if cfg.logging.mode != 'disabled':
-            wandb.init(
-                dir=str(self.output_dir),
-                config=OmegaConf.to_container(cfg, resolve=True),
-                **cfg.logging
-            )
-            self.wandb_run_dir = pathlib.Path(wandb.run.dir)
-        else:
-            self.wandb_run_dir = None
-        
-        # JSON logger
-        self.json_logger = JsonLogger(self.output_dir.joinpath("log.json"))
+        # Logging objects are created in run() to match diffusion workspace logic.
+        self.wandb_run_dir = None
         
         # Initialize checkpoint manager
         if 'topk' in cfg.checkpoint:
@@ -205,97 +194,163 @@ class TrainStreamingFlowWorkspace(BaseWorkspace):
     def run(self):
         """Main training loop."""
         cfg = copy.deepcopy(self.cfg)
-        
-        # Training loop
-        num_epochs = cfg.training.num_epochs
-        
-        with tqdm.tqdm(range(num_epochs), desc='Epoch') as tglobal:
-            for epoch_idx in tglobal:
-                self.epoch = epoch_idx
-                epoch_loss = []
-                
-                # Training
-                self.policy.train()
-                with tqdm.tqdm(self.dataloader, desc='Batch', leave=False) as tepoch:
+
+        # Resume training if checkpoint exists
+        if cfg.training.resume:
+            latest_ckpt_path = self.get_checkpoint_path()
+            if latest_ckpt_path.is_file():
+                print(f"Resuming from checkpoint {latest_ckpt_path}")
+                self.load_checkpoint(path=latest_ckpt_path)
+
+        # ========= Logging =========
+        wandb_run = wandb.init(
+            dir=str(self.output_dir),
+            config=OmegaConf.to_container(cfg, resolve=True),
+            **cfg.logging
+        )
+        wandb.config.update({"output_dir": self.output_dir})
+        if wandb.run is not None:
+            self.wandb_run_dir = pathlib.Path(wandb.run.dir)
+
+        # Debug mode
+        if cfg.training.debug:
+            cfg.training.num_epochs = 2
+            cfg.training.max_train_steps = 3
+            cfg.training.max_val_steps = 3
+            cfg.training.rollout_every = 1
+            cfg.training.checkpoint_every = 1
+            cfg.training.val_every = 1
+            cfg.training.sample_every = 1
+
+        # ========= Training Loop =========
+        log_path = os.path.join(self.output_dir, 'logs.json.txt')
+
+        with JsonLogger(log_path) as json_logger:
+            for local_epoch_idx in range(cfg.training.num_epochs):
+                step_log = dict()
+
+                # ========= Train for this epoch =========
+                train_losses = list()
+                with tqdm.tqdm(
+                    self.dataloader,
+                    desc=f"Training epoch {self.epoch}",
+                    leave=False,
+                    mininterval=cfg.training.tqdm_interval_sec
+                ) as tepoch:
                     for batch_idx, batch in enumerate(tepoch):
-                        # Move batch to device
-                        batch = dict_apply(batch, lambda x: x.to(self.device, non_blocking=True))
-                        
+                        # Device transfer
+                        batch = dict_apply(
+                            batch,
+                            lambda x: x.to(self.device, non_blocking=True)
+                        )
+
                         # Compute loss
-                        loss_dict = self.policy.compute_loss(batch)
-                        loss = loss_dict['loss']
-                        
-                        # Backward pass
+                        raw_loss = self.policy.compute_loss(batch)['loss']
+                        loss = raw_loss / cfg.training.gradient_accumulate_every
                         loss.backward()
-                        self.optimizer.step()
-                        self.optimizer.zero_grad()
-                        
-                        # LR scheduler step
-                        self.lr_scheduler.step()
-                        
-                        # EMA update
+
+                        # Step optimizer
+                        if self.global_step % cfg.training.gradient_accumulate_every == 0:
+                            self.optimizer.step()
+                            self.optimizer.zero_grad()
+                            self.lr_scheduler.step()
+
+                        # Update EMA
                         if self.ema is not None:
                             self.ema.step(self.policy)
-                        
+
                         # Logging
-                        loss_cpu = loss.item()
-                        epoch_loss.append(loss_cpu)
-                        tepoch.set_postfix(loss=loss_cpu)
-                        
-                        self.global_step += 1
-                
-                # Epoch logging
-                epoch_loss_mean = np.mean(epoch_loss)
-                tglobal.set_postfix(loss=epoch_loss_mean)
-                
-                log_data = {
-                    'epoch': self.epoch,
-                    'train_loss': epoch_loss_mean,
-                    'lr': self.lr_scheduler.get_last_lr()[0]
-                }
-                
-                # Validation
-                if (epoch_idx + 1) % cfg.training.val_every == 0:
-                    val_loss = self._run_validation()
-                    log_data['val_loss'] = val_loss
-                
-                # Environment evaluation
-                if (epoch_idx + 1) % cfg.training.rollout_every == 0 and self.env_runner is not None:
-                    runner_log = self._run_env_evaluation()
-                    log_data.update(runner_log)
-                
-                # Log to wandb and JSON
-                if self.wandb_run_dir is not None:
-                    wandb.log(log_data, step=self.global_step)
-                self.json_logger.log(log_data)
-                
-                # Checkpointing
-                if (epoch_idx + 1) % cfg.training.checkpoint_every == 0:
+                        raw_loss_cpu = raw_loss.item()
+                        tepoch.set_postfix(loss=raw_loss_cpu, refresh=False)
+                        train_losses.append(raw_loss_cpu)
+
+                        step_log = {
+                            'train_loss': raw_loss_cpu,
+                            'global_step': self.global_step,
+                            'epoch': self.epoch,
+                            'lr': self.lr_scheduler.get_last_lr()[0]
+                        }
+
+                        is_last_batch = (batch_idx == (len(self.dataloader) - 1))
+                        if not is_last_batch:
+                            wandb_run.log(step_log, step=self.global_step)
+                            json_logger.log(step_log)
+                            self.global_step += 1
+
+                        if (cfg.training.max_train_steps is not None
+                                and batch_idx >= (cfg.training.max_train_steps - 1)):
+                            break
+
+                # End of epoch - compute average train loss
+                if len(train_losses) > 0:
+                    train_loss = float(np.mean(train_losses))
+                else:
+                    train_loss = 0.0
+                step_log['train_loss'] = train_loss
+
+                # ========= Evaluation =========
+                policy = self.policy
+                if self.ema is not None:
+                    policy = self.ema.averaged_model
+                policy.eval()
+
+                # Run rollout
+                if self.env_runner is not None and (self.epoch % cfg.training.rollout_every) == 0:
+                    runner_log = self.env_runner.run(policy)
+                    step_log.update(runner_log)
+
+                # Run validation
+                if (self.epoch % cfg.training.val_every) == 0:
+                    with torch.no_grad():
+                        val_losses = list()
+                        with tqdm.tqdm(
+                            self.val_dataloader,
+                            desc=f"Validation epoch {self.epoch}",
+                            leave=False,
+                            mininterval=cfg.training.tqdm_interval_sec
+                        ) as tepoch:
+                            for batch_idx, batch in enumerate(tepoch):
+                                batch = dict_apply(
+                                    batch,
+                                    lambda x: x.to(self.device, non_blocking=True)
+                                )
+                                val_loss = self.policy.compute_loss(batch)['loss']
+                                val_losses.append(val_loss.item())
+                                if (cfg.training.max_val_steps is not None
+                                        and batch_idx >= (cfg.training.max_val_steps - 1)):
+                                    break
+
+                        if len(val_losses) > 0:
+                            step_log['val_loss'] = float(np.mean(val_losses))
+
+                # ========= Checkpointing =========
+                if (self.epoch % cfg.training.checkpoint_every) == 0:
+                    if cfg.checkpoint.save_last_ckpt:
+                        self.save_checkpoint()
+                    if cfg.checkpoint.save_last_snapshot:
+                        self.save_snapshot()
+
                     if self.checkpoint_manager is not None:
-                        # Save with topk manager
-                        self.checkpoint_manager.save_checkpoint(
-                            {
-                                'cfg': cfg,
-                                'global_step': self.global_step,
-                                'epoch': self.epoch,
-                                'state_dicts': {
-                                    'model': self.policy.state_dict(),
-                                    'ema': self.ema.state_dict() if self.ema is not None else None,
-                                    'optimizer': self.optimizer.state_dict(),
-                                    'lr_scheduler': self.lr_scheduler.state_dict(),
-                                }
-                            },
-                            metrics={'val_loss': log_data.get('val_loss', epoch_loss_mean)},
-                            epoch=self.epoch
-                        )
-                    else:
-                        # Save regular checkpoint
-                        self._save_checkpoint()
-        
+                        metric_dict = {
+                            key.replace('/', '_'): value
+                            for key, value in step_log.items()
+                        }
+                        topk_ckpt_path = self.checkpoint_manager.get_ckpt_path(metric_dict)
+                        if topk_ckpt_path is not None:
+                            self.save_checkpoint(path=topk_ckpt_path)
+
+                # ========= End of epoch =========
+                policy.train()
+
+                wandb_run.log(step_log, step=self.global_step)
+                json_logger.log(step_log)
+                self.global_step += 1
+                self.epoch += 1
+
         # Save final checkpoint
         if cfg.checkpoint.save_last_ckpt:
-            self._save_checkpoint(tag='last')
-        
+            self.save_checkpoint(tag='last')
+
         print("Streaming Flow Policy training completed!")
     
     def _run_validation(self) -> float:
@@ -354,6 +409,19 @@ class TrainStreamingFlowWorkspace(BaseWorkspace):
         torch.save(payload, ckpt_path.open('wb'), pickle_module=dill)
         print(f"Saved checkpoint to {ckpt_path}")
     
-    def save_checkpoint(self):
-        """Public interface for saving checkpoints."""
-        self._save_checkpoint()
+    def save_checkpoint(
+        self,
+        path: Optional[str] = None,
+        tag: str = 'latest',
+        exclude_keys: Optional[tuple] = None,
+        include_keys: Optional[tuple] = None,
+        use_thread: bool = True
+    ) -> str:
+        """Public checkpoint API aligned with BaseWorkspace."""
+        return super().save_checkpoint(
+            path=path,
+            tag=tag,
+            exclude_keys=exclude_keys,
+            include_keys=include_keys,
+            use_thread=use_thread
+        )
