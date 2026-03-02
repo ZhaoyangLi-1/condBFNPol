@@ -109,6 +109,78 @@ def _patch_async_vector_env_shared_memory_api_mismatch() -> None:
     dp_async_vector_env._shared_memory_api_patched = True
 
 
+def _patch_real_pusht_dataset_action_shape_assertion() -> None:
+    """
+    Patch legacy RealPushT dataset loader to accept 7D action vectors.
+
+    diffusion_policy.dataset.real_pusht_image_dataset._get_replay_buffer
+    hard-codes action dims to (2,) or (6,). Our real PushT configs use (7,),
+    which triggers an AssertionError during Hydra dataset instantiation.
+    """
+    try:
+        import diffusion_policy.dataset.real_pusht_image_dataset as dp_real_pusht
+    except Exception as exc:  # pragma: no cover - best-effort runtime patch
+        print(f"[warn] RealPushT action-shape patch not applied: {exc}")
+        return
+
+    if getattr(dp_real_pusht, "_action_shape_assertion_patched", False):
+        return
+
+    _orig_get_replay_buffer = dp_real_pusht._get_replay_buffer
+
+    def _patched_get_replay_buffer(dataset_path, shape_meta, store):
+        action_shape = tuple(shape_meta["action"]["shape"])
+        try:
+            return _orig_get_replay_buffer(dataset_path, shape_meta, store)
+        except AssertionError:
+            # Keep original strict behavior except for our 7D real PushT setting.
+            if action_shape != (7,):
+                raise
+
+            rgb_keys = []
+            lowdim_keys = []
+            out_resolutions = {}
+            lowdim_shapes = {}
+            obs_shape_meta = shape_meta["obs"]
+            for key, attr in obs_shape_meta.items():
+                obs_type = attr.get("type", "low_dim")
+                shape = tuple(attr.get("shape"))
+                if obs_type == "rgb":
+                    rgb_keys.append(key)
+                    _, h, w = shape
+                    out_resolutions[key] = (w, h)
+                elif obs_type == "low_dim":
+                    lowdim_keys.append(key)
+                    lowdim_shapes[key] = shape
+                    if "pose" in key:
+                        assert shape in [(2,), (6,), (7,)]
+
+            dp_real_pusht.cv2.setNumThreads(1)
+            with dp_real_pusht.threadpool_limits(1):
+                replay_buffer = dp_real_pusht.real_data_to_replay_buffer(
+                    dataset_path=dataset_path,
+                    out_store=store,
+                    out_resolutions=out_resolutions,
+                    lowdim_keys=lowdim_keys + ["action"],
+                    image_keys=rgb_keys,
+                )
+
+            # Preserve original projection behavior for 2D settings.
+            if action_shape == (2,):
+                zarr_arr = replay_buffer["action"]
+                dp_real_pusht.zarr_resize_index_last_dim(zarr_arr, idxs=[0, 1])
+
+            for key, shape in lowdim_shapes.items():
+                if "pose" in key and shape == (2,):
+                    zarr_arr = replay_buffer[key]
+                    dp_real_pusht.zarr_resize_index_last_dim(zarr_arr, idxs=[0, 1])
+
+            return replay_buffer
+
+    dp_real_pusht._get_replay_buffer = _patched_get_replay_buffer
+    dp_real_pusht._action_shape_assertion_patched = True
+
+
 @hydra.main(
     version_base=None,
     config_path='../config',
@@ -123,6 +195,7 @@ def main(cfg: DictConfig):
     """
     # Ensure AsyncVectorEnv shared memory works with the installed Gym API.
     _patch_async_vector_env_shared_memory_api_mismatch()
+    _patch_real_pusht_dataset_action_shape_assertion()
 
     # Resolve all interpolations
     OmegaConf.resolve(cfg)
