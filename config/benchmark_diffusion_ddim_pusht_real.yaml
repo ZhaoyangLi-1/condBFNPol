@@ -10,6 +10,8 @@ _target_: workspaces.train_diffusion_unet_hybrid_workspace.TrainDiffusionUnetHyb
 
 name: benchmark_diffusion_ddim_pusht_real_image_480x640
 exp_name: bfn_vs_diffusion
+output_root: ${oc.env:BFN_OUTPUT_ROOT,/ariesdv0/zhaoyang/BFN_outputs}
+dataset_root: ${oc.env:BFN_DATA_ROOT,/ariesdv0/zhaoyang/BFN_data}
 
 # ================== Horizons ==================
 horizon: 16
@@ -19,7 +21,7 @@ n_action_steps: 8
 # ================== Shape Meta ==================
 image_shape: [3, 480, 480]
 crop_shape: [384, 384]
-dataset_path: /ariesdv0/zhaoyang/BFN_data/pusht_real
+dataset_path: ${dataset_root}/pusht_real
 
 shape_meta:
   action:
@@ -166,7 +168,7 @@ logging:
 # ================== Hydra ==================
 hydra:
   run:
-    dir: "/ariesdv0/zhaoyang/BFN_outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_diffusion_ddim_real_image_seed${training.seed}"
+    dir: "${output_root}/${now:%Y.%m.%d}/${now:%H.%M.%S}_diffusion_ddim_real_image_seed${training.seed}"
   sweep:
     dir: outputs/benchmark/${now:%Y-%m-%d}
     subdir: diffusion_ddim_real_image_seed${training.seed}
