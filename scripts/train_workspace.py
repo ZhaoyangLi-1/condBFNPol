@@ -20,6 +20,7 @@ Usage:
 
 import os
 import sys
+import pathlib
 
 # Add project root to path
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -181,6 +182,18 @@ def _patch_real_pusht_dataset_action_shape_assertion() -> None:
     dp_real_pusht._action_shape_assertion_patched = True
 
 
+def _resolve_hydra_output_dir() -> pathlib.Path:
+    """
+    Resolve Hydra output dir and return it as pathlib.Path.
+    """
+    try:
+        from hydra.core.hydra_config import HydraConfig
+        return pathlib.Path(HydraConfig.get().runtime.output_dir)
+    except Exception:
+        # Fallback: in non-Hydra contexts, current working directory is safest.
+        return pathlib.Path(os.getcwd())
+
+
 @hydra.main(
     version_base=None,
     config_path='../config',
@@ -211,7 +224,12 @@ def main(cfg: DictConfig):
     workspace_cls = hydra.utils.get_class(cfg._target_)
     
     # Create and initialize workspace
-    workspace = workspace_cls(cfg)
+    output_dir = _resolve_hydra_output_dir()
+    try:
+        workspace = workspace_cls(cfg, output_dir=output_dir)
+    except TypeError:
+        # Backward compatibility for workspace constructors without output_dir.
+        workspace = workspace_cls(cfg)
     
     # Run training
     workspace.run()
