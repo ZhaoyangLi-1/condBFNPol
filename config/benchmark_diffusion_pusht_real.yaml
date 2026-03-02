@@ -100,10 +100,10 @@ training:
   lr_warmup_steps: 300
   num_epochs: 100
   gradient_accumulate_every: 1
-  rollout_every: 2
-  checkpoint_every: 2
+  rollout_every: 1
+  checkpoint_every: 1
   val_every: 1
-  sample_every: 2
+  sample_every: 1
   max_train_steps: null
   max_val_steps: null
   tqdm_interval_sec: 1.0
