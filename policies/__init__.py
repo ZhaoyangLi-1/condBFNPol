@@ -23,4 +23,4 @@ __all__ = [
 ]
 
 if HAS_STREAMING_FLOW:
-    __all__.append("StreamingFlowPolicy")
+    __all__.extend(["StreamingFlowPolicy"])

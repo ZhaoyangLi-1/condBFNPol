@@ -156,3 +156,8 @@ funcsigs
 moviepy<2
 decorator
 git+https://github.com/youliangtan/edgeml.git
+drake
+# Streaming Flow Policy dependencies
+torchdyn
+mediapy
+gdown
