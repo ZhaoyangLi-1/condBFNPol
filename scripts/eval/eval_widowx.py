@@ -249,16 +249,6 @@ flags.DEFINE_bool(
 
 flags.DEFINE_bool("show_image", False, "Show camera image")
 flags.DEFINE_string("video_save_path", None, "Directory to save rollout videos")
-flags.DEFINE_float(
-    "video_fps_scale",
-    0.3,
-    "Saved video speed scale relative to policy rate (1.0=real-time, <1 slower).",
-)
-flags.DEFINE_bool(
-    "save_two_camera_videos",
-    True,
-    "Deprecated/ignored. Cam0/cam1 videos are always saved when video_save_path is set.",
-)
 flags.DEFINE_bool("no_pitch_roll", False, "Zero out pitch/roll action dims")
 flags.DEFINE_bool("no_yaw", False, "Zero out yaw action dim")
 flags.DEFINE_float(
@@ -1290,7 +1280,11 @@ def _interpolate_actions_to_robot_rate(
     return interpolated
 
 
-def _save_rollout_video(images: List[np.ndarray], policy_name: str):
+def _save_rollout_video(
+    images: List[np.ndarray],
+    frame_timestamps_s: List[float],
+    policy_name: str,
+):
     if FLAGS.video_save_path is None or len(images) == 0:
         return
 
@@ -1301,8 +1295,33 @@ def _save_rollout_video(images: List[np.ndarray], policy_name: str):
         FLAGS.video_save_path,
         f"{curr_time}_{safe_name}_sticky_{FLAGS.sticky_gripper_num_steps}.mp4",
     )
-    fps = max(1.0, (1.0 / FLAGS.step_duration) * max(0.01, float(FLAGS.video_fps_scale)))
-    imageio.mimsave(save_path, images, fps=fps)
+
+    # Encode using real frame intervals, so playback speed reflects robot speed.
+    export_fps = 30.0
+    export_frames: List[np.ndarray] = []
+    n = len(images)
+
+    if n == 1:
+        export_frames = [images[0]]
+    elif len(frame_timestamps_s) == n:
+        default_dt = 1.0 / export_fps
+        for i in range(n - 1):
+            dt = float(frame_timestamps_s[i + 1] - frame_timestamps_s[i])
+            if (not np.isfinite(dt)) or dt <= 0.0:
+                dt = default_dt
+            repeat = max(1, int(round(dt * export_fps)))
+            export_frames.extend([images[i]] * repeat)
+
+        last_dt = float(frame_timestamps_s[-1] - frame_timestamps_s[-2])
+        if (not np.isfinite(last_dt)) or last_dt <= 0.0:
+            last_dt = default_dt
+        last_repeat = max(1, int(round(last_dt * export_fps)))
+        export_frames.extend([images[-1]] * last_repeat)
+    else:
+        # Fallback for unexpected timestamp mismatch.
+        export_frames = images
+
+    imageio.mimsave(save_path, export_frames, fps=export_fps)
     print(f"Saved video to: {save_path}")
 
 
@@ -1684,6 +1703,7 @@ def main(_):
         last_exec_tstep = last_tstep - robot_step_duration
         cam0_images: List[np.ndarray] = []
         cam1_images: List[np.ndarray] = []
+        frame_timestamps_s: List[float] = []
         obs_hist = deque(maxlen=max(1, loaded.n_obs_steps))
 
         prev_policy_action: np.ndarray | None = None
@@ -1735,6 +1755,7 @@ def main(_):
                         )
                         warned_missing_camera_stream = True
                     cam1_rgb = cam0_rgb
+                frame_timestamps_s.append(time.monotonic())
                 cam0_images.append(cam0_rgb)
                 cam1_images.append(cam1_rgb)
 
@@ -1936,8 +1957,8 @@ def main(_):
             save_dir=FLAGS.video_save_path,
         )
 
-        _save_rollout_video(cam0_images, f"{loaded.name}_cam0")
-        _save_rollout_video(cam1_images, f"{loaded.name}_cam1")
+        _save_rollout_video(cam0_images, frame_timestamps_s, f"{loaded.name}_cam0")
+        _save_rollout_video(cam1_images, frame_timestamps_s, f"{loaded.name}_cam1")
         if stop_reason == "manual":
             print("[INFO] Rollout ended by user request (S key).")
         elif stop_reason == "timeout":
