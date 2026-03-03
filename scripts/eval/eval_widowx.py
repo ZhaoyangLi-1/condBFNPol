@@ -5,7 +5,7 @@ This script borrows the control flow of scripts/eval/example_widowx.py but
 loads PyTorch workspace checkpoints trained in this repository.
 
 python scripts/eval/eval_widowx.py \
-  --checkpoint /data/BFN_data/checkpoints/diffusion_real_pusht.ckpt \
+  --checkpoint /data/BFN_data/checkpoints/ddpm_real_pusht.ckpt \
   --widowx_envs_path /scr2/zhaoyang/bridge_data_robot_pusht/widowx_envs \
   --action_mode 2trans \
   --step_duration 0.1 \
@@ -14,6 +14,8 @@ python scripts/eval/eval_widowx.py \
   --num_inference_steps 100 \
   --widowx_init_timeout_ms 180000 \
   --widowx_init_retries 8 \
+  --robot_exec_hz 20 \
+  --step_duration 0.05 \
   --video_save_path /data/BFN_data/ddpm_results
 
   
@@ -26,6 +28,8 @@ python scripts/eval/eval_widowx.py \
   --im_size 480 \
   --widowx_init_timeout_ms 180000 \
   --widowx_init_retries 8 \
+  --robot_exec_hz 20 \
+  --step_duration 0.05 \
   --video_save_path /data/BFN_data/ddim_results
 
   
@@ -38,6 +42,8 @@ python scripts/eval/eval_widowx.py \
   --im_size 480 \
   --widowx_init_timeout_ms 180000 \
   --widowx_init_retries 8 \
+  --robot_exec_hz 20 \
+  --step_duration 0.05 \
   --video_save_path /data/BFN_data/consistency_policy_results
   
 
@@ -51,6 +57,8 @@ python scripts/eval/eval_widowx.py \
   --bfn_n_timesteps 10 \
   --widowx_init_timeout_ms 180000 \
   --widowx_init_retries 8 \
+  --robot_exec_hz 20 \
+  --step_duration 0.05 \
   --video_save_path /data/BFN_data/bfn_results
 
 When --video_save_path is set, cam0/cam1 videos are always saved separately.
@@ -138,7 +146,7 @@ flags.DEFINE_integer("num_rollouts", 1, "Number of rollouts; <=0 means infinite"
 flags.DEFINE_float("step_duration", 0.1, "Control period in seconds")
 flags.DEFINE_float(
     "max_duration",
-    60.0,
+    120.0,
     "Max duration for each rollout in seconds.",
 )
 flags.DEFINE_spaceseplist(
@@ -148,17 +156,17 @@ flags.DEFINE_spaceseplist(
 )
 flags.DEFINE_float(
     "term_dist_thresh",
-    0.03,
+    0.02,
     "EEF XY distance threshold to consider entering termination area (meters).",
 )
 flags.DEFINE_float(
     "term_hold_sec",
-    0.5,
+    0.4,
     "Required dwell time in termination area before auto-termination (seconds).",
 )
 flags.DEFINE_float(
     "robot_exec_hz",
-    10.0,
+    20.0,
     "Robot command execution frequency in Hz after linear interpolation.",
 )
 flags.DEFINE_integer("act_exec_horizon", 8, "How many planned actions to execute")
@@ -243,7 +251,7 @@ flags.DEFINE_bool("show_image", False, "Show camera image")
 flags.DEFINE_string("video_save_path", None, "Directory to save rollout videos")
 flags.DEFINE_float(
     "video_fps_scale",
-    0.33,
+    0.3,
     "Saved video speed scale relative to policy rate (1.0=real-time, <1 slower).",
 )
 flags.DEFINE_bool(
