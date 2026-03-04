@@ -8,7 +8,6 @@ python scripts/eval/eval_widowx.py \
   --checkpoint /data/BFN_data/checkpoints/ddpm_real_pusht.ckpt \
   --widowx_envs_path /scr2/zhaoyang/bridge_data_robot_pusht/widowx_envs \
   --action_mode 2trans \
-  --step_duration 0.1 \
   --act_exec_horizon 8 \
   --im_size 480 \
   --num_inference_steps 100 \
@@ -23,7 +22,6 @@ python scripts/eval/eval_widowx.py \
   --checkpoint /data/BFN_data/checkpoints/ddim_real_pusht.ckpt \
   --widowx_envs_path /scr2/zhaoyang/bridge_data_robot_pusht/widowx_envs \
   --action_mode 2trans \
-  --step_duration 0.1 \
   --act_exec_horizon 8 \
   --im_size 480 \
   --widowx_init_timeout_ms 180000 \
@@ -37,7 +35,19 @@ python scripts/eval/eval_widowx.py \
   --checkpoint /data/BFN_data/checkpoints/consistency_real_pusht.ckpt \
   --widowx_envs_path /scr2/zhaoyang/bridge_data_robot_pusht/widowx_envs \
   --action_mode 2trans \
-  --step_duration 0.1 \
+  --act_exec_horizon 8 \
+  --im_size 480 \
+  --widowx_init_timeout_ms 180000 \
+  --widowx_init_retries 8 \
+  --robot_exec_hz 20 \
+  --step_duration 0.05 \
+  --video_save_path /data/BFN_data/consistency_policy_results
+
+  
+python scripts/eval/eval_widowx.py \
+  --checkpoint /data/BFN_data/checkpoints/consistency_real_pusht.ckpt \
+  --widowx_envs_path /scr2/zhaoyang/bridge_data_robot_pusht/widowx_envs \
+  --action_mode 2trans \
   --act_exec_horizon 8 \
   --im_size 480 \
   --widowx_init_timeout_ms 180000 \
@@ -51,7 +61,6 @@ python scripts/eval/eval_widowx.py \
   --checkpoint /data/BFN_data/checkpoints/bfn_real_pusht.ckpt \
   --widowx_envs_path /scr2/zhaoyang/bridge_data_robot_pusht/widowx_envs \
   --action_mode 2trans \
-  --step_duration 0.1 \
   --act_exec_horizon 8 \
   --im_size 480 \
   --bfn_n_timesteps 10 \
@@ -146,7 +155,7 @@ flags.DEFINE_integer("num_rollouts", 1, "Number of rollouts; <=0 means infinite"
 flags.DEFINE_float("step_duration", 0.1, "Control period in seconds")
 flags.DEFINE_float(
     "max_duration",
-    120.0,
+    150.0,
     "Max duration for each rollout in seconds.",
 )
 flags.DEFINE_spaceseplist(
