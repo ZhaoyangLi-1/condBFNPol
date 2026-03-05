@@ -32,7 +32,7 @@ python scripts/eval/eval_widowx.py \
 
   
 python scripts/eval/eval_widowx.py \
-  --checkpoint /data/BFN_data/checkpoints/consistency_real_pusht.ckpt \
+  --checkpoint /data/BFN_data/checkpoints/consistency_flow_policy_3steps_real_pusht.ckpt \
   --widowx_envs_path /scr2/zhaoyang/bridge_data_robot_pusht/widowx_envs \
   --action_mode 2trans \
   --act_exec_horizon 8 \
@@ -41,11 +41,11 @@ python scripts/eval/eval_widowx.py \
   --widowx_init_retries 8 \
   --robot_exec_hz 20 \
   --step_duration 0.05 \
-  --video_save_path /data/BFN_data/consistency_policy_results
+  --video_save_path /data/BFN_data/consistency_flow_policy_3steps_results
 
   
 python scripts/eval/eval_widowx.py \
-  --checkpoint /data/BFN_data/checkpoints/consistency_real_pusht.ckpt \
+  --checkpoint /data/BFN_data/checkpoints/consistency_flow_policy_1step_real_pusht.ckpt \
   --widowx_envs_path /scr2/zhaoyang/bridge_data_robot_pusht/widowx_envs \
   --action_mode 2trans \
   --act_exec_horizon 8 \
@@ -54,7 +54,7 @@ python scripts/eval/eval_widowx.py \
   --widowx_init_retries 8 \
   --robot_exec_hz 20 \
   --step_duration 0.05 \
-  --video_save_path /data/BFN_data/consistency_policy_results
+  --video_save_path /data/BFN_data/consistency_flow_policy_1step_results
   
 
 python scripts/eval/eval_widowx.py \
