@@ -155,7 +155,7 @@ flags.DEFINE_integer("num_rollouts", 1, "Number of rollouts; <=0 means infinite"
 flags.DEFINE_float("step_duration", 0.1, "Control period in seconds")
 flags.DEFINE_float(
     "max_duration",
-    150.0,
+    5.0,
     "Max duration for each rollout in seconds.",
 )
 flags.DEFINE_spaceseplist(
@@ -219,6 +219,17 @@ flags.DEFINE_float(
     "widowx_init_retry_sleep",
     1.0,
     "Seconds to sleep between init retries.",
+)
+flags.DEFINE_bool(
+    "widowx_force_fresh_init",
+    False,
+    "Force server-side env reinit instead of reusing an already initialized env.",
+)
+flags.DEFINE_bool(
+    "widowx_reuse_existing_env",
+    True,
+    "If the server already has a live env, skip init() and reuse it so we do "
+    "not trigger the cached init->reset(itraj=None) path.",
 )
 flags.DEFINE_integer(
     "widowx_reset_retries",
@@ -378,6 +389,37 @@ def _tcp_port_reachable(host: str, port: int, timeout_s: float = 1.0) -> bool:
             return True
     except Exception:
         return False
+
+
+def _widowx_server_has_live_env(
+    widowx_client: Any,
+    max_wait_sec: float = 1.0,
+    poll_interval_sec: float = 0.1,
+) -> bool:
+    """Best-effort probe for an already initialized server-side env."""
+    deadline = time.monotonic() + max(0.1, float(max_wait_sec))
+    poll_interval_sec = max(0.01, float(poll_interval_sec))
+    while time.monotonic() < deadline:
+        try:
+            raw_obs = widowx_client.get_observation()
+        except Exception:
+            raw_obs = None
+
+        if raw_obs is not None:
+            state = raw_obs.get("state", None)
+            if state is None:
+                time.sleep(poll_interval_sec)
+                continue
+            if isinstance(state, dict):
+                return len(state) > 0
+            try:
+                state_vec = np.asarray(state, dtype=np.float64).reshape(-1)
+            except Exception:
+                state_vec = np.array([], dtype=np.float64)
+            if state_vec.size > 0:
+                return True
+        time.sleep(poll_interval_sec)
+    return False
 
 
 def _init_widowx_with_retry(
@@ -1249,6 +1291,23 @@ def _extract_eef_xy(raw_obs: Dict[str, Any]) -> np.ndarray | None:
     return None
 
 
+def _extract_gripper_pose(raw_obs: Dict[str, Any]) -> np.ndarray | None:
+    for key in ("state", "proprio", "eef_state", "eef_pose", "ee_pose", "pose"):
+        if key not in raw_obs or raw_obs[key] is None:
+            continue
+        arr = np.asarray(raw_obs[key], dtype=np.float64).reshape(-1)
+        if arr.size >= 6:
+            return arr[: min(7, arr.size)]
+
+    for key in ("eef_pos", "ee_pos", "agent_pos"):
+        if key not in raw_obs or raw_obs[key] is None:
+            continue
+        arr = np.asarray(raw_obs[key], dtype=np.float64).reshape(-1)
+        if arr.size >= 3:
+            return arr[:3]
+    return None
+
+
 def _get_current_eef_xy_with_retry(
     widowx_client: Any,
     max_wait_sec: float = 2.0,
@@ -1262,6 +1321,23 @@ def _get_current_eef_xy_with_retry(
             eef_xy = _extract_eef_xy(raw_obs)
             if eef_xy is not None:
                 return np.asarray(eef_xy, dtype=np.float64).reshape(-1)[:2]
+        time.sleep(poll_interval_sec)
+    return None
+
+
+def _get_current_gripper_pose_with_retry(
+    widowx_client: Any,
+    max_wait_sec: float = 2.0,
+    poll_interval_sec: float = 0.05,
+) -> np.ndarray | None:
+    deadline = time.monotonic() + max(0.1, float(max_wait_sec))
+    poll_interval_sec = max(0.01, float(poll_interval_sec))
+    while time.monotonic() < deadline:
+        raw_obs = widowx_client.get_observation()
+        if raw_obs is not None:
+            gripper_pose = _extract_gripper_pose(raw_obs)
+            if gripper_pose is not None:
+                return np.asarray(gripper_pose, dtype=np.float64).reshape(-1)
         time.sleep(poll_interval_sec)
     return None
 
@@ -1583,12 +1659,48 @@ def main(_):
             "Init may timeout unless the action server is started."
         )
     widowx_client = WidowXClient(host=FLAGS.ip, port=FLAGS.port)
-    init_status = _init_widowx_with_retry(
-        widowx_client=widowx_client,
-        env_params=env_params,
-        image_size=FLAGS.im_size,
-        WidowXStatus=WidowXStatus,
-    )
+    reuse_existing_env = False
+    reused_env_prepared_for_first_rollout = False
+    if FLAGS.widowx_reuse_existing_env and not FLAGS.widowx_force_fresh_init:
+        reuse_existing_env = _widowx_server_has_live_env(
+            widowx_client=widowx_client,
+            max_wait_sec=1.0,
+            poll_interval_sec=0.1,
+        )
+        if reuse_existing_env:
+            print(
+                "[INFO] Reusing existing WidowX env on the server; skipping init() "
+                "to avoid the cached init->reset(itraj=None) path."
+            )
+            print(
+                "[INFO] Resetting reused env with itraj=0 so the robot moves to "
+                "the same neutral-only pose as the first rollout reset."
+            )
+
+    if reuse_existing_env:
+        _set_widowx_reqrep_timeout_ms(
+            widowx_client,
+            max(1, int(FLAGS.widowx_rpc_timeout_ms)),
+        )
+        init_status = WidowXStatus.SUCCESS
+        reused_reset_status = _reset_widowx_with_retry(
+            widowx_client=widowx_client,
+            WidowXStatus=WidowXStatus,
+            i_traj=0,
+        )
+        if reused_reset_status != WidowXStatus.SUCCESS:
+            raise RuntimeError(
+                "Failed to reset reused WidowX env with i_traj=0; "
+                f"status={_status_name(reused_reset_status, WidowXStatus)}."
+            )
+        reused_env_prepared_for_first_rollout = True
+    else:
+        init_status = _init_widowx_with_retry(
+            widowx_client=widowx_client,
+            env_params=env_params,
+            image_size=FLAGS.im_size,
+            WidowXStatus=WidowXStatus,
+        )
     if init_status != WidowXStatus.SUCCESS:
         raise RuntimeError(
             "WidowX init failed after "
@@ -1640,11 +1752,19 @@ def main(_):
 
         input("Press [Enter] to start rollout.")
 
-        reset_status = _reset_widowx_with_retry(
-            widowx_client=widowx_client,
-            WidowXStatus=WidowXStatus,
-            i_traj=rollout_idx,
-        )
+        if reused_env_prepared_for_first_rollout and rollout_idx == 0:
+            print(
+                "[INFO] First rollout reuses the existing env reset prepared with "
+                "itraj=0; skipping duplicate reset."
+            )
+            reset_status = WidowXStatus.SUCCESS
+            reused_env_prepared_for_first_rollout = False
+        else:
+            reset_status = _reset_widowx_with_retry(
+                widowx_client=widowx_client,
+                WidowXStatus=WidowXStatus,
+                i_traj=rollout_idx,
+            )
         if reset_status != WidowXStatus.SUCCESS:
             print(
                 "[ERROR] Reset failed with status="
@@ -1701,6 +1821,31 @@ def main(_):
                     "[INFO] Auto-aligned termination XY to post-reset robot pose: "
                     f"{np.array2string(rollout_term_pose_xy, precision=6, suppress_small=True)}"
                 )
+
+        pre_rollout_gripper_pose = _get_current_gripper_pose_with_retry(
+            widowx_client=widowx_client,
+            max_wait_sec=2.0,
+            poll_interval_sec=0.05,
+        )
+        if pre_rollout_gripper_pose is None:
+            print("[WARN] Failed to read pre-rollout gripper pose.")
+        elif pre_rollout_gripper_pose.size >= 7:
+            print(
+                "[INFO] Pre-rollout gripper pose xyz+rpy="
+                f"{np.array2string(pre_rollout_gripper_pose[:6], precision=6, suppress_small=True)}, "
+                "gripper_state="
+                f"{np.array2string(pre_rollout_gripper_pose[6:], precision=6, suppress_small=True)}"
+            )
+        elif pre_rollout_gripper_pose.size >= 6:
+            print(
+                "[INFO] Pre-rollout gripper pose xyz+rpy="
+                f"{np.array2string(pre_rollout_gripper_pose[:6], precision=6, suppress_small=True)}"
+            )
+        else:
+            print(
+                "[INFO] Pre-rollout gripper position xyz="
+                f"{np.array2string(pre_rollout_gripper_pose[:3], precision=6, suppress_small=True)}"
+            )
 
         if hasattr(policy, "reset"):
             try:
