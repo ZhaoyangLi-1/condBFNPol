@@ -158,6 +158,28 @@ flags.DEFINE_float(
     5.0,
     "Max duration for each rollout in seconds.",
 )
+flags.DEFINE_float(
+    "timeout_recovery_lift_z",
+    0.1,
+    "After a timeout, first lift the current gripper pose to this z height.",
+)
+flags.DEFINE_float(
+    "timeout_recovery_stage_duration",
+    1.5,
+    "Duration in seconds for each stage of the post-timeout recovery motion.",
+)
+flags.DEFINE_spaceseplist(
+    "timeout_recovery_target_joints",
+    [
+        "-0.11965051",
+        "-0.4954758",
+        "1.29621375",
+        "-0.02914564",
+        "0.65194184",
+        "-0.13038836",
+    ],
+    "Joint target used by the post-timeout recovery sequence.",
+)
 flags.DEFINE_spaceseplist(
     "term_pose_xy",
     [],
@@ -175,7 +197,7 @@ flags.DEFINE_float(
 )
 flags.DEFINE_float(
     "robot_exec_hz",
-    20.0,
+    150.0,
     "Robot command execution frequency in Hz after linear interpolation.",
 )
 flags.DEFINE_integer("act_exec_horizon", 8, "How many planned actions to execute")
@@ -885,6 +907,42 @@ def _build_policy_obs_frame(
     return obs_frame, vis_rgb
 
 
+def _append_rollout_video_frame(
+    raw_obs: Dict[str, Any],
+    im_size: int,
+    cam0_images: List[np.ndarray],
+    cam1_images: List[np.ndarray],
+    frame_timestamps_s: List[float],
+    warned_missing_camera_stream: bool,
+    fallback_rgb: np.ndarray | None = None,
+) -> bool:
+    cam0_rgb, cam1_rgb = _extract_two_camera_rgb(raw_obs, im_size)
+    if fallback_rgb is None and (cam0_rgb is None or cam1_rgb is None):
+        fallback_rgb = _extract_widowx_rgb_obs(raw_obs, im_size)
+
+    if cam0_rgb is None:
+        cam0_rgb = fallback_rgb
+    if cam1_rgb is None:
+        if not warned_missing_camera_stream:
+            print(
+                "[WARN] Second camera stream not found in observation; "
+                "cam1 video will mirror cam0 frames."
+            )
+            warned_missing_camera_stream = True
+        cam1_rgb = cam0_rgb if cam0_rgb is not None else fallback_rgb
+
+    if cam0_rgb is None:
+        return warned_missing_camera_stream
+
+    if cam1_rgb is None:
+        cam1_rgb = cam0_rgb
+
+    frame_timestamps_s.append(time.monotonic())
+    cam0_images.append(cam0_rgb)
+    cam1_images.append(cam1_rgb)
+    return warned_missing_camera_stream
+
+
 def _project_action_to_env_mode(action_7d: np.ndarray, action_mode: str) -> np.ndarray:
     if action_mode == "2trans":
         return action_7d[:2]
@@ -1340,6 +1398,79 @@ def _get_current_gripper_pose_with_retry(
                 return np.asarray(gripper_pose, dtype=np.float64).reshape(-1)
         time.sleep(poll_interval_sec)
     return None
+
+
+def _run_timeout_recovery_sequence(
+    widowx_client: Any,
+    WidowXStatus: Any,
+    blocking: bool = True,
+) -> Any:
+    target_joints = np.array(
+        [float(v) for v in FLAGS.timeout_recovery_target_joints],
+        dtype=np.float64,
+    ).reshape(-1)
+    if target_joints.size != 6:
+        raise ValueError(
+            "--timeout_recovery_target_joints must contain exactly 6 joint values."
+        )
+    if not hasattr(widowx_client, "timeout_recovery_move"):
+        raise AttributeError(
+            "WidowXClient does not expose timeout_recovery_move(). "
+            "Make sure --widowx_envs_path points to the patched widowx_envs tree."
+        )
+
+    print(
+        "[INFO] Running post-timeout recovery: lift current pose to z="
+        f"{float(FLAGS.timeout_recovery_lift_z):.4f}, move above target joints="
+        f"{np.array2string(target_joints, precision=6, suppress_small=True)}, "
+        "then descend to the target z height."
+    )
+    return widowx_client.timeout_recovery_move(
+        target_joints=target_joints,
+        lift_z=float(FLAGS.timeout_recovery_lift_z),
+        duration=float(FLAGS.timeout_recovery_stage_duration),
+        blocking=bool(blocking),
+    )
+
+
+def _record_timeout_recovery_frames(
+    widowx_client: Any,
+    cam0_images: List[np.ndarray],
+    cam1_images: List[np.ndarray],
+    frame_timestamps_s: List[float],
+    warned_missing_camera_stream: bool,
+    total_duration_sec: float,
+) -> bool:
+    deadline = time.monotonic() + max(0.1, float(total_duration_sec))
+    poll_interval_sec = min(0.05, max(0.01, float(FLAGS.step_duration) * 0.5))
+    while time.monotonic() < deadline:
+        raw_obs = widowx_client.get_observation()
+        if raw_obs is not None:
+            warned_missing_camera_stream = _append_rollout_video_frame(
+                raw_obs=raw_obs,
+                im_size=FLAGS.im_size,
+                cam0_images=cam0_images,
+                cam1_images=cam1_images,
+                frame_timestamps_s=frame_timestamps_s,
+                warned_missing_camera_stream=warned_missing_camera_stream,
+            )
+            if FLAGS.show_image:
+                preview = _extract_widowx_rgb_obs(raw_obs, FLAGS.im_size)
+                cv2.imshow("img_view", cv2.cvtColor(preview, cv2.COLOR_RGB2BGR))
+                cv2.waitKey(1)
+        time.sleep(poll_interval_sec)
+
+    raw_obs = widowx_client.get_observation()
+    if raw_obs is not None:
+        warned_missing_camera_stream = _append_rollout_video_frame(
+            raw_obs=raw_obs,
+            im_size=FLAGS.im_size,
+            cam0_images=cam0_images,
+            cam1_images=cam1_images,
+            frame_timestamps_s=frame_timestamps_s,
+            warned_missing_camera_stream=warned_missing_camera_stream,
+        )
+    return warned_missing_camera_stream
 
 
 def _interpolate_actions_to_robot_rate(
@@ -1898,20 +2029,15 @@ def main(_):
                     obs_shape_meta=obs_shape_meta,
                     im_size=FLAGS.im_size,
                 )
-                cam0_rgb, cam1_rgb = _extract_two_camera_rgb(raw_obs, FLAGS.im_size)
-                if cam0_rgb is None:
-                    cam0_rgb = vis_rgb
-                if cam1_rgb is None:
-                    if not warned_missing_camera_stream:
-                        print(
-                            "[WARN] Second camera stream not found in observation; "
-                            "cam1 video will mirror cam0 frames."
-                        )
-                        warned_missing_camera_stream = True
-                    cam1_rgb = cam0_rgb
-                frame_timestamps_s.append(time.monotonic())
-                cam0_images.append(cam0_rgb)
-                cam1_images.append(cam1_rgb)
+                warned_missing_camera_stream = _append_rollout_video_frame(
+                    raw_obs=raw_obs,
+                    im_size=FLAGS.im_size,
+                    cam0_images=cam0_images,
+                    cam1_images=cam1_images,
+                    frame_timestamps_s=frame_timestamps_s,
+                    warned_missing_camera_stream=warned_missing_camera_stream,
+                    fallback_rgb=vis_rgb,
+                )
 
                 if FLAGS.show_image:
                     cv2.imshow("img_view", cv2.cvtColor(vis_rgb, cv2.COLOR_RGB2BGR))
@@ -2095,6 +2221,30 @@ def main(_):
             print(traceback.format_exc(), file=sys.stderr)
         finally:
             _restore_terminal_mode(stdin_fd, stdin_old_attrs)
+
+        if stop_reason == "timeout":
+            try:
+                recovery_status = _run_timeout_recovery_sequence(
+                    widowx_client=widowx_client,
+                    WidowXStatus=WidowXStatus,
+                    blocking=False,
+                )
+                if recovery_status != WidowXStatus.SUCCESS:
+                    print(
+                        "[WARN] Post-timeout recovery motion failed with status="
+                        f"{_status_name(recovery_status, WidowXStatus)}."
+                    )
+                else:
+                    warned_missing_camera_stream = _record_timeout_recovery_frames(
+                        widowx_client=widowx_client,
+                        cam0_images=cam0_images,
+                        cam1_images=cam1_images,
+                        frame_timestamps_s=frame_timestamps_s,
+                        warned_missing_camera_stream=warned_missing_camera_stream,
+                        total_duration_sec=float(FLAGS.timeout_recovery_stage_duration) * 3.0 + 0.3,
+                    )
+            except Exception as exc:
+                print(f"[WARN] Post-timeout recovery motion could not run: {exc}")
 
         # =================================================================
         # 【改动3d】rollout 结束后打印统计 + 保存 JSON
