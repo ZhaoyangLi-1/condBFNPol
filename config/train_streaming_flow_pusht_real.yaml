@@ -58,7 +58,7 @@ policy:
   crop_shape: ${crop_shape}
   obs_encoder_group_norm: true
   eval_fixed_crop: true
-  image_feature_dim: 64  # Dimension of encoded image features per camera
+  image_feature_dim: 256  # Dimension of encoded image features per camera
   
   # Training specific parameters
   fc_timesteps: 2

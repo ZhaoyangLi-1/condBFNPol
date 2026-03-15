@@ -117,6 +117,9 @@ class TrainStreamingFlowWorkspace(BaseWorkspace):
         policy = policy.to(device)
         self.policy = policy
         
+        # Compatibility aliases for comprehensive_ablation_study.py
+        self.model = policy  # ablation study expects .model attribute
+        
         # Initialize EMA
         if cfg.training.use_ema:
             # Directly instantiate EMA to avoid parameter conflicts
@@ -129,8 +132,11 @@ class TrainStreamingFlowWorkspace(BaseWorkspace):
                 min_value=cfg.ema.min_value,
                 max_value=cfg.ema.max_value,
             )
+            # Compatibility alias for comprehensive_ablation_study.py
+            self.ema_model = self.ema.ema_model if hasattr(self.ema, 'ema_model') else None
         else:
             self.ema = None
+            self.ema_model = None
         
         # Initialize optimizer
         optimizer = hydra.utils.instantiate(cfg.optimizer, 

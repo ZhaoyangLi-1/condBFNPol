@@ -117,6 +117,7 @@ _patch_async_vector_env_shared_memory_api_mismatch()
 # Import workspaces for proper checkpoint loading
 from workspaces.train_bfn_workspace import TrainBFNWorkspace
 from workspaces.train_diffusion_unet_hybrid_workspace import TrainDiffusionUnetHybridWorkspace
+from workspaces.train_streaming_flow_workspace import TrainStreamingFlowWorkspace
 from diffusion_policy.env_runner.pusht_image_runner import PushTImageRunner
 
 
@@ -132,9 +133,9 @@ def find_all_checkpoints(base_dir: str = None) -> Dict[str, Dict[int, str]]:
     2. outputs/YYYY.MM.DD/HH.MM.SS_method_seed*/checkpoints (benchmark format)
     
     Returns:
-        Dict with structure: {'bfn': {seed: best_ckpt_path}, 'diffusion': {seed: best_ckpt_path}}
+        Dict with structure: {'bfn': {seed: best_ckpt_path}, 'diffusion': {seed: best_ckpt_path}, 'streaming_flow': {seed: best_ckpt_path}}
     """
-    checkpoints = {'bfn': {}, 'diffusion': {}}
+    checkpoints = {'bfn': {}, 'diffusion': {}, 'streaming_flow': {}}
     
     # Try organized format first
     if base_dir is None:
@@ -180,8 +181,8 @@ def find_all_checkpoints(base_dir: str = None) -> Dict[str, Dict[int, str]]:
                 _process_run_directory(run_dir, checkpoints)
     
     # Convert to simple dict structure (extract 'path' from dict values)
-    result = {'bfn': {}, 'diffusion': {}}
-    for method in ['bfn', 'diffusion']:
+    result = {'bfn': {}, 'diffusion': {}, 'streaming_flow': {}}
+    for method in ['bfn', 'diffusion', 'streaming_flow']:
         for seed, data in checkpoints[method].items():
             if isinstance(data, dict):
                 result[method][seed] = data['path']
@@ -203,6 +204,8 @@ def _process_run_directory(run_dir: Path, checkpoints: Dict[str, Dict[int, str]]
         method = "bfn"
     elif "diffusion" in dir_name.lower():
         method = "diffusion"
+    elif "streaming" in dir_name.lower() and "flow" in dir_name.lower():
+        method = "streaming_flow"
     else:
         return False
     
@@ -355,6 +358,50 @@ def load_diffusion_policy_from_checkpoint(checkpoint_path: str, device: str = "c
         return policy, cfg
     except Exception as e:
         print(f"Error loading Diffusion checkpoint: {e}")
+        import traceback
+        traceback.print_exc()
+        raise
+
+
+def load_streaming_flow_policy_from_checkpoint(checkpoint_path: str, device: str = "cuda"):
+    """Load Streaming Flow policy from workspace checkpoint."""
+    print(f"Loading Streaming Flow checkpoint: {Path(checkpoint_path).name}")
+    
+    try:
+        import dill
+        payload = torch.load(open(checkpoint_path, 'rb'), pickle_module=dill, map_location='cpu')
+    except Exception as e:
+        error_msg = str(e)
+        if "zip archive" in error_msg.lower() or "central directory" in error_msg.lower():
+            raise RuntimeError(
+                f"Checkpoint file appears corrupted (ZIP archive error). "
+                f"This usually happens when the checkpoint save was interrupted or the file was corrupted during transfer. "
+                f"\n\nPossible solutions:"
+                f"\n  1. Re-train the model or re-download the checkpoint from your training cluster"
+                f"\n  2. Check if there are backup checkpoints or alternative checkpoint formats"
+                f"\n  3. Use the existing evaluation scores from logs/filenames instead of full ablation"
+                f"\n\nFile: {checkpoint_path}"
+            ) from e
+        raise
+    
+    try:
+        workspace = TrainStreamingFlowWorkspace.create_from_checkpoint(checkpoint_path)
+        # Workspace stores policy as 'model' (or 'ema_model' for EMA version)
+        # Use EMA model if available, otherwise use main model
+        if hasattr(workspace, 'ema_model') and workspace.ema_model is not None:
+            policy = workspace.ema_model
+        elif hasattr(workspace, 'model'):
+            policy = workspace.model
+        else:
+            raise AttributeError("Workspace has no 'model' or 'ema_model' attribute")
+        
+        cfg = workspace.cfg
+        
+        policy.to(device)
+        policy.eval()
+        return policy, cfg
+    except Exception as e:
+        print(f"Error loading Streaming Flow checkpoint: {e}")
         import traceback
         traceback.print_exc()
         raise
