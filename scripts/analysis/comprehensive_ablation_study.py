@@ -413,7 +413,7 @@ def load_streaming_flow_policy_from_checkpoint(checkpoint_path: str, device: str
 
 def evaluate_policy_at_steps(
     policy,
-    method: str,  # 'bfn' or 'diffusion'
+    method: str,  # 'bfn', 'diffusion', or 'streaming_flow'
     n_steps: int,
     n_envs: int = 50,
     max_steps: int = 300,
@@ -426,6 +426,9 @@ def evaluate_policy_at_steps(
     if method == 'bfn':
         original_steps = getattr(policy, 'n_timesteps', 20)
         policy.n_timesteps = n_steps
+    elif method == 'streaming_flow':
+        original_steps = getattr(policy, 'num_integration_steps', 100)
+        policy.num_integration_steps = n_steps
     else:  # diffusion
         if hasattr(policy, 'num_inference_steps'):
             original_steps = policy.num_inference_steps
@@ -476,6 +479,8 @@ def evaluate_policy_at_steps(
     if original_steps is not None:
         if method == 'bfn':
             policy.n_timesteps = original_steps
+        elif method == 'streaming_flow':
+            policy.num_integration_steps = original_steps
         else:
             if hasattr(policy, 'num_inference_steps'):
                 policy.num_inference_steps = original_steps
@@ -510,6 +515,9 @@ def measure_inference_time(
     if method == 'bfn':
         original = policy.n_timesteps
         policy.n_timesteps = n_steps
+    elif method == 'streaming_flow':
+        original = getattr(policy, 'num_integration_steps', 100)
+        policy.num_integration_steps = n_steps
     else:
         original = None
         if hasattr(policy, 'num_inference_steps'):
@@ -549,6 +557,8 @@ def measure_inference_time(
     # Restore
     if method == 'bfn':
         policy.n_timesteps = original
+    elif method == 'streaming_flow':
+        policy.num_integration_steps = original
     else:
         if original is not None:
             if hasattr(policy, 'num_inference_steps'):
@@ -570,8 +580,10 @@ def measure_inference_time(
 def run_comprehensive_ablation(
     bfn_checkpoints: Dict[int, str],
     diffusion_checkpoints: Dict[int, str],
+    streaming_flow_checkpoints: Dict[int, str],
     bfn_steps: List[int] = [5, 10, 15, 20, 30, 50],
     diffusion_steps: List[int] = [10, 20, 30, 50, 75, 100],
+    streaming_flow_steps: List[int] = [25, 50, 75, 100, 150, 200],
     n_envs: int = 50,
     device: str = "cuda",
     output_dir: str = "results/ablation",
@@ -583,13 +595,16 @@ def run_comprehensive_ablation(
     results = {
         'bfn': defaultdict(dict),
         'diffusion': defaultdict(dict),
+        'streaming_flow': defaultdict(dict),
         'metadata': {
             'timestamp': datetime.now().isoformat(),
             'bfn_steps': bfn_steps,
             'diffusion_steps': diffusion_steps,
+            'streaming_flow_steps': streaming_flow_steps,
             'n_envs': n_envs,
             'bfn_seeds': list(bfn_checkpoints.keys()),
             'diffusion_seeds': list(diffusion_checkpoints.keys()),
+            'streaming_flow_seeds': list(streaming_flow_checkpoints.keys()),
         }
     }
     
@@ -670,6 +685,43 @@ def run_comprehensive_ablation(
         if device == "cuda" and torch.cuda.is_available():
             torch.cuda.empty_cache()
     
+    # Run Streaming Flow ablation
+    print("\n" + "=" * 70)
+    print("STREAMING FLOW INFERENCE STEPS ABLATION")
+    print("=" * 70)
+    
+    for seed, ckpt_path in streaming_flow_checkpoints.items():
+        print(f"\n--- Streaming Flow Seed {seed} ---")
+        try:
+            policy, cfg = load_streaming_flow_policy_from_checkpoint(ckpt_path, device)
+        except Exception as e:
+            print(f"Error loading checkpoint: {e}")
+            continue
+        
+        for n_steps in tqdm(streaming_flow_steps, desc=f"Streaming Flow seed {seed}"):
+            print(f"  Evaluating with {n_steps} steps...", end=" ", flush=True)
+            
+            try:
+                time_result = measure_inference_time(policy, 'streaming_flow', n_steps, device=device)
+                eval_result = evaluate_policy_at_steps(
+                    policy, 'streaming_flow', n_steps, n_envs, device=device
+                )
+                
+                results['streaming_flow'][seed][n_steps] = {
+                    **eval_result,
+                    **time_result,
+                }
+                print(f"✓ Score: {eval_result['mean_score']:.3f}, Time: {time_result['avg_time_ms']:.1f}ms")
+            except Exception as e:
+                print(f"✗ Error: {e}")
+                import traceback
+                traceback.print_exc()
+        
+        # Cleanup
+        del policy
+        if device == "cuda" and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    
     # Save results
     results_file = output_path / "ablation_results.json"
     
@@ -677,6 +729,7 @@ def run_comprehensive_ablation(
     results_to_save = {
         'bfn': {str(k): {str(k2): v2 for k2, v2 in v.items()} for k, v in results['bfn'].items()},
         'diffusion': {str(k): {str(k2): v2 for k2, v2 in v.items()} for k, v in results['diffusion'].items()},
+        'streaming_flow': {str(k): {str(k2): v2 for k2, v2 in v.items()} for k, v in results['streaming_flow'].items()},
         'metadata': results['metadata'],
     }
     
@@ -1037,6 +1090,8 @@ def main():
                         help="Comma-separated list of BFN steps to test")
     parser.add_argument("--diffusion-steps", type=str, default="10,20,30,50,75,100",
                         help="Comma-separated list of Diffusion steps to test")
+    parser.add_argument("--streaming-flow-steps", type=str, default="25,50,75,100,150,200",
+                        help="Comma-separated list of Streaming Flow steps to test")
     parser.add_argument("--n-envs", type=int, default=50,
                         help="Number of environments for evaluation")
     parser.add_argument("--device", type=str, default="auto",
@@ -1066,6 +1121,7 @@ def main():
     # Parse steps lists
     bfn_steps = [int(x) for x in args.bfn_steps.split(",")]
     diffusion_steps = [int(x) for x in args.diffusion_steps.split(",")]
+    streaming_flow_steps = [int(x) for x in args.streaming_flow_steps.split(",")]
     
     # Load existing results or run ablation
     if args.plot_only:
@@ -1092,26 +1148,31 @@ def main():
     
     bfn_checkpoints = checkpoints.get('bfn', {})
     diffusion_checkpoints = checkpoints.get('diffusion', {})
+    streaming_flow_checkpoints = checkpoints.get('streaming_flow', {})
     
     # Filter by seeds if specified
     if args.seeds:
         seed_list = [int(s) for s in args.seeds.split(",")]
         bfn_checkpoints = {s: bfn_checkpoints[s] for s in seed_list if s in bfn_checkpoints}
         diffusion_checkpoints = {s: diffusion_checkpoints[s] for s in seed_list if s in diffusion_checkpoints}
+        streaming_flow_checkpoints = {s: streaming_flow_checkpoints[s] for s in seed_list if s in streaming_flow_checkpoints}
     
-    if not bfn_checkpoints and not diffusion_checkpoints:
+    if not bfn_checkpoints and not diffusion_checkpoints and not streaming_flow_checkpoints:
         print("Error: No checkpoints found. Check --checkpoint-dir or --seeds")
         return
     
     print(f"\nFound {len(bfn_checkpoints)} BFN checkpoints")
     print(f"Found {len(diffusion_checkpoints)} Diffusion checkpoints")
+    print(f"Found {len(streaming_flow_checkpoints)} Streaming Flow checkpoints")
     
     # Run ablation
     results = run_comprehensive_ablation(
         bfn_checkpoints=bfn_checkpoints,
         diffusion_checkpoints=diffusion_checkpoints,
+        streaming_flow_checkpoints=streaming_flow_checkpoints,
         bfn_steps=bfn_steps,
         diffusion_steps=diffusion_steps,
+        streaming_flow_steps=streaming_flow_steps,
         n_envs=args.n_envs,
         device=device,
         output_dir=args.output_dir,

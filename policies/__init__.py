@@ -6,7 +6,8 @@ from policies.bfn_unet_hybrid_image_policy import BFNUnetHybridImagePolicy
 from policies.bfn_hybrid_action_policy import BFNHybridActionPolicy
 
 try:
-    from policies.streaming_flow_policy import StreamingFlowPolicy
+    from policies.streaming_flow_policy import StreamingFlowPolicy, StreamingFlowConfig
+    from policies.streaming_flow_unet_hybrid_image_policy import StreamingFlowUnetHybridImagePolicy
     HAS_STREAMING_FLOW = True
 except ImportError:
     HAS_STREAMING_FLOW = False
@@ -23,4 +24,4 @@ __all__ = [
 ]
 
 if HAS_STREAMING_FLOW:
-    __all__.extend(["StreamingFlowPolicy"])
+    __all__.extend(["StreamingFlowPolicy", "StreamingFlowConfig", "StreamingFlowUnetHybridImagePolicy"])

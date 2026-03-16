@@ -12,6 +12,7 @@ from workspaces.train_diffusion_unet_hybrid_workspace import (
 from workspaces.train_bfn_workspace import TrainBFNWorkspace
 from workspaces.train_bfn_robomimic_workspace import TrainBFNRobomimicWorkspace
 from workspaces.train_diffusion_robomimic_workspace import TrainDiffusionRobomimicWorkspace
+from workspaces.train_streaming_flow_workspace import TrainStreamingFlowWorkspace
 
 __all__ = [
     "BaseWorkspace",
@@ -20,4 +21,5 @@ __all__ = [
     "TrainBFNWorkspace",
     "TrainBFNRobomimicWorkspace",
     "TrainDiffusionRobomimicWorkspace",
+    "TrainStreamingFlowWorkspace",
 ]

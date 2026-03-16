@@ -149,6 +149,11 @@ flags.DEFINE_integer(
     -1,
     "Override BFN n_timesteps when > 0",
 )
+flags.DEFINE_integer(
+    "streaming_flow_integration_steps",
+    -1,
+    "Override Streaming Flow num_integration_steps when > 0",
+)
 
 flags.DEFINE_integer("im_size", 480, "WidowX service image size")
 flags.DEFINE_integer("num_rollouts", 1, "Number of rollouts; <=0 means infinite")
@@ -639,6 +644,8 @@ def _load_policy_from_checkpoint(
         policy.num_inference_steps = int(FLAGS.num_inference_steps)
     if FLAGS.bfn_n_timesteps > 0 and hasattr(policy, "n_timesteps"):
         policy.n_timesteps = int(FLAGS.bfn_n_timesteps)
+    if FLAGS.streaming_flow_integration_steps > 0 and hasattr(policy, "num_integration_steps"):
+        policy.num_integration_steps = int(FLAGS.streaming_flow_integration_steps)
 
     shape_meta_cfg = _cfg_get(cfg, "shape_meta", None)
     if shape_meta_cfg is None:
@@ -1002,6 +1009,7 @@ def _detect_policy_type(policy: Any) -> str:
         "edm"                 — EDM teacher (Karras ODE solver, Euler/Heun)
         "diffusion_ddpm_ddim" — HuggingFace-scheduler Diffusion Policy (DDPM/DDiM)
         "bfn"                 — Bayesian Flow Network policy
+        "streaming_flow"      — Streaming Flow policy
         "unknown"
     """
     cls_name = type(policy).__name__.lower()
@@ -1013,6 +1021,15 @@ def _detect_policy_type(policy: Any) -> str:
         return "consistency_policy"
     if "ctm" in cls_name or "consistency" in cls_name:
         return "consistency_policy"
+
+    # Streaming Flow — check for unique streaming flow attributes
+    if hasattr(policy, "num_integration_steps") or (
+        "streaming" in cls_name
+        and "flow" in cls_name
+    ):
+        return "streaming_flow"
+    if "streamingflow" in cls_name or "streaming_flow" in cls_name:
+        return "streaming_flow"
 
     # BFN — check before diffusion because BFN also has n_timesteps
     if hasattr(policy, "n_timesteps") and (
@@ -1163,6 +1180,23 @@ def _estimate_nfe(policy: Any) -> Dict[str, Any]:
             }
         else:
             result["details"] = "BFN: n_timesteps not found"
+
+    elif ptype == "streaming_flow":
+        # Streaming Flow uses ODE integration with num_integration_steps
+        num_integration_steps = getattr(policy, "num_integration_steps", None)
+        if num_integration_steps is not None:
+            # Each ODE step requires one velocity network evaluation
+            nfe = int(num_integration_steps)
+            result["nfe"] = nfe
+            result["details"] = (
+                f"Streaming Flow: {num_integration_steps} ODE integration steps = {nfe} NFE"
+            )
+            result["breakdown"] = {
+                "num_integration_steps": int(num_integration_steps),
+                "nfe_per_step": 1,
+            }
+        else:
+            result["details"] = "Streaming Flow: num_integration_steps not found"
 
     else:
         result["details"] = f"Unknown policy type ({type(policy).__name__}): NFE not estimated"
