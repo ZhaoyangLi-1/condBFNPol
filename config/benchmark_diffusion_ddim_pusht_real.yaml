@@ -148,10 +148,10 @@ checkpoint:
 
 # ================== Logging ==================
 logging:
-  project: pusht_bfn_vs_diffusion
+  project: bfn-project
   resume: true
   mode: online
-  name: ${now:%Y.%m.%d-%H.%M.%S}_diffusion_ddim_real_image_seed${training.seed}
+  name: ${now:%Y.%m.%d-%H.%M.%S}_ddim_real_pusht_seed${training.seed}
   tags:
     - benchmark
     - pusht_real
@@ -163,12 +163,12 @@ logging:
     - infer10
     - seed_${training.seed}
   id: null
-  group: bfn_vs_diffusion_benchmark
+  group: bfn-project
 
 # ================== Hydra ==================
 hydra:
   run:
-    dir: "${output_root}/${now:%Y.%m.%d}/${now:%H.%M.%S}_diffusion_ddim_real_image_seed${training.seed}"
+    dir: "${output_root}/${now:%Y.%m.%d}/${now:%H.%M.%S}_ddim_real_pusht_seed${training.seed}"
   sweep:
     dir: outputs/benchmark/${now:%Y-%m-%d}
-    subdir: diffusion_ddim_real_image_seed${training.seed}
+    subdir: ddim_real_pusht_seed${training.seed}
