@@ -41,14 +41,15 @@ policy:
   # Streaming Flow specific config
   sigma0: 0.0
   sigma1: 0.1
+  k: 0.0
   num_integration_steps: 100
   # Vision encoder config
   crop_shape: [84, 84]
   obs_encoder_group_norm: true
   eval_fixed_crop: true
   # U-Net config
-  diffusion_step_embed_dim: 128
-  down_dims: [512, 1024, 2048]
+  diffusion_step_embed_dim: 256
+  down_dims: [256, 512, 1024]
   kernel_size: 5
   n_groups: 8
   cond_predict_scale: true

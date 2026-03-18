@@ -1,462 +1,412 @@
-"""Training workspace for Streaming Flow Policy.
+"""Training Workspace for Streaming Flow Policy.
 
-This workspace handles the training loop for streaming flow policies,
-following the same pattern as other workspaces in the condBFNPol framework.
+Aligned with TrainBFNWorkspace: same normalizer handling, checkpoint management,
+wandb logging, and training loop structure.
 """
 
 from __future__ import annotations
 
+import copy
 import os
 import pathlib
-import logging
+import random
 from typing import Any, Dict, Optional
 
+import numpy as np
 import torch
 import tqdm
 import wandb
-import numpy as np
-from omegaconf import DictConfig
-import hydra
+from omegaconf import OmegaConf
+from torch.utils.data import DataLoader
 
-from workspaces.base_workspace import BaseWorkspace
-
-# Try importing from local utils first, fallback to diffusion_policy
 try:
-    from utils.normalizer import LinearNormalizer
+    import hydra
+    HAS_HYDRA = True
 except ImportError:
-    from diffusion_policy.model.common.normalizer import LinearNormalizer
+    HAS_HYDRA = False
 
-log = logging.getLogger(__name__)
+from workspaces.base_workspace import BaseWorkspace, copy_to_cpu
+
+# Import from diffusion_policy
+from diffusion_policy.model.common.normalizer import LinearNormalizer
+from diffusion_policy.common.pytorch_util import dict_apply, optimizer_to
+from diffusion_policy.common.checkpoint_util import TopKCheckpointManager
+from diffusion_policy.common.json_logger import JsonLogger
+
+try:
+    from diffusion_policy.model.diffusion.ema_model import EMAModel
+except ImportError:
+    from utils.ema import EMAModel
+
+try:
+    from diffusion_policy.model.common.lr_scheduler import get_scheduler
+except ImportError:
+    from torch.optim.lr_scheduler import LambdaLR
+
+    def get_scheduler(name, optimizer, num_warmup_steps, num_training_steps, last_epoch=-1):
+        if name == 'cosine':
+            from torch.optim.lr_scheduler import CosineAnnealingLR
+            return CosineAnnealingLR(optimizer, T_max=num_training_steps, last_epoch=last_epoch)
+        elif name == 'linear':
+            def lr_lambda(step):
+                if step < num_warmup_steps:
+                    return float(step) / float(max(1, num_warmup_steps))
+                return max(0.0, float(num_training_steps - step) / float(max(1, num_training_steps - num_warmup_steps)))
+            return LambdaLR(optimizer, lr_lambda, last_epoch=last_epoch)
+        else:
+            raise ValueError(f"Unknown scheduler: {name}")
 
 __all__ = ["TrainStreamingFlowWorkspace"]
 
+OmegaConf.register_new_resolver("eval", eval, replace=True)
+
 
 class TrainStreamingFlowWorkspace(BaseWorkspace):
-    """Workspace for training streaming flow policies."""
+    """Workspace for training Streaming Flow policies.
 
-    def __init__(self, cfg: DictConfig, output_dir: Optional[pathlib.Path] = None):
-        """Initialize training workspace.
-        
-        Args:
-            cfg: Configuration object
-            output_dir: Output directory for checkpoints and logs
-        """
+    Mirrors TrainBFNWorkspace so that configs, checkpoints, wandb metrics,
+    and the ablation / eval scripts work identically.
+    """
+
+    include_keys = ['global_step', 'epoch']
+
+    def __init__(self, cfg: OmegaConf, output_dir: Optional[str] = None):
         super().__init__(cfg, output_dir=output_dir)
-        
-        # Initialize device
-        device_str = self.cfg.training.device
-        if device_str == 'cuda' and not torch.cuda.is_available():
-            device_str = 'cpu'
-            log.warning("CUDA not available, falling back to CPU")
-        
-        self.device = torch.device(device_str)
-        
-        # Set random seeds
-        self._set_seed(self.cfg.training.seed)
-        
-        # Initialize policy
-        policy_cfg = self.cfg.policy
-        self.policy = hydra.utils.instantiate(policy_cfg, device=self.device)
-        self.policy.to(self.device)
-        
-        # Initialize dataset and dataloader
-        task_cfg = self.cfg.task
-        dataset = hydra.utils.instantiate(task_cfg.dataset)
-        
-        # Create normalizers
-        self.action_normalizer = LinearNormalizer()
-        self.obs_normalizer = LinearNormalizer()
-        
-        # Fit normalizers on dataset
-        log.info("Fitting normalizers...")
-        self._fit_normalizers(dataset)
-        
-        # Set normalizers in policy
-        self.policy.set_normalizers(
-            action_normalizer=self.action_normalizer,
-            obs_normalizer=self.obs_normalizer
-        )
-        
-        # Create EMA model (recreate instead of deepcopy to avoid NeuralODE issues)
-        if self.cfg.training.use_ema:
-            self.ema_model = hydra.utils.instantiate(policy_cfg, device=self.device)
-            self.ema_model.set_normalizers(
-                action_normalizer=self.action_normalizer,
-                obs_normalizer=self.obs_normalizer
-            )
-            # Copy weights from main policy to EMA model
-            self.ema_model.load_state_dict(self.policy.state_dict())
+
+        # Set random seed
+        seed = cfg.training.seed
+        torch.manual_seed(seed)
+        np.random.seed(seed)
+        random.seed(seed)
+
+        # Instantiate model
+        if HAS_HYDRA:
+            self.model = hydra.utils.instantiate(cfg.policy)
         else:
-            self.ema_model = None
-        
-        # Create dataloaders
-        self.dataloader = torch.utils.data.DataLoader(
-            dataset,
-            **self.cfg.dataloader,
-        )
-        
-        self.val_dataloader = torch.utils.data.DataLoader(
-            dataset,
-            **self.cfg.val_dataloader,
-        )
-        
-        # Initialize optimizer
-        optimizer_cfg = self.cfg.optimizer
+            raise ImportError("Hydra is required for config-based instantiation")
+
+        # EMA model – recreate via instantiate to avoid NeuralODE deep-copy issues
+        self.ema_model = None
+        if cfg.training.use_ema:
+            self.ema_model = hydra.utils.instantiate(cfg.policy)
+
+        # Optimizer – use get_params() so we only optimise velocity_net + obs_encoder
+        if hasattr(self.model, 'get_params'):
+            params = self.model.get_params()
+        else:
+            params = self.model.parameters()
+
         self.optimizer = hydra.utils.instantiate(
-            optimizer_cfg,
-            params=self.policy.get_params()
+            cfg.optimizer,
+            params=params,
         )
-        
-        # Initialize EMA
-        if self.cfg.training.use_ema:
-            self.ema = hydra.utils.instantiate(
-                self.cfg.ema,
-                model=self.ema_model
-            )
-        else:
-            self.ema = None
-        
-        # Initialize scheduler
-        if self.cfg.training.lr_scheduler == 'cosine':
-            from diffusers.optimization import get_scheduler
-            self.lr_scheduler = get_scheduler(
-                name='cosine',
-                optimizer=self.optimizer,
-                num_warmup_steps=self.cfg.training.lr_warmup_steps,
-                num_training_steps=len(self.dataloader) * self.cfg.training.num_epochs
-            )
-        else:
-            self.lr_scheduler = None
-        
-        # Initialize environment runner for evaluation (if available)
-        try:
-            env_runner_cfg = task_cfg.env_runner
-            self.env_runner = hydra.utils.instantiate(env_runner_cfg, output_dir=self.output_dir)
-        except Exception as e:
-            log.warning(f"Failed to initialize environment runner: {e}")
-            self.env_runner = None
-        
+
         # Training state
         self.global_step = 0
         self.epoch = 0
-        
-        # Move models to device
-        self.policy.to(self.device)
-        if self.ema_model is not None:
-            self.ema_model.to(self.device)
-        
-        log.info(f"TrainStreamingFlowWorkspace initialized on device {self.device}")
-        log.info(f"Dataset size: {len(dataset)}")
-        log.info(f"Batch size: {self.cfg.dataloader.batch_size}")
-        log.info(f"Number of epochs: {self.cfg.training.num_epochs}")
 
-    def _set_seed(self, seed: int):
-        """Set random seeds for reproducibility."""
-        torch.manual_seed(seed)
-        np.random.seed(seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed(seed)
-            torch.cuda.manual_seed_all(seed)
-
-    def _fit_normalizers(self, dataset):
-        """Fit normalizers on the dataset."""
-        # Sample a batch to get data shapes
-        sample_batch = dataset[0]
-        
-        # Collect all data for normalization
-        all_actions = []
-        all_obs = {}
-        
-        # Initialize observation containers
-        for key in sample_batch:
-            if 'obs' in key or key == 'obs':
-                all_obs[key] = []
-        
-        # Collect data from dataset
-        log.info("Collecting data for normalization...")
-        for i in range(0, len(dataset), max(1, len(dataset) // 1000)):  # Sample ~1000 data points
-            batch = dataset[i]
-            
-            # Collect actions
-            if 'action' in batch:
-                all_actions.append(batch['action'])
-            
-            # Collect observations
-            for key in all_obs.keys():
-                if key in batch:
-                    all_obs[key].append(batch[key])
-        
-        # Fit action normalizer
-        if all_actions:
-            actions_tensor = torch.stack(all_actions)
-            self.action_normalizer.fit(actions_tensor)
-            log.info(f"Action normalizer fitted on {len(all_actions)} samples")
-        
-        # Fit observation normalizer (if we have observations)
-        if all_obs:
-            # For now, we'll skip observation normalization for hybrid policies
-            # as they handle normalization internally through the encoder
-            log.info("Skipping observation normalization for hybrid policy")
-    
     def run(self):
-        """Run training loop."""
-        log.info("Starting training...")
-        
-        # Initialize logging
-        if self.cfg.logging.mode == 'online' and self.cfg.logging.project:
-            wandb.init(
-                project=self.cfg.logging.project,
-                name=self.cfg.logging.name,
-                config=dict(self.cfg),
-                tags=self.cfg.logging.tags,
-                group=self.cfg.logging.group,
-                resume=self.cfg.logging.resume,
+        cfg = copy.deepcopy(self.cfg)
+
+        # Resume training if checkpoint exists
+        if cfg.training.resume:
+            latest_ckpt_path = self.get_checkpoint_path()
+            if latest_ckpt_path.is_file():
+                print(f"Resuming from checkpoint {latest_ckpt_path}")
+                self.load_checkpoint(path=latest_ckpt_path)
+
+        # ========= Dataset Setup =========
+        dataset = hydra.utils.instantiate(cfg.task.dataset)
+        train_dataloader = DataLoader(dataset, **cfg.dataloader)
+
+        # Get normalizer from dataset (same as BFN workspace)
+        if hasattr(dataset, 'get_normalizer'):
+            normalizer = dataset.get_normalizer()
+        else:
+            normalizer = self._build_normalizer(dataset, cfg)
+
+        # Validation dataset
+        if hasattr(dataset, 'get_validation_dataset'):
+            val_dataset = dataset.get_validation_dataset()
+            val_dataloader = DataLoader(val_dataset, **cfg.val_dataloader)
+        else:
+            val_dataloader = None
+
+        # Set normalizer on model (and EMA)
+        self.model.set_normalizer(normalizer)
+        if cfg.training.use_ema:
+            self.ema_model.set_normalizer(normalizer)
+
+        # ========= LR Scheduler =========
+        lr_scheduler = get_scheduler(
+            cfg.training.lr_scheduler,
+            optimizer=self.optimizer,
+            num_warmup_steps=cfg.training.lr_warmup_steps,
+            num_training_steps=(
+                len(train_dataloader) * cfg.training.num_epochs
+            ) // cfg.training.gradient_accumulate_every,
+            last_epoch=self.global_step - 1,
+        )
+
+        # ========= EMA =========
+        ema = None
+        if cfg.training.use_ema:
+            ema = hydra.utils.instantiate(cfg.ema, model=self.ema_model)
+
+        # ========= Environment Runner =========
+        env_runner = None
+        if hasattr(cfg.task, 'env_runner') and cfg.task.env_runner is not None:
+            env_runner = hydra.utils.instantiate(
+                cfg.task.env_runner,
+                output_dir=self.output_dir,
             )
-        
-        try:
-            for epoch in range(self.cfg.training.num_epochs):
-                self.epoch = epoch
-                
-                # Training step
-                train_losses = self._train_epoch()
-                
-                # Validation step
-                if epoch % self.cfg.training.val_every == 0:
-                    val_losses = self._val_epoch()
-                else:
-                    val_losses = {}
-                
-                # Environment evaluation step (like BFN workspace)
-                if (epoch % self.cfg.training.rollout_every == 0 and 
-                    self.env_runner is not None):
-                    try:
-                        # Use EMA model for evaluation if available, otherwise use main policy
-                        eval_policy = self.ema_model if self.ema_model is not None else self.policy
-                        eval_policy.eval()
-                        runner_log = self.env_runner.run(eval_policy)
-                        eval_results = dict(runner_log) if runner_log else {}
-                    except Exception as e:
-                        log.warning(f"Environment evaluation failed: {e}")
-                        eval_results = {}
-                else:
-                    eval_results = {}
-                
-                # Sampling evaluation (like BFN workspace)
-                if (epoch % self.cfg.training.sample_every == 0):
-                    try:
-                        # Get a training batch for sampling evaluation
-                        sample_batch = next(iter(self.dataloader))
-                        sample_batch = self._to_device(sample_batch, self.device)
-                        
-                        # Use EMA model for sampling if available, otherwise use main policy
-                        eval_policy = self.ema_model if self.ema_model is not None else self.policy
-                        eval_policy.eval()
-                        
-                        with torch.no_grad():
-                            # Get ground truth actions
-                            gt_action = sample_batch['action']  # [B, horizon, action_dim]
-                            
-                            # Sample actions from policy
-                            obs = sample_batch['obs']
-                            pred_action = eval_policy.predict_action(obs)['action']  # [B, horizon, action_dim]
-                            
-                            # Compute MSE error for action prediction
-                            mse = torch.nn.functional.mse_loss(pred_action, gt_action)
-                            train_losses['train_action_mse_error'] = mse.item()
-                            
-                    except Exception as e:
-                        log.warning(f"Sampling evaluation failed: {e}")
-                
-                # Combine all log data (like BFN workspace)
-                log_data = {
-                    'epoch': epoch,
-                    'global_step': self.global_step,
-                    **train_losses,
-                    **val_losses,
-                    **eval_results,
-                }
-                
-                # Log epoch-level metrics to wandb (like BFN workspace)
-                if self.cfg.logging.mode == 'online':
-                    wandb.log(log_data, step=self.global_step)
-                
-                # Print progress
-                loss_str = f"train_loss={train_losses.get('train_loss', 0.0):.6f}"
-                if val_losses:
-                    loss_str += f", val_loss={val_losses.get('val_loss', 0.0):.6f}"
-                if eval_results:
-                    loss_str += f", test_score={eval_results.get('test_mean_score', 0.0):.3f}"
-                    
-                log.info(f"Epoch {epoch:04d}: {loss_str}")
-                
-                # Checkpointing
-                if epoch % self.cfg.training.checkpoint_every == 0:
-                    self._save_checkpoint(epoch, log_data)
-            
-            log.info("Training completed successfully!")
-            
-        except KeyboardInterrupt:
-            log.info("Training interrupted by user")
-        except Exception as e:
-            log.error(f"Training failed with error: {e}")
-            raise
-        finally:
-            if wandb.run is not None:
-                wandb.finish()
 
-    def _train_epoch(self):
-        """Run one training epoch."""
-        self.policy.train()
-        
-        epoch_losses = []
-        
-        with tqdm.tqdm(
-            self.dataloader,
-            desc=f"Training epoch {self.epoch}",
-            leave=False,
-            mininterval=self.cfg.training.tqdm_interval_sec
-        ) as tepoch:
-            for batch_idx, batch in enumerate(tepoch):
-                # Move batch to device
-                batch = self._to_device(batch, self.device)
-                
-                # Compute loss
-                loss = self.policy.compute_loss(batch)
-                raw_loss_cpu = loss.item()
-                
-                # Backward pass
-                loss.backward()
-                
-                # Optimizer step
-                if (batch_idx + 1) % self.cfg.training.gradient_accumulate_every == 0:
-                    self.optimizer.step()
-                    self.optimizer.zero_grad()
-                    
-                    # Update EMA
-                    if self.ema is not None:
-                        self.ema.step(self.ema_model)
-                    
-                    # Update scheduler
-                    if self.lr_scheduler is not None:
-                        self.lr_scheduler.step()
-                    
-                    # Log step-level metrics to wandb (like BFN workspace)
-                    step_log = {
-                        'train_loss': raw_loss_cpu,
-                        'global_step': self.global_step,
-                        'epoch': self.epoch,
-                        'lr': self.optimizer.param_groups[0]['lr']
-                    }
-                    
-                    is_last_batch = (batch_idx == (len(self.dataloader) - 1))
-                    if not is_last_batch and self.cfg.logging.mode == 'online':
-                        wandb.log(step_log, step=self.global_step)
-                    
-                    self.global_step += 1
-                
-                epoch_losses.append(raw_loss_cpu)
-                
-                # Update progress bar
-                tepoch.set_postfix({
-                    'loss': f'{raw_loss_cpu:.6f}',
-                    'lr': f'{self.optimizer.param_groups[0]["lr"]:.2e}'
-                })
-        
-        return {
-            'train_loss': np.mean(epoch_losses),
-            'lr': self.optimizer.param_groups[0]['lr'],
-        }
+        # ========= Logging =========
+        wandb_run = wandb.init(
+            dir=str(self.output_dir),
+            config=OmegaConf.to_container(cfg, resolve=True),
+            **cfg.logging,
+        )
+        wandb.config.update({"output_dir": self.output_dir})
 
-    def _val_epoch(self):
-        """Run one validation epoch."""
-        self.policy.eval()
-        
-        epoch_losses = []
-        
-        with torch.no_grad():
-            with tqdm.tqdm(
-                self.val_dataloader,
-                desc=f"Validation epoch {self.epoch}",
-                leave=False,
-                mininterval=self.cfg.training.tqdm_interval_sec
-            ) as tepoch:
-                for batch in tepoch:
-                    # Move batch to device
-                    batch = self._to_device(batch, self.device)
-                    
-                    # Compute loss
-                    loss = self.policy.compute_loss(batch)
-                    val_loss_cpu = loss.item()
-                    epoch_losses.append(val_loss_cpu)
-                    
-                    # Update progress bar
-                    tepoch.set_postfix({
-                        'val_loss': f'{val_loss_cpu:.6f}'
-                    })
-        
-        return {
-            'val_loss': np.mean(epoch_losses),
-        }
+        # ========= Checkpoint Manager =========
+        topk_manager = TopKCheckpointManager(
+            save_dir=os.path.join(self.output_dir, 'checkpoints'),
+            **cfg.checkpoint.topk,
+        )
 
-    def _eval_epoch(self):
-        """Run environment evaluation."""
-        if self.env_runner is None:
-            return {}
-        
-        self.policy.eval()
-        
-        # Use EMA model for evaluation if available, otherwise use main policy
-        eval_policy = self.ema_model if self.ema_model is not None else self.policy
-        eval_policy.eval()
-        
-        try:
-            # Run environment evaluation
-            results = self.env_runner.run(eval_policy)
-            
-            # Process results
-            eval_results = {}
-            if hasattr(results, 'test_mean_score'):
-                eval_results['test_mean_score'] = results.test_mean_score
-            if hasattr(results, 'test_std_score'):
-                eval_results['test_std_score'] = results.test_std_score
-            
-            return eval_results
-            
-        except Exception as e:
-            log.warning(f"Environment evaluation failed: {e}")
-            return {}
-
-    def _save_checkpoint(self, epoch: int, log_data: Dict[str, Any]):
-        """Save model checkpoint."""
-        checkpoint_dir = self.output_dir / "checkpoints"
-        checkpoint_dir.mkdir(exist_ok=True)
-        
-        checkpoint = {
-            'epoch': epoch,
-            'global_step': self.global_step,
-            'model_state_dict': self.policy.state_dict(),
-            'optimizer_state_dict': self.optimizer.state_dict(),
-            'config': dict(self.cfg),
-            'action_normalizer': self.action_normalizer.state_dict() if self.action_normalizer else None,
-            'obs_normalizer': self.obs_normalizer.state_dict() if self.obs_normalizer else None,
-        }
-        
+        # ========= Device Setup =========
+        device = torch.device(cfg.training.device)
+        self.model.to(device)
         if self.ema_model is not None:
-            checkpoint['ema_state_dict'] = self.ema_model.state_dict()
-        
-        if self.lr_scheduler is not None:
-            checkpoint['scheduler_state_dict'] = self.lr_scheduler.state_dict()
-        
-        # Save latest checkpoint
-        latest_path = checkpoint_dir / "latest.ckpt"
-        torch.save(checkpoint, latest_path)
-        
-        # Save epoch checkpoint
-        epoch_path = checkpoint_dir / f"epoch_{epoch:04d}.ckpt"
-        torch.save(checkpoint, epoch_path)
-        
-        log.info(f"Checkpoint saved: {epoch_path}")
+            self.ema_model.to(device)
+        optimizer_to(self.optimizer, device)
 
-    def _to_device(self, batch: Dict[str, torch.Tensor], device: torch.device) -> Dict[str, torch.Tensor]:
-        """Move batch to device."""
-        return {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+        # Save batch for sampling
+        train_sampling_batch = None
+
+        # Debug mode
+        if cfg.training.debug:
+            cfg.training.num_epochs = 2
+            cfg.training.max_train_steps = 3
+            cfg.training.max_val_steps = 3
+            cfg.training.rollout_every = 1
+            cfg.training.checkpoint_every = 1
+            cfg.training.val_every = 1
+            cfg.training.sample_every = 1
+
+        # ========= Training Loop =========
+        log_path = os.path.join(self.output_dir, 'logs.json.txt')
+
+        with JsonLogger(log_path) as json_logger:
+            for local_epoch_idx in range(cfg.training.num_epochs):
+                step_log = dict()
+
+                # ========= Train for this epoch =========
+                train_losses = list()
+                with tqdm.tqdm(
+                    train_dataloader,
+                    desc=f"Training epoch {self.epoch}",
+                    leave=False,
+                    mininterval=cfg.training.tqdm_interval_sec,
+                ) as tepoch:
+                    for batch_idx, batch in enumerate(tepoch):
+                        # Device transfer
+                        batch = dict_apply(
+                            batch,
+                            lambda x: x.to(device, non_blocking=True),
+                        )
+                        if train_sampling_batch is None:
+                            train_sampling_batch = batch
+
+                        # Compute loss
+                        raw_loss = self.model.compute_loss(batch)
+                        loss = raw_loss / cfg.training.gradient_accumulate_every
+                        loss.backward()
+
+                        # Step optimizer
+                        if self.global_step % cfg.training.gradient_accumulate_every == 0:
+                            self.optimizer.step()
+                            self.optimizer.zero_grad()
+                            lr_scheduler.step()
+
+                        # Update EMA
+                        if cfg.training.use_ema and ema is not None:
+                            ema.step(self.model)
+
+                        # Logging
+                        raw_loss_cpu = raw_loss.item()
+                        tepoch.set_postfix(loss=raw_loss_cpu, refresh=False)
+                        train_losses.append(raw_loss_cpu)
+
+                        step_log = {
+                            'train_loss': raw_loss_cpu,
+                            'global_step': self.global_step,
+                            'epoch': self.epoch,
+                            'lr': lr_scheduler.get_last_lr()[0],
+                        }
+
+                        is_last_batch = (batch_idx == (len(train_dataloader) - 1))
+                        if not is_last_batch:
+                            wandb_run.log(step_log, step=self.global_step)
+                            json_logger.log(step_log)
+                            self.global_step += 1
+
+                        if (cfg.training.max_train_steps is not None
+                                and batch_idx >= (cfg.training.max_train_steps - 1)):
+                            break
+
+                # End of epoch – average train loss
+                train_loss = np.mean(train_losses)
+                step_log['train_loss'] = train_loss
+
+                # ========= Evaluation =========
+                policy = self.model
+                if cfg.training.use_ema:
+                    policy = self.ema_model
+                policy.eval()
+
+                # Run rollout
+                if env_runner is not None and (self.epoch % cfg.training.rollout_every) == 0:
+                    runner_log = env_runner.run(policy)
+                    step_log.update(runner_log)
+
+                # Run validation
+                if val_dataloader is not None and (self.epoch % cfg.training.val_every) == 0:
+                    with torch.no_grad():
+                        val_losses = list()
+                        with tqdm.tqdm(
+                            val_dataloader,
+                            desc=f"Validation epoch {self.epoch}",
+                            leave=False,
+                            mininterval=cfg.training.tqdm_interval_sec,
+                        ) as tepoch:
+                            for batch_idx, batch in enumerate(tepoch):
+                                batch = dict_apply(
+                                    batch,
+                                    lambda x: x.to(device, non_blocking=True),
+                                )
+                                loss = self.model.compute_loss(batch)
+                                val_losses.append(loss.item())
+                                if (cfg.training.max_val_steps is not None
+                                        and batch_idx >= (cfg.training.max_val_steps - 1)):
+                                    break
+
+                        if len(val_losses) > 0:
+                            val_loss = np.mean(val_losses)
+                            step_log['val_loss'] = val_loss
+
+                # Streaming flow sampling on training batch
+                if (self.epoch % cfg.training.sample_every) == 0:
+                    with torch.no_grad():
+                        batch = dict_apply(
+                            train_sampling_batch,
+                            lambda x: x.to(device, non_blocking=True),
+                        )
+                        obs = batch['obs']
+                        gt_action = batch['action']
+
+                        # Use predict_action for the full trajectory
+                        result = policy.predict_action(obs)
+                        pred_action = result.get('action_pred', result['action'])
+
+                        # Align shapes for MSE comparison
+                        if pred_action.ndim == 3 and gt_action.ndim == 3:
+                            n_action_steps = pred_action.shape[1]
+                            n_obs_steps = getattr(policy, 'n_obs_steps', 2)
+                            start_idx = n_obs_steps - 1
+                            end_idx = start_idx + n_action_steps
+                            gt_action_slice = gt_action[:, start_idx:end_idx, :]
+                        elif pred_action.ndim == 3 and gt_action.ndim == 2:
+                            pred_action = pred_action.reshape(pred_action.shape[0], -1)
+                            gt_action_slice = gt_action
+                        elif pred_action.ndim == 2 and gt_action.ndim == 3:
+                            gt_action_slice = gt_action.reshape(gt_action.shape[0], -1)
+                        else:
+                            gt_action_slice = gt_action
+
+                        mse = torch.nn.functional.mse_loss(pred_action, gt_action_slice)
+                        step_log['train_action_mse_error'] = mse.item()
+
+                        del batch, obs, gt_action, pred_action, mse
+
+                # ========= Checkpointing =========
+                if (self.epoch % cfg.training.checkpoint_every) == 0:
+                    if cfg.checkpoint.save_last_ckpt:
+                        self.save_checkpoint()
+                    if cfg.checkpoint.save_last_snapshot:
+                        self.save_snapshot()
+
+                    metric_dict = {
+                        key.replace('/', '_'): value
+                        for key, value in step_log.items()
+                    }
+
+                    topk_ckpt_path = topk_manager.get_ckpt_path(metric_dict)
+                    if topk_ckpt_path is not None:
+                        self.save_checkpoint(path=topk_ckpt_path)
+
+                # ========= End of epoch =========
+                policy.train()
+
+                wandb_run.log(step_log, step=self.global_step)
+                json_logger.log(step_log)
+                self.global_step += 1
+                self.epoch += 1
+
+    def _build_normalizer(self, dataset, cfg) -> LinearNormalizer:
+        """Build normalizer from dataset when get_normalizer is not available."""
+        normalizer = LinearNormalizer()
+
+        n_samples = min(len(dataset), 1000)
+        indices = np.random.choice(len(dataset), n_samples, replace=False)
+
+        obs_list = []
+        action_list = []
+
+        for idx in indices:
+            item = dataset[idx]
+            if isinstance(item, dict):
+                if 'obs' in item:
+                    obs_list.append(item['obs'])
+                if 'action' in item:
+                    action_list.append(item['action'])
+            elif isinstance(item, (list, tuple)):
+                obs_list.append(item[0])
+                action_list.append(item[1])
+
+        fit_data = {}
+        if obs_list:
+            if isinstance(obs_list[0], dict):
+                for key in obs_list[0].keys():
+                    fit_data[key] = np.stack([o[key] for o in obs_list])
+            else:
+                fit_data['obs'] = np.stack(obs_list)
+
+        if action_list:
+            fit_data['action'] = np.stack(action_list)
+
+        normalizer.fit(fit_data)
+        return normalizer
+
+
+def _main(cfg):
+    workspace = TrainStreamingFlowWorkspace(cfg)
+    workspace.run()
+
+
+if HAS_HYDRA:
+    @hydra.main(
+        version_base=None,
+        config_path=str(pathlib.Path(__file__).parent.parent / "config"),
+        config_name="train_streaming_flow_pusht",
+    )
+    def main(cfg):
+        _main(cfg)
+else:
+    def main(cfg):
+        _main(cfg)
+
+
+if __name__ == "__main__":
+    main()
