@@ -231,7 +231,7 @@ class CTMPPUnetHybridImagePolicy(BaseImagePolicy):
         if inference_mode == True:
             print("You should be doing inference only!")
         else:
-            state_dict = state_dict_to_model(torch.load(teacher_path))
+            state_dict = state_dict_to_model(torch.load(teacher_path, map_location="cpu", weights_only=False))
             teacher.load_state_dict(state_dict)
             teacher.eval()
             teacher.requires_grad_(False)
