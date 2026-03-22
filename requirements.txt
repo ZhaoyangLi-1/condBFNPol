@@ -10,7 +10,6 @@ cfgv==3.4.0
 charset-normalizer==3.4.2
 click==8.1.8
 cloudpickle==3.1.1
-cmake==4.1.2
 colorama
 contourpy==1.3.2
 crc32c==2.7.1
@@ -26,7 +25,6 @@ dm-tree==0.1.9
 dm_control==1.0.34
 docker-pycreds==0.4.0
 donfig==0.8.1.post1
-egl-probe>=1.0.2
 einops==0.8.1
 etils==1.13.0
 Farama-Notifications==0.0.4
@@ -90,8 +88,9 @@ pillow==11.2.1
 platformdirs==4.3.8
 pluggy==1.6.0
 pre_commit==4.2.0
-protobuf==6.31.0
+protobuf>=6.31.1
 psutil==7.0.0
+pyarrow
 pybind11
 pybind11_global
 pybullet==3.2.7
@@ -128,6 +127,7 @@ tensorboard==2.20.0
 tensorboard-data-server==0.7.2
 tensorboardX==2.6.4
 termcolor==3.2.0
+threadpoolctl
 tifffile==2025.5.10
 torch
 torchaudio==2.1.2
@@ -141,12 +141,13 @@ typing_extensions==4.13.2
 tzdata==2025.2
 urllib3
 virtualenv==20.31.2
-wandb==0.19.11
+wandb>=0.19.11
 Werkzeug==3.1.3
 wrapt==2.0.1
 zarr<3.5
 zipp==3.21.0
 zstandard==0.25.0
+fastparquet
 av
 pettingzoo
 imagecodecs
@@ -161,3 +162,7 @@ drake
 torchdyn
 mediapy
 gdown
+# NOTE: egl-probe is installed separately in install.sh via:
+# pip install --no-build-isolation "egl-probe>=1.0.2"
+# This is required because egl-probe needs cmake at build time,
+# which is not available inside pip's isolated build environment.
