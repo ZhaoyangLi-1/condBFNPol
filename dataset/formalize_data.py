@@ -363,6 +363,63 @@ def extract_action(
     return act7
 
 
+def shift_next(arr: np.ndarray) -> np.ndarray:
+    """
+    Shift a per-step series forward by one timestep and repeat the terminal
+    value. This matches the action/observation alignment used by the
+    diffusion-policy sampler and upstream SFP preprocessing.
+    """
+    arr = np.asarray(arr, dtype=np.float64)
+    if arr.ndim == 0:
+        raise ValueError("shift_next expects an array with a time dimension")
+    if arr.shape[0] <= 1:
+        return arr.copy()
+    return np.concatenate([arr[1:], arr[-1:]], axis=0)
+
+
+def extract_sfp_xy_action(
+    policy_out,
+    obs: dict,
+    eef_pose: np.ndarray,
+    source_indices: np.ndarray | None = None,
+    default_gripper: float = DEFAULT_GRIPPER_OPEN,
+) -> np.ndarray:
+    """
+    Build a 7D achieved-trajectory action for Streaming Flow Policy.
+
+    We use observed EE pose instead of raw policy commands, then shift it by
+    one step so a sampled action sequence begins at the current observation.
+    The full 7D layout is preserved for compatibility; downstream configs can
+    still crop to XY via shape_meta.action.shape=[2].
+    """
+    eef_pose = np.asarray(eef_pose, dtype=np.float64)
+    if eef_pose.ndim != 2 or eef_pose.shape[1] != 6:
+        raise ValueError(f"eef_pose must have shape (T, 6), got {eef_pose.shape}")
+
+    target_len = eef_pose.shape[0]
+    next_pose6 = shift_next(eef_pose)
+
+    full_len = int(np.asarray(obs["time_stamp"]).shape[0])
+    g_full = get_gripper_from_policy_out(policy_out, full_len)
+    if g_full is None:
+        g_full = get_gripper_from_obs(obs, full_len)
+    if g_full is None:
+        g_full = np.full((full_len,), float(default_gripper), dtype=np.float64)
+
+    if source_indices is not None:
+        source_indices = np.asarray(source_indices, dtype=np.int64)
+        g = np.asarray(g_full, dtype=np.float64)[source_indices]
+    else:
+        g = _as_gripper_series(g_full, target_len)
+
+    g = shift_next(np.asarray(g, dtype=np.float64).reshape(target_len, 1))
+
+    act7 = np.concatenate([next_pose6, g], axis=1)
+    if act7.shape != (target_len, 7):
+        raise RuntimeError(f"Internal error: expected (T,7) got {act7.shape}")
+    return act7
+
+
 def detect_image_ext(img_dir: Path) -> str:
     for ext in ("jpg", "png", "jpeg"):
         if (img_dir / f"im_0.{ext}").exists():
@@ -631,6 +688,17 @@ def main() -> None:
         help="If output exists, report its estimated Hz and exit.",
     )
     parser.add_argument(
+        "--action-source",
+        type=str,
+        default="policy",
+        choices=["policy", "sfp_xy"],
+        help=(
+            "How to construct replay_buffer/data/action. "
+            "'policy' uses policy_out-derived actions; "
+            "'sfp_xy' uses shifted achieved EE pose from obs for Streaming Flow Policy."
+        ),
+    )
+    parser.add_argument(
         "--default-gripper-open",
         type=float,
         default=DEFAULT_GRIPPER_OPEN,
@@ -651,7 +719,9 @@ def main() -> None:
     args = parser.parse_args()
     if args.downsample < 1:
         raise ValueError("--downsample must be >= 1")
-    print(f"Arm action source: {args.arm_action_source}")
+    print(f"Action source: {args.action_source}")
+    if args.action_source == "policy":
+        print(f"Arm action source: {args.arm_action_source}")
 
     reference_spec = None
     if not args.no_reference:
@@ -780,14 +850,15 @@ def main() -> None:
                             f"(source {resolved_src_hz:.2f} Hz -> {resolved_eff_hz:.2f} Hz)"
                         )
 
-        # >>> Option A change: action_full is now (T, 7)
-        action_full = extract_action(
-            policy_out,
-            obs=obs,
-            target_len=len(timestamps_full),
-            default_gripper=float(args.default_gripper_open),
-            arm_action_source=str(args.arm_action_source),
-        )
+        action_full = None
+        if args.action_source == "policy":
+            action_full = extract_action(
+                policy_out,
+                obs=obs,
+                target_len=len(timestamps_full),
+                default_gripper=float(args.default_gripper_open),
+                arm_action_source=str(args.arm_action_source),
+            )
 
         if args.target_hz is not None:
             idx, timestamps = make_target_hz_indices(timestamps_full, args.target_hz)
@@ -799,11 +870,21 @@ def main() -> None:
         qvel = qvel[idx]
         stage = stage[idx]
         eef_T = eef_T[idx]
-        action = action_full[idx]  # (len(idx), 7)
         frame_indices_per_episode.append(idx)
 
         eef_pose = transform_to_pose(eef_T)
         eef_pose_vel = compute_pose_vel(eef_T, timestamps)
+        if args.action_source == "policy":
+            assert action_full is not None
+            action = action_full[idx]  # (len(idx), 7)
+        else:
+            action = extract_sfp_xy_action(
+                policy_out=policy_out,
+                obs=obs,
+                eef_pose=eef_pose,
+                source_indices=idx,
+                default_gripper=float(args.default_gripper_open),
+            )
 
         all_timestamp.append(timestamps)
         all_joint.append(qpos)
@@ -888,4 +969,5 @@ if __name__ == "__main__":
 
 """
 python formalize_data.py --src /scr2/zhaoyang/BFN_data/pusht_real_raw --dst /scr2/zhaoyang/BFN_data/pusht_real --overwrite --target-hz 20  --arm-action-source relative
+python formalize_data.py --src /scr2/zhaoyang/BFN_data/pusht_real_raw --dst /scr2/zhaoyang/BFN_data/pusht_real_sfp_xy --overwrite --target-hz 10 --action-source sfp_xy
 """

@@ -1,25 +1,17 @@
-# Training Configuration: Streaming Flow Policy on PushT Simulation
-# 
-# Run with: python scripts/train_workspace.py --config-name=train_streaming_flow_pusht
-
 defaults:
   - _self_
 
-# Workspace target
 _target_: workspaces.train_streaming_flow_workspace.TrainStreamingFlowWorkspace
 
-# Experiment info  
-name: train_streaming_flow_pusht
-exp_name: streaming_flow_pusht
+name: benchmark_streaming_flow_pusht
+exp_name: bfn_vs_diffusion
 output_root: ${oc.env:BFN_OUTPUT_ROOT,/ariesdv0/zhaoyang/BFN_outputs}
 dataset_root: ${oc.env:BFN_DATA_ROOT,/ariesdv0/zhaoyang/BFN_data}
 
-# ================== Horizons ==================
 horizon: 16
 n_obs_steps: 2
 n_action_steps: 8
 
-# ================== Shape Meta ==================
 shape_meta:
   action:
     shape: [2]
@@ -31,30 +23,25 @@ shape_meta:
       shape: [3, 96, 96]
       type: rgb
 
-# ================== Policy ==================
 policy:
   _target_: policies.streaming_flow_unet_hybrid_image_policy.StreamingFlowUnetHybridImagePolicy
   shape_meta: ${shape_meta}
   horizon: ${horizon}
   n_obs_steps: ${n_obs_steps}
   n_action_steps: ${n_action_steps}
-  # Streaming Flow specific config
-  sigma0: 0.0
+  flow_mode: stochastic
+  sigma0: 0.1
   sigma1: 0.1
-  k: 0.0
   num_integration_steps: 100
-  # Vision encoder config
+  initial_action_mode: auto
   crop_shape: [84, 84]
   obs_encoder_group_norm: true
   eval_fixed_crop: true
-  # U-Net config
   diffusion_step_embed_dim: 256
   down_dims: [256, 512, 1024]
   kernel_size: 5
   n_groups: 8
-  cond_predict_scale: true
 
-# ================== EMA ==================
 ema:
   _target_: diffusion_policy.model.diffusion.ema_model.EMAModel
   update_after_step: 0
@@ -63,7 +50,6 @@ ema:
   min_value: 0.0
   max_value: 0.9999
 
-# ================== Optimizer ==================
 optimizer:
   _target_: torch.optim.AdamW
   lr: 1.0e-4
@@ -71,7 +57,6 @@ optimizer:
   eps: 1.0e-8
   weight_decay: 1.0e-6
 
-# ================== Training ==================
 training:
   device: cuda
   seed: 42
@@ -90,7 +75,6 @@ training:
   tqdm_interval_sec: 1.0
   use_ema: true
 
-# ================== Dataloader ==================
 dataloader:
   batch_size: 64
   shuffle: true
@@ -105,12 +89,11 @@ val_dataloader:
   pin_memory: true
   persistent_workers: false
 
-# ================== Task ==================
 task:
   name: pusht_image
   image_shape: [3, 96, 96]
   shape_meta: ${shape_meta}
-  
+
   dataset:
     _target_: diffusion_policy.dataset.pusht_image_dataset.PushTImageDataset
     zarr_path: ${dataset_root}/pusht_sim/pusht_cchi_v7_replay.zarr
@@ -137,7 +120,6 @@ task:
     n_envs: null
     legacy_test: true
 
-# ================== Checkpoint ==================
 checkpoint:
   topk:
     monitor_key: test_mean_score
@@ -147,21 +129,19 @@ checkpoint:
   save_last_ckpt: true
   save_last_snapshot: false
 
-# ================== Logging ==================
 logging:
-  project: pusht_bfn_vs_diffusion  # Shared project for comparison
+  project: bfn-project
   resume: true
   mode: online
-  name: ${now:%Y.%m.%d-%H.%M.%S}_streaming_flow_seed${training.seed}
+  name: ${now:%Y.%m.%d-%H.%M.%S}_streaming_flow_pusht_sim_seed${training.seed}
   tags:
     - benchmark
-    - pusht
+    - pusht_sim
     - streaming_flow
     - seed_${training.seed}
   id: null
-  group: bfn_vs_diffusion_benchmark
+  group: bfn-project
 
-# ================== Hydra ==================
 hydra:
   run:
     dir: "${output_root}/${now:%Y.%m.%d}/${now:%H.%M.%S}_streaming_flow_pusht_sim_seed${training.seed}"

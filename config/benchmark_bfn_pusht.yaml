@@ -15,7 +15,9 @@ _target_: workspaces.train_bfn_workspace.TrainBFNWorkspace
 
 # Experiment info  
 name: benchmark_bfn_pusht
-exp_name: bfn_vs_diffusion
+exp_name: bfn_pusht
+output_root: ${oc.env:BFN_OUTPUT_ROOT,/ariesdv0/zhaoyang/BFN_outputs}
+dataset_root: ${oc.env:BFN_DATA_ROOT,/ariesdv0/zhaoyang/BFN_data}
 
 # ================== Horizons (SAME AS DIFFUSION) ==================
 horizon: 16
@@ -115,7 +117,7 @@ task:
   dataset:
     _target_: diffusion_policy.dataset.pusht_image_dataset.PushTImageDataset
     # Use absolute path - override with task.dataset.zarr_path=/path/to/data on cluster
-    zarr_path: /scr2/zhaoyang/BFN_data/pusht_sim/pusht_raw/pusht_cchi_v7_replay.zarr
+    zarr_path: ${dataset_root}/pusht_sim/pusht_cchi_v7_replay.zarr
     horizon: ${horizon}
     pad_before: 1
     pad_after: 7
@@ -151,23 +153,23 @@ checkpoint:
 
 # ================== Logging ==================
 logging:
-  project: pusht_bfn_vs_diffusion  # Shared project for comparison
+  project: bfn-project  # Shared project for comparison
   resume: true
   mode: online
-  name: ${now:%Y.%m.%d-%H.%M.%S}_bfn_seed${training.seed}
+  name: ${now:%Y.%m.%d-%H.%M.%S}_bfn_pusht_sim_seed${training.seed}
   tags:
     - benchmark
     - pusht
     - bfn
     - seed_${training.seed}
   id: null
-  group: bfn_vs_diffusion_benchmark
+  group: bfn-project
 
 # ================== Hydra ==================
 hydra:
   run:
     # Replace with your desired output directory
-    dir: "/scr2/zhaoyang/bfn/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_bfn_seed${training.seed}"
+    dir: "${output_root}//${now:%Y.%m.%d}/${now:%H.%M.%S}_bfn_pusht_sim_seed${training.seed}"
   sweep:
     dir: outputs/benchmark/${now:%Y-%m-%d}
-    subdir: bfn_seed${training.seed}
+    subdir: bfn_pusht_sim_seed${training.seed}
