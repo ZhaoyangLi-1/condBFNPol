@@ -9,7 +9,7 @@ python scripts/eval/eval_widowx.py \
   --widowx_envs_path /scr2/zhaoyang/bridge_data_robot_pusht/widowx_envs \
   --action_mode 2trans \
   --act_exec_horizon 8 \
-  --im_size 480 \
+  --im_size 480 --im_width 640 \
   --num_inference_steps 100 \
   --widowx_init_timeout_ms 180000 \
   --widowx_init_retries 8 \
@@ -23,46 +23,46 @@ python scripts/eval/eval_widowx.py \
   --widowx_envs_path /scr2/zhaoyang/bridge_data_robot_pusht/widowx_envs \
   --action_mode 2trans \
   --act_exec_horizon 8 \
-  --im_size 480 \
+  --im_size 480 --im_width 640 \
   --widowx_init_timeout_ms 180000 \
   --widowx_init_retries 8 \
   --robot_exec_hz 20 \
   --step_duration 0.05 \
   --video_save_path /data/BFN_data/ddim_results
 
-  
+
 python scripts/eval/eval_widowx.py \
   --checkpoint /data/BFN_data/checkpoints/consistency_flow_policy_3steps_real_pusht.ckpt \
   --widowx_envs_path /scr2/zhaoyang/bridge_data_robot_pusht/widowx_envs \
   --action_mode 2trans \
   --act_exec_horizon 8 \
-  --im_size 480 \
+  --im_size 480 --im_width 640 \
   --widowx_init_timeout_ms 180000 \
   --widowx_init_retries 8 \
   --robot_exec_hz 20 \
   --step_duration 0.05 \
   --video_save_path /data/BFN_data/consistency_flow_policy_3steps_results
 
-  
+
 python scripts/eval/eval_widowx.py \
   --checkpoint /data/BFN_data/checkpoints/consistency_flow_policy_1step_real_pusht.ckpt \
   --widowx_envs_path /scr2/zhaoyang/bridge_data_robot_pusht/widowx_envs \
   --action_mode 2trans \
   --act_exec_horizon 8 \
-  --im_size 480 \
+  --im_size 480 --im_width 640 \
   --widowx_init_timeout_ms 180000 \
   --widowx_init_retries 8 \
   --robot_exec_hz 20 \
   --step_duration 0.05 \
   --video_save_path /data/BFN_data/consistency_flow_policy_1step_results
-  
+
 
 python scripts/eval/eval_widowx.py \
   --checkpoint /data/BFN_data/checkpoints/bfn_real_pusht.ckpt \
   --widowx_envs_path /scr2/zhaoyang/bridge_data_robot_pusht/widowx_envs \
   --action_mode 2trans \
   --act_exec_horizon 8 \
-  --im_size 480 \
+  --im_size 480 --im_width 640 \
   --bfn_n_timesteps 10 \
   --widowx_init_timeout_ms 180000 \
   --widowx_init_retries 8 \
@@ -155,7 +155,8 @@ flags.DEFINE_integer(
     "Override Streaming Flow integration_steps_per_action when > 0",
 )
 
-flags.DEFINE_integer("im_size", 480, "WidowX service image size")
+flags.DEFINE_integer("im_size", 480, "WidowX service image height")
+flags.DEFINE_integer("im_width", 640, "WidowX service image width (0 = same as im_size)")
 flags.DEFINE_integer("num_rollouts", 1, "Number of rollouts; <=0 means infinite")
 flags.DEFINE_float("step_duration", 0.1, "Control period in seconds")
 flags.DEFINE_float(
@@ -686,18 +687,24 @@ def _to_uint8_rgb(img: np.ndarray) -> np.ndarray:
     return np.clip(arr, 0, 255).astype(np.uint8)
 
 
-def _reshape_flattened_image(flat: np.ndarray, im_size: int) -> np.ndarray:
-    side = int(im_size)
-    if side <= 0 or flat.size != 3 * side * side:
-        inferred_side = int(round(np.sqrt(flat.size / 3.0)))
-        if inferred_side > 0 and 3 * inferred_side * inferred_side == flat.size:
-            side = inferred_side
-        else:
-            raise ValueError(
-                f"Cannot reshape flattened image of size {flat.size} with im_size={im_size}"
-            )
-    img = flat.reshape(3, side, side).transpose(1, 2, 0)
-    return _to_uint8_rgb(img)
+def _reshape_flattened_image(flat: np.ndarray, im_size: int, im_width: int = 0) -> np.ndarray:
+    h = int(im_size)
+    w = int(im_width) if im_width > 0 else h
+    if h > 0 and flat.size == 3 * h * w:
+        img = flat.reshape(3, h, w).transpose(1, 2, 0)
+        return _to_uint8_rgb(img)
+    # Fallback: try square
+    if h > 0 and w != h and flat.size == 3 * h * h:
+        img = flat.reshape(3, h, h).transpose(1, 2, 0)
+        return _to_uint8_rgb(img)
+    # Fallback: infer square side
+    inferred_side = int(round(np.sqrt(flat.size / 3.0)))
+    if inferred_side > 0 and 3 * inferred_side * inferred_side == flat.size:
+        img = flat.reshape(3, inferred_side, inferred_side).transpose(1, 2, 0)
+        return _to_uint8_rgb(img)
+    raise ValueError(
+        f"Cannot reshape flattened image of size {flat.size} with im_size={im_size}, im_width={im_width}"
+    )
 
 
 def _extract_widowx_rgb_sources(raw_obs: Dict[str, Any], im_size: int) -> Dict[str, np.ndarray]:
@@ -721,11 +728,11 @@ def _extract_widowx_rgb_sources(raw_obs: Dict[str, Any], im_size: int) -> Dict[s
     if "image" in raw_obs and raw_obs["image"] is not None:
         image_arr = np.asarray(raw_obs["image"])
         if image_arr.ndim == 1:
-            sources.setdefault("image_0", _reshape_flattened_image(image_arr, im_size))
+            sources.setdefault("image_0", _reshape_flattened_image(image_arr, im_size, FLAGS.im_width))
         elif image_arr.ndim == 2:
             for i in range(image_arr.shape[0]):
                 try:
-                    sources.setdefault(f"image_{i}", _reshape_flattened_image(image_arr[i], im_size))
+                    sources.setdefault(f"image_{i}", _reshape_flattened_image(image_arr[i], im_size, FLAGS.im_width))
                 except Exception:
                     continue
         elif image_arr.ndim == 3:
