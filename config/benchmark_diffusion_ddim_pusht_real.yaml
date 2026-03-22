@@ -19,8 +19,8 @@ n_obs_steps: 2
 n_action_steps: 8
 
 # ================== Shape Meta ==================
-image_shape: [3, 480, 480]
-crop_shape: [384, 384]
+image_shape: [3, 480, 640]
+crop_shape: [384, 512]
 dataset_path: ${dataset_root}/pusht_real
 
 shape_meta:
