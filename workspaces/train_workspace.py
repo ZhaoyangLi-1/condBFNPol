@@ -218,34 +218,32 @@ class TrainWorkspace(BaseWorkspace):
                 if env_runner is not None and (epoch + 1) % cfg.training.get('eval_every', 10) == 0:
                     policy = self.ema_model if self.ema_model is not None else self.model
                     policy.eval()
-                    
+
                     with torch.no_grad():
                         eval_result = env_runner.run(policy)
                     log_data.update(eval_result)
-                    
-                    # Save best checkpoint
-                    metric = eval_result.get('test_mean_score', epoch_loss)
-                    topk_manager.update(
-                        {
-                            'epoch': epoch,
-                            'state_dict': copy_to_cpu(self.model.state_dict()),
-                            'ema_state_dict': copy_to_cpu(self.ema_model.state_dict()) if self.ema_model else None,
-                            'optimizer': copy_to_cpu(self.optimizer.state_dict()),
-                            'cfg': OmegaConf.to_container(cfg, resolve=True),
-                        },
-                        metric,
-                    )
-                
+
                 # Log
                 wandb.log(log_data, step=self.global_step)
                 json_logger.log(log_data)
-                
-                # Checkpoint
-                if (epoch + 1) % cfg.training.get('checkpoint_every', 50) == 0:
-                    self.save_checkpoint(tag=f'epoch_{epoch:04d}')
-                    
-        # Final save
-        self.save_checkpoint(tag='final')
+
+                # Checkpointing (TopK managed, same as TrainBFNWorkspace)
+                if (epoch + 1) % cfg.training.get('checkpoint_every', 1) == 0:
+                    if cfg.checkpoint.get('save_last_ckpt', False):
+                        self.save_checkpoint()
+                    if cfg.checkpoint.get('save_last_snapshot', False):
+                        self.save_snapshot()
+
+                    # Sanitize metric names for checkpoint manager
+                    metric_dict = {
+                        key.replace('/', '_'): value
+                        for key, value in log_data.items()
+                    }
+
+                    topk_ckpt_path = topk_manager.get_ckpt_path(metric_dict)
+                    if topk_ckpt_path is not None:
+                        self.save_checkpoint(path=topk_ckpt_path)
+
         wandb.finish()
         
     def _build_normalizer(self, dataset, cfg) -> LinearNormalizer:
