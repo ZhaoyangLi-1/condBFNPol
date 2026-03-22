@@ -17,7 +17,7 @@ class StreamingFlowConfig:
     flow_mode: str = "stochastic"
     sigma0: float = 0.0
     sigma1: float = 0.1
-    num_integration_steps: int = 100
+    integration_steps_per_action: int = 6
     initial_action_mode: str = "auto"
     initial_action_keys: Optional[Sequence[str]] = None
 

@@ -150,9 +150,9 @@ flags.DEFINE_integer(
     "Override BFN n_timesteps when > 0",
 )
 flags.DEFINE_integer(
-    "streaming_flow_integration_steps",
+    "streaming_flow_steps_per_action",
     -1,
-    "Override Streaming Flow num_integration_steps when > 0",
+    "Override Streaming Flow integration_steps_per_action when > 0",
 )
 
 flags.DEFINE_integer("im_size", 480, "WidowX service image size")
@@ -644,8 +644,8 @@ def _load_policy_from_checkpoint(
         policy.num_inference_steps = int(FLAGS.num_inference_steps)
     if FLAGS.bfn_n_timesteps > 0 and hasattr(policy, "n_timesteps"):
         policy.n_timesteps = int(FLAGS.bfn_n_timesteps)
-    if FLAGS.streaming_flow_integration_steps > 0 and hasattr(policy, "num_integration_steps"):
-        policy.num_integration_steps = int(FLAGS.streaming_flow_integration_steps)
+    if FLAGS.streaming_flow_steps_per_action > 0 and hasattr(policy, "integration_steps_per_action"):
+        policy.integration_steps_per_action = int(FLAGS.streaming_flow_steps_per_action)
 
     shape_meta_cfg = _cfg_get(cfg, "shape_meta", None)
     if shape_meta_cfg is None:
@@ -1023,7 +1023,7 @@ def _detect_policy_type(policy: Any) -> str:
         return "consistency_policy"
 
     # Streaming Flow — check for unique streaming flow attributes
-    if hasattr(policy, "num_integration_steps") or (
+    if hasattr(policy, "integration_steps_per_action") or (
         "streaming" in cls_name
         and "flow" in cls_name
     ):
@@ -1182,21 +1182,25 @@ def _estimate_nfe(policy: Any) -> Dict[str, Any]:
             result["details"] = "BFN: n_timesteps not found"
 
     elif ptype == "streaming_flow":
-        # Streaming Flow uses ODE integration with num_integration_steps
-        num_integration_steps = getattr(policy, "num_integration_steps", None)
-        if num_integration_steps is not None:
-            # Each ODE step requires one velocity network evaluation
-            nfe = int(num_integration_steps)
+        steps_per_action = getattr(policy, "integration_steps_per_action", None)
+        horizon = getattr(policy, "horizon", None)
+        solver = getattr(policy, "ode_solver", "rk4").lower()
+        if steps_per_action is not None and horizon is not None:
+            total_ode_steps = (int(horizon) - 1) * int(steps_per_action)
+            nfe_per_step = {"euler": 1, "heun": 2}.get(solver, 4)
+            nfe = total_ode_steps * nfe_per_step
             result["nfe"] = nfe
             result["details"] = (
-                f"Streaming Flow: {num_integration_steps} ODE integration steps = {nfe} NFE"
+                f"Streaming Flow: {total_ode_steps} ODE steps x {nfe_per_step} NFE/step ({solver}) = {nfe} NFE"
             )
             result["breakdown"] = {
-                "num_integration_steps": int(num_integration_steps),
-                "nfe_per_step": 1,
+                "integration_steps_per_action": int(steps_per_action),
+                "horizon": int(horizon),
+                "total_ode_steps": total_ode_steps,
+                "nfe_per_step": nfe_per_step,
             }
         else:
-            result["details"] = "Streaming Flow: num_integration_steps not found"
+            result["details"] = "Streaming Flow: integration_steps_per_action or horizon not found"
 
     else:
         result["details"] = f"Unknown policy type ({type(policy).__name__}): NFE not estimated"

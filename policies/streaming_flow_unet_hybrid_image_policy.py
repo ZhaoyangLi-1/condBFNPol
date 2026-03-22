@@ -120,7 +120,7 @@ class StreamingFlowUnetHybridImagePolicy(BasePolicy):
         sigma0: float = 0.0,
         sigma1: float = 0.1,
         flow_mode: str = "stochastic",
-        num_integration_steps: int = 100,
+        integration_steps_per_action: int = 6,
         initial_action_mode: str = "auto",
         initial_action_keys: Optional[Sequence[str]] = None,
         crop_shape: Optional[tuple[int, int]] = None,
@@ -214,7 +214,12 @@ class StreamingFlowUnetHybridImagePolicy(BasePolicy):
         self.sigma0 = float(sigma0)
         self.sigma1 = float(sigma1)
         self.sigma_r = math.sqrt(max(self.sigma1**2 - self.sigma0**2, 0.0))
-        self.num_integration_steps = int(num_integration_steps)
+        # Backward compat: old checkpoints store num_integration_steps (total),
+        # convert to per-action equivalent.
+        if 'num_integration_steps' in kwargs:
+            legacy_val = int(kwargs.pop('num_integration_steps'))
+            integration_steps_per_action = max(1, legacy_val // max(horizon - 1, 1))
+        self.integration_steps_per_action = int(integration_steps_per_action)
         self.initial_action_mode = initial_action_mode
         self.initial_action_keys = list(initial_action_keys) if initial_action_keys else None
         self.ode_solver = ode_solver
@@ -485,10 +490,13 @@ class StreamingFlowUnetHybridImagePolicy(BasePolicy):
         else:
             x0 = init_action
 
-        total_steps = max(int(self.num_integration_steps), self.horizon - 1)
-        select_idx = torch.round(
-            torch.linspace(0, total_steps, self.horizon, device=device)
-        ).long()
+        # Match original streaming-flow-policy: integration_steps_per_action
+        num_future_actions = self.horizon - 1
+        total_steps = num_future_actions * self.integration_steps_per_action
+        # Select one action every integration_steps_per_action → horizon points
+        select_idx = torch.arange(
+            0, total_steps + 1, self.integration_steps_per_action, device=device
+        )
 
         vector_field = StreamingFlowVectorField(
             velocity_net=self.velocity_net,

@@ -427,8 +427,8 @@ def evaluate_policy_at_steps(
         original_steps = getattr(policy, 'n_timesteps', 20)
         policy.n_timesteps = n_steps
     elif method == 'streaming_flow':
-        original_steps = getattr(policy, 'num_integration_steps', 100)
-        policy.num_integration_steps = n_steps
+        original_steps = getattr(policy, 'integration_steps_per_action', 6)
+        policy.integration_steps_per_action = n_steps
     else:  # diffusion
         if hasattr(policy, 'num_inference_steps'):
             original_steps = policy.num_inference_steps
@@ -480,7 +480,7 @@ def evaluate_policy_at_steps(
         if method == 'bfn':
             policy.n_timesteps = original_steps
         elif method == 'streaming_flow':
-            policy.num_integration_steps = original_steps
+            policy.integration_steps_per_action = original_steps
         else:
             if hasattr(policy, 'num_inference_steps'):
                 policy.num_inference_steps = original_steps
@@ -516,8 +516,8 @@ def measure_inference_time(
         original = policy.n_timesteps
         policy.n_timesteps = n_steps
     elif method == 'streaming_flow':
-        original = getattr(policy, 'num_integration_steps', 100)
-        policy.num_integration_steps = n_steps
+        original = getattr(policy, 'integration_steps_per_action', 6)
+        policy.integration_steps_per_action = n_steps
     else:
         original = None
         if hasattr(policy, 'num_inference_steps'):
@@ -558,7 +558,7 @@ def measure_inference_time(
     if method == 'bfn':
         policy.n_timesteps = original
     elif method == 'streaming_flow':
-        policy.num_integration_steps = original
+        policy.integration_steps_per_action = original
     else:
         if original is not None:
             if hasattr(policy, 'num_inference_steps'):
@@ -583,7 +583,7 @@ def run_comprehensive_ablation(
     streaming_flow_checkpoints: Dict[int, str],
     bfn_steps: List[int] = [5, 10, 15, 20, 30, 50],
     diffusion_steps: List[int] = [10, 20, 30, 50, 75, 100],
-    streaming_flow_steps: List[int] = [25, 50, 75, 100, 150, 200],
+    streaming_flow_steps: List[int] = [1, 2, 4, 6, 8, 10],
     n_envs: int = 50,
     device: str = "cuda",
     output_dir: str = "results/ablation",
