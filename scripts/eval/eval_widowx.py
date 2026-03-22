@@ -144,6 +144,11 @@ flags.DEFINE_integer(
     -1,
     "Override diffusion num_inference_steps when > 0",
 )
+flags.DEFINE_bool(
+    "use_ddim",
+    False,
+    "Replace DDPMScheduler with DDIMScheduler at eval time (no retraining needed).",
+)
 flags.DEFINE_integer(
     "bfn_n_timesteps",
     -1,
@@ -641,6 +646,20 @@ def _load_policy_from_checkpoint(
     policy.eval()
     print(f"[INFO] Loaded weights from state_dicts['{loaded_source}']")
 
+    if FLAGS.use_ddim and hasattr(policy, "noise_scheduler"):
+        from diffusers.schedulers.scheduling_ddim import DDIMScheduler
+        old_scheduler = policy.noise_scheduler
+        ddim = DDIMScheduler(
+            num_train_timesteps=old_scheduler.config.num_train_timesteps,
+            beta_start=old_scheduler.config.beta_start,
+            beta_end=old_scheduler.config.beta_end,
+            beta_schedule=old_scheduler.config.beta_schedule,
+            clip_sample=True,
+            set_alpha_to_one=True,
+            prediction_type=getattr(old_scheduler.config, "prediction_type", "epsilon"),
+        )
+        policy.noise_scheduler = ddim
+        print(f"[INFO] Replaced {type(old_scheduler).__name__} with DDIMScheduler")
     if FLAGS.num_inference_steps > 0 and hasattr(policy, "num_inference_steps"):
         policy.num_inference_steps = int(FLAGS.num_inference_steps)
     if FLAGS.bfn_n_timesteps > 0 and hasattr(policy, "n_timesteps"):
