@@ -15,6 +15,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torchdyn.core import NeuralODE
 
 from diffusion_policy.common.pytorch_util import dict_apply, replace_submodules
 from diffusion_policy.common.robomimic_config_util import get_robomimic_config
@@ -73,24 +74,29 @@ class SimpleObsEncoder(nn.Module):
 
 
 class StreamingFlowVectorField(nn.Module):
-    """torchdyn-compatible vector field wrapper."""
+    """torchdyn-compatible vector field wrapper.
+
+    Matches the original VectorFieldWrapper from streaming-flow-policy.
+    Accepts x with shape ``(state_tokens, action_dim)`` (single sample) or
+    ``(B, state_tokens, action_dim)`` (batched).
+    """
 
     def __init__(
         self,
         velocity_net: nn.Module,
         obs_cond: torch.Tensor,
-        action_dim: int,
-        state_tokens: int,
     ):
         super().__init__()
         self.velocity_net = velocity_net
         self.obs_cond = obs_cond
-        self.action_dim = action_dim
-        self.state_tokens = state_tokens
 
     def forward(self, t: torch.Tensor, x: torch.Tensor, *args, **kwargs) -> torch.Tensor:
-        if x.dim() == 1:
+        # x: (state_tokens, action_dim) or (B, state_tokens, action_dim)
+        if x.dim() == 2:
             x = x.unsqueeze(0)
+            squeeze = True
+        else:
+            squeeze = False
 
         batch_size = x.shape[0]
         if t.dim() == 0:
@@ -98,13 +104,15 @@ class StreamingFlowVectorField(nn.Module):
         elif t.numel() == 1:
             t = t.reshape(1).expand(batch_size)
 
-        state = x.reshape(batch_size, self.state_tokens, self.action_dim)
         velocity = self.velocity_net(
-            sample=state,
+            sample=x,
             timestep=t,
             global_cond=self.obs_cond,
         )
-        return velocity.reshape(batch_size, -1)
+
+        if squeeze:
+            velocity = velocity.squeeze(0)
+        return velocity
 
 
 class StreamingFlowUnetHybridImagePolicy(BasePolicy):
@@ -130,7 +138,7 @@ class StreamingFlowUnetHybridImagePolicy(BasePolicy):
         down_dims: Sequence[int] = (256, 512, 1024),
         kernel_size: int = 5,
         n_groups: int = 8,
-        ode_solver: str = "rk4",
+        ode_solver: str = "dopri5",
         ode_atol: float = 1e-4,
         ode_rtol: float = 1e-4,
         device: Union[torch.device, str] = "cpu",
@@ -435,46 +443,6 @@ class StreamingFlowUnetHybridImagePolicy(BasePolicy):
         return F.mse_loss(pred, target)
 
     @torch.no_grad()
-    def _integrate_ode(
-        self,
-        vector_field: StreamingFlowVectorField,
-        x0: torch.Tensor,
-        total_steps: int,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> torch.Tensor:
-        t_span = torch.linspace(0.0, 1.0, total_steps + 1, device=device, dtype=dtype)
-        states = [x0]
-        x = x0
-        solver = self.ode_solver.lower()
-
-        for step in range(total_steps):
-            t0 = t_span[step]
-            t1 = t_span[step + 1]
-            dt = t1 - t0
-
-            if solver == "euler":
-                x = x + dt * vector_field(t0, x)
-            elif solver == "heun":
-                k1 = vector_field(t0, x)
-                x_euler = x + dt * k1
-                k2 = vector_field(t1, x_euler)
-                x = x + 0.5 * dt * (k1 + k2)
-            else:
-                # Use RK4 for "rk4" and as a reliable fallback for adaptive-solver
-                # names such as "dopri5" when we want deterministic fixed-step rollout.
-                half_dt = 0.5 * dt
-                k1 = vector_field(t0, x)
-                k2 = vector_field(t0 + half_dt, x + half_dt * k1)
-                k3 = vector_field(t0 + half_dt, x + half_dt * k2)
-                k4 = vector_field(t1, x + dt * k3)
-                x = x + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
-
-            states.append(x)
-
-        return torch.stack(states, dim=0)
-
-    @torch.no_grad()
     def _integrate_normalized_action(
         self,
         obs_dict: Dict[str, torch.Tensor],
@@ -486,33 +454,37 @@ class StreamingFlowUnetHybridImagePolicy(BasePolicy):
 
         if self.flow_mode == "stochastic":
             init_latent = torch.randn_like(init_action)
-            x0 = torch.cat((init_action, init_latent), dim=-1)
+            # Stack as (B, 2, ACTION_DIM) — matches original torch.stack((a0, z0), dim=0)
+            x0 = torch.stack((init_action, init_latent), dim=1)
         else:
-            x0 = init_action
+            x0 = init_action.unsqueeze(1)  # (B, 1, ACTION_DIM)
 
         # Match original streaming-flow-policy: integration_steps_per_action
         num_future_actions = self.horizon - 1
         total_steps = num_future_actions * self.integration_steps_per_action
-        # Select one action every integration_steps_per_action → horizon points
+        total_integration_steps = 1 + total_steps
+        t_span = torch.linspace(0.0, 1.0, total_integration_steps, device=device, dtype=dtype)
         select_idx = torch.arange(
-            0, total_steps + 1, self.integration_steps_per_action, device=device
+            0, total_integration_steps, self.integration_steps_per_action, device=device
         )
 
         vector_field = StreamingFlowVectorField(
             velocity_net=self.velocity_net,
             obs_cond=cond,
-            action_dim=self.action_dim,
-            state_tokens=self.state_tokens,
         )
-        trajectory = self._integrate_ode(
+        ode_solver = NeuralODE(
             vector_field=vector_field,
-            x0=x0,
-            total_steps=total_steps,
-            device=device,
-            dtype=dtype,
+            solver=self.ode_solver,
+            sensitivity="adjoint",
+            atol=self.ode_atol,
+            rtol=self.ode_rtol,
         )
+        # trajectory: (total_integration_steps, B, state_tokens, ACTION_DIM)
+        trajectory = ode_solver.trajectory(x=x0, t_span=t_span)
 
-        action_traj = trajectory.index_select(0, select_idx)[..., : self.action_dim]
+        # Select action keypoints; index 0 on state_tokens dim = action component
+        action_traj = trajectory.index_select(0, select_idx)[:, :, 0, :]
+        # (num_points, B, ACTION_DIM) → (B, num_points, ACTION_DIM)
         return action_traj.permute(1, 0, 2).contiguous()
 
     @torch.no_grad()
