@@ -1,0 +1,68 @@
+defaults:
+  - _self_
+
+# ── Reproducibility ──────────────────────────────────────────────────────────
+seed:
+  base_seed: 42
+  torch_deterministic: true
+
+# ── Environment ──────────────────────────────────────────────────────────────
+env:
+  seed_mean: 0.0
+  seed_std: 5000.0
+  seed_min: 0
+  seed_max: 2147483647
+  trigger_side: true
+  n_envs: 16
+
+# ── PPO hyperparameters ──────────────────────────────────────────────────────
+ppo:
+  total_timesteps: 10_000_000
+  n_steps: 1024            # steps per env per rollout
+  n_epochs: 10
+  batch_size: 512
+  lr: 3.0e-4
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_range: 0.2
+  vf_coef: 0.5
+  ent_coef: 0.02
+  max_grad_norm: 0.5
+  target_kl: 0.02
+
+# ── Network ──────────────────────────────────────────────────────────────────
+network:
+  hidden_dim: 256
+
+# ── Logging & checkpointing ──────────────────────────────────────────────────
+training:
+  log_interval: 10
+  eval_interval: 50
+  eval_episodes: 10
+  save_best: true
+  save_final: true
+  output_dir: ${oc.env:PPO_OUTPUT_ROOT,/scr2/zhaoyang/lunar_lander_outputs}/ppo_lunar_lander_hybrid
+
+# ── tqdm ─────────────────────────────────────────────────────────────────────
+tqdm:
+  enable: true
+  leave: true
+
+# ── Wandb ────────────────────────────────────────────────────────────────────
+logging:
+  project: ppo-lunar-lander-hybrid
+  entity: null
+  mode: online              # online / offline / disabled
+  name: null
+  group: null
+  tags:
+    - ppo
+    - lunar_lander
+    - hybrid-action
+    - discrete-continuous
+    - reproducible
+    - robust-reset-seeds
+  notes: null
+  log_model: true
+  watch_model: true
+  watch_log_freq: 100

@@ -37,7 +37,7 @@ policy:
   n_action_steps: ${n_action_steps}
   flow_mode: stochastic
   sigma0: 0.1
-  sigma1: 0.1
+  sigma1: 0.5
   integration_steps_per_action: 6
   initial_action_mode: zeros
   initial_action_keys: null
