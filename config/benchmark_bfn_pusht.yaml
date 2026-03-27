@@ -80,9 +80,11 @@ training:
   seed: 42
   debug: false
   resume: true
+  resume_path: "None"
   lr_scheduler: cosine
   lr_warmup_steps: 500
   num_epochs: 300
+  p_epochs: 300
   gradient_accumulate_every: 1
   rollout_every: 50
   checkpoint_every: 100  # Less frequent checkpoints to save disk
@@ -92,6 +94,7 @@ training:
   max_val_steps: null
   tqdm_interval_sec: 1.0
   use_ema: true
+  output_dir: ${hydra:runtime.output_dir}
 
 # ================== Dataloader (SAME AS DIFFUSION) ==================
 dataloader:
@@ -148,7 +151,7 @@ checkpoint:
     mode: max
     k: 3  # Only keep top 3 checkpoints to save disk
     format_str: epoch={epoch:04d}-test_mean_score={test_mean_score:.3f}.ckpt
-  save_last_ckpt: false  # Disabled to save disk
+  save_last_ckpt: true
   save_last_snapshot: false
 
 # ================== Logging ==================

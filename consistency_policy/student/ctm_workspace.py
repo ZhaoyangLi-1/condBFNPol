@@ -64,6 +64,7 @@ class CTMWorkspace(BaseWorkspace):
     def run(self):
 
         cfg = copy.deepcopy(self.cfg)
+        resume_path = None
 
         if cfg.training.debug:
             self.model.noise_scheduler.ode_steps_max = 1
@@ -81,33 +82,27 @@ class CTMWorkspace(BaseWorkspace):
             cfg.task.env_runner.n_train = 1
             cfg.task.env_runner.n_test_vis = 1
             cfg.task.env_runner.n_train_vis = 1
-            
-        if cfg.policy.edm != "None" and cfg.training.inference_mode == False:
+
+        if cfg.training.resume:
+            if cfg.training.resume_path != "None":
+                resume_path = cfg.training.resume_path
+            else:
+                lastest_ckpt_path = self.get_checkpoint_path()
+                if lastest_ckpt_path.is_file():
+                    resume_path = str(lastest_ckpt_path)
+
+        if cfg.policy.edm != "None" and cfg.training.inference_mode == False and resume_path is None:
             print(f"Warm starting from {cfg.policy.edm}")
             self.load_checkpoint(path=cfg.policy.edm, exclude_keys=['ema_model', 'optimizer', 'epoch', 'global_step', '_output_dir'], 
                                  update_dict_dim=cfg.policy.diffusion_step_embed_dim, strict=False)
             self.model.obs_encoder.eval()
             self.model.obs_encoder.requires_grad_(False)
+        elif cfg.policy.edm != "None" and cfg.training.inference_mode == False:
+            print(f"Skipping warm start because resume checkpoint will be loaded: {resume_path}")
+            self.model.obs_encoder.eval()
+            self.model.obs_encoder.requires_grad_(False)
         else:
             print("No warm start provided, assuming inference mode")
-
-        # resume training
-        if cfg.training.resume:
-            if cfg.training.resume_path != "None":
-                print(f"Resuming from checkpoint {cfg.training.resume_path}")
-                self.load_checkpoint(path=cfg.training.resume_path, exclude_keys=['optimizer'])
-                workspace_state_dict = torch.load(cfg.training.resume_path)
-                normalizer = load_normalizer(workspace_state_dict)
-                self.model.set_normalizer(normalizer)
-
-            lastest_ckpt_path = self.get_checkpoint_path()
-            if lastest_ckpt_path.is_file() and cfg.training.resume_path == "None":
-                print(f"Resuming from checkpoint {lastest_ckpt_path}")
-                self.load_checkpoint(path=lastest_ckpt_path, exclude_keys=['optimizer'])
-                workspace_state_dict = torch.load(lastest_ckpt_path)
-                normalizer = load_normalizer(workspace_state_dict)
-                self.model.set_normalizer(normalizer)
-        
 
         print("EPOCH", self.epoch)
 
@@ -130,8 +125,16 @@ class CTMWorkspace(BaseWorkspace):
             self.optimizer = hydra.utils.instantiate(
                 cfg.optimizer, params=self.model.parameters())
 
-            self.global_step = 0
-            self.epoch = 0
+            if resume_path is not None:
+                print(f"Resuming from checkpoint {resume_path}")
+                resume_payload = self.load_checkpoint(path=resume_path)
+                normalizer = load_normalizer(resume_payload)
+                self.model.set_normalizer(normalizer)
+                # Checkpoints are saved at epoch end before the counters advance.
+                # Move to the next epoch/step so resume continues from unseen work.
+                self.global_step += 1
+                self.epoch += 1
+                print("RESUMED EPOCH", self.epoch, "GLOBAL STEP", self.global_step)
             
             # configure lr scheduler
             lr_scheduler = get_scheduler(

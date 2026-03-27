@@ -85,9 +85,11 @@ training:
   seed: 42
   debug: false
   resume: false
+  resume_path: "None"
   lr_scheduler: cosine
   lr_warmup_steps: 300
   num_epochs: 100
+  p_epochs: 100
   gradient_accumulate_every: 1
   rollout_every: 1
   checkpoint_every: 1
@@ -97,6 +99,7 @@ training:
   max_val_steps: null
   tqdm_interval_sec: 1.0
   use_ema: true
+  output_dir: ${hydra:runtime.output_dir}
 
   
 # ================== Dataloader ==================
@@ -142,7 +145,7 @@ checkpoint:
     mode: min
     k: 1
     format_str: epoch={epoch:04d}-val_loss={val_loss:.3f}.ckpt
-  save_last_ckpt: false
+  save_last_ckpt: true
   save_last_snapshot: false
 
 # ================== Logging ==================

@@ -969,5 +969,5 @@ if __name__ == "__main__":
 
 """
 python formalize_data.py --src /scr2/zhaoyang/BFN_data/pusht_real_raw --dst /scr2/zhaoyang/BFN_data/pusht_real --overwrite --target-hz 20  --arm-action-source relative
-python formalize_data.py --src /scr2/zhaoyang/BFN_data/pusht_real_raw --dst /scr2/zhaoyang/BFN_data/pusht_real_sfp_xy --overwrite --target-hz 10 --action-source sfp_xy
+python formalize_data.py --src /scr2/zhaoyang/BFN_data/pusht_real_raw --dst /scr2/zhaoyang/BFN_data/pusht_real_sfp_xy --overwrite --target-hz 20 --action-source sfp_xy
 """

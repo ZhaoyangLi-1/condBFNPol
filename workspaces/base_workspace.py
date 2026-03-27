@@ -85,6 +85,9 @@ class BaseWorkspace:
         """
         self.cfg = cfg
         self._output_dir = output_dir
+        cfg_output_dir = OmegaConf.select(cfg, "training.output_dir", default=None)
+        if cfg_output_dir not in (None, "None"):
+            self._output_dir = cfg_output_dir
         self._saving_thread: Optional[threading.Thread] = None
     
     @property

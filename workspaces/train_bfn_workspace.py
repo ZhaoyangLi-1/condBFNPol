@@ -126,13 +126,26 @@ class TrainBFNWorkspace(BaseWorkspace):
     def run(self):
         """Execute the training loop."""
         cfg = copy.deepcopy(self.cfg)
+        resume_path = None
+        total_training_epochs = cfg.training.get('p_epochs', cfg.training.num_epochs)
         
         # Resume training if checkpoint exists
         if cfg.training.resume:
-            latest_ckpt_path = self.get_checkpoint_path()
-            if latest_ckpt_path.is_file():
-                print(f"Resuming from checkpoint {latest_ckpt_path}")
-                self.load_checkpoint(path=latest_ckpt_path)
+            requested_resume_path = cfg.training.get('resume_path', "None")
+            if requested_resume_path != "None":
+                resume_path = requested_resume_path
+            else:
+                latest_ckpt_path = self.get_checkpoint_path()
+                if latest_ckpt_path.is_file():
+                    resume_path = str(latest_ckpt_path)
+            if resume_path is not None:
+                print(f"Resuming from checkpoint {resume_path}")
+                self.load_checkpoint(path=resume_path)
+                # Checkpoints are saved at epoch end before the counters advance.
+                # Move to the next epoch/step so resume continues from unseen work.
+                self.global_step += 1
+                self.epoch += 1
+                print("RESUMED EPOCH", self.epoch, "GLOBAL STEP", self.global_step)
         
         # ========= Dataset Setup =========
         dataset = hydra.utils.instantiate(cfg.task.dataset)
@@ -163,7 +176,7 @@ class TrainBFNWorkspace(BaseWorkspace):
             optimizer=self.optimizer,
             num_warmup_steps=cfg.training.lr_warmup_steps,
             num_training_steps=(
-                len(train_dataloader) * cfg.training.num_epochs
+                len(train_dataloader) * total_training_epochs
             ) // cfg.training.gradient_accumulate_every,
             last_epoch=self.global_step - 1
         )
