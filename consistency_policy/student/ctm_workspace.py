@@ -94,7 +94,7 @@ class CTMWorkspace(BaseWorkspace):
         if cfg.policy.edm != "None" and cfg.training.inference_mode == False and resume_path is None:
             print(f"Warm starting from {cfg.policy.edm}")
             self.load_checkpoint(path=cfg.policy.edm, exclude_keys=['ema_model', 'optimizer', 'epoch', 'global_step', '_output_dir'], 
-                                 update_dict_dim=cfg.policy.diffusion_step_embed_dim, strict=False)
+                                 include_keys="EDM", update_dict_dim=cfg.policy.diffusion_step_embed_dim, strict=False)
             self.model.obs_encoder.eval()
             self.model.obs_encoder.requires_grad_(False)
         elif cfg.policy.edm != "None" and cfg.training.inference_mode == False:

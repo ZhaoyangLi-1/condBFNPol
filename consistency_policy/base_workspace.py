@@ -104,6 +104,8 @@ class BaseWorkspace:
                     print("Failed to load strict state dict for key: ", key)
                     self.__dict__[key].load_state_dict(value, **kwargs)
         for key in include_keys:
+            if key in exclude_keys:
+                continue
             print(key)
             if key in payload['pickles']:
                 self.__dict__[key] = dill.loads(payload['pickles'][key])
