@@ -118,6 +118,8 @@ class StreamingFlowVectorField(nn.Module):
 class StreamingFlowUnetHybridImagePolicy(BasePolicy):
     """Image-conditioned Streaming Flow policy with unified train/eval interface."""
 
+    RUNTIME_INIT_ACTION_KEY = "__streaming_flow_init_action__"
+
     def __init__(
         self,
         *,
@@ -144,6 +146,7 @@ class StreamingFlowUnetHybridImagePolicy(BasePolicy):
         device: Union[torch.device, str] = "cpu",
         dtype: str = "float32",
         clip_actions: bool = True,
+        action_representation: str = "unspecified",
         k: float = 0.0,
         **kwargs,
     ):
@@ -164,6 +167,11 @@ class StreamingFlowUnetHybridImagePolicy(BasePolicy):
             raise ValueError("Stochastic Streaming Flow requires sigma0 <= sigma1.")
         if initial_action_mode not in {"auto", "obs", "zeros"}:
             raise ValueError(f"Unsupported initial_action_mode={initial_action_mode!r}.")
+        if action_representation not in {"unspecified", "delta", "absolute_xy"}:
+            raise ValueError(
+                "Unsupported action_representation="
+                f"{action_representation!r}."
+            )
 
         obs_shape_meta = shape_meta["obs"]
         obs_config = {
@@ -234,8 +242,13 @@ class StreamingFlowUnetHybridImagePolicy(BasePolicy):
         self.ode_atol = float(ode_atol)
         self.ode_rtol = float(ode_rtol)
         self.obs_feature_dim = obs_feature_dim
+        self.action_representation = action_representation
         self.k = float(k)
         self.kwargs = kwargs
+
+    @classmethod
+    def get_runtime_init_action_key(cls) -> str:
+        return cls.RUNTIME_INIT_ACTION_KEY
 
     def _build_robomimic_encoder(
         self,
@@ -351,6 +364,22 @@ class StreamingFlowUnetHybridImagePolicy(BasePolicy):
         dtype: torch.dtype,
     ) -> torch.Tensor:
         batch_size = next(iter(obs_dict.values())).shape[0]
+        runtime_init_action = obs_dict.get(self.RUNTIME_INIT_ACTION_KEY, None)
+        if runtime_init_action is not None:
+            if runtime_init_action.dim() == 1:
+                runtime_init_action = runtime_init_action.unsqueeze(0)
+            elif runtime_init_action.dim() >= 3:
+                runtime_init_action = runtime_init_action.reshape(
+                    runtime_init_action.shape[0], -1, runtime_init_action.shape[-1]
+                )[:, -1, :]
+            runtime_init_action = runtime_init_action.to(device=device, dtype=dtype)
+            if runtime_init_action.shape[-1] != self.action_dim:
+                raise ValueError(
+                    f"Runtime init action dim mismatch: expected {self.action_dim}, "
+                    f"got {runtime_init_action.shape[-1]}."
+                )
+            return self.normalizer["action"].normalize(runtime_init_action)
+
         keys = self._resolve_initial_action_keys()
 
         if keys:
@@ -489,7 +518,12 @@ class StreamingFlowUnetHybridImagePolicy(BasePolicy):
 
     @torch.no_grad()
     def predict_action(self, obs_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        nobs = self.normalizer.normalize(obs_dict)
+        obs_inputs = {
+            key: value
+            for key, value in obs_dict.items()
+            if key != self.RUNTIME_INIT_ACTION_KEY
+        }
+        nobs = self.normalizer.normalize(obs_inputs)
         cond = self._encode_observation_condition(nobs)
 
         naction_full = self._integrate_normalized_action(obs_dict, cond)

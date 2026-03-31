@@ -666,6 +666,15 @@ def _load_policy_from_checkpoint(
         policy.n_timesteps = int(FLAGS.bfn_n_timesteps)
     if FLAGS.streaming_flow_steps_per_action > 0 and hasattr(policy, "integration_steps_per_action"):
         policy.integration_steps_per_action = int(FLAGS.streaming_flow_steps_per_action)
+    if (
+        _detect_policy_type(policy) == "streaming_flow"
+        and getattr(policy, "action_representation", "unspecified") == "absolute_xy"
+    ):
+        print(
+            "[INFO] Streaming Flow checkpoint uses absolute_xy actions. "
+            "WidowX eval will inject current EEF XY as the ODE initial state "
+            "and convert predicted absolute XY back to delta XY commands."
+        )
 
     shape_meta_cfg = _cfg_get(cfg, "shape_meta", None)
     if shape_meta_cfg is None:
@@ -1359,6 +1368,51 @@ def _predict_action_sequence(
     if actions.ndim == 1:
         actions = actions[None]
     return actions, inference_time_ms
+
+
+def _uses_streaming_flow_absolute_xy_adapter(policy: Any) -> bool:
+    return (
+        _detect_policy_type(policy) == "streaming_flow"
+        and getattr(policy, "action_representation", "unspecified") == "absolute_xy"
+    )
+
+
+def _inject_streaming_flow_runtime_init_action(
+    policy: Any,
+    obs_np: Dict[str, np.ndarray],
+    current_eef_xy: np.ndarray,
+) -> Dict[str, np.ndarray]:
+    init_key = getattr(
+        policy,
+        "RUNTIME_INIT_ACTION_KEY",
+        "__streaming_flow_init_action__",
+    )
+    obs_with_runtime = dict(obs_np)
+    obs_with_runtime[init_key] = np.asarray(
+        current_eef_xy, dtype=np.float32
+    ).reshape(-1)[:2]
+    return obs_with_runtime
+
+
+def _absolute_xy_actions_to_delta_xy(
+    actions: np.ndarray,
+    current_eef_xy: np.ndarray,
+) -> np.ndarray:
+    action_arr = np.asarray(actions, dtype=np.float64)
+    if action_arr.ndim == 1:
+        action_arr = action_arr[None]
+    if action_arr.shape[-1] < 2:
+        raise ValueError(
+            "absolute_xy adapter requires at least 2 action dims, "
+            f"got shape {action_arr.shape}"
+        )
+
+    delta_actions = np.array(action_arr, copy=True)
+    current_xy = np.asarray(current_eef_xy, dtype=np.float64).reshape(-1)[:2]
+    delta_actions[0, :2] = action_arr[0, :2] - current_xy
+    if action_arr.shape[0] > 1:
+        delta_actions[1:, :2] = action_arr[1:, :2] - action_arr[:-1, :2]
+    return delta_actions
 
 
 def _enter_terminal_cbreak_mode() -> Tuple[int | None, Any]:
@@ -2144,6 +2198,18 @@ def main(_):
                     obs_hist.append(obs_frame)
 
                 stacked_obs = _stack_obs_history(obs_hist)
+                policy_obs = stacked_obs
+                if _uses_streaming_flow_absolute_xy_adapter(policy):
+                    if eef_xy is None:
+                        raise RuntimeError(
+                            "Streaming Flow absolute_xy eval requires current EEF XY, "
+                            "but WidowX observation did not provide it."
+                        )
+                    policy_obs = _inject_streaming_flow_runtime_init_action(
+                        policy=policy,
+                        obs_np=stacked_obs,
+                        current_eef_xy=eef_xy,
+                    )
                 last_tstep = time.time()
 
                 # =============================================================
@@ -2151,15 +2217,20 @@ def main(_):
                 # =============================================================
                 actions, infer_ms = _predict_action_sequence(
                     policy=policy,
-                    obs_np=stacked_obs,
+                    obs_np=policy_obs,
                     device=device,
                 )
+                if _uses_streaming_flow_absolute_xy_adapter(policy):
+                    actions = _absolute_xy_actions_to_delta_xy(
+                        actions=actions,
+                        current_eef_xy=eef_xy,
+                    )
                 inference_times_ms.append(infer_ms)
 
                 # Runtime NFE measurement: hook-count on the first step
                 if len(inference_times_ms) == 1 and loaded.nfe_info is not None:
                     try:
-                        nfe_rt = _measure_nfe_runtime(policy, stacked_obs, device)
+                        nfe_rt = _measure_nfe_runtime(policy, policy_obs, device)
                         loaded.nfe_info["nfe_measured_runtime"] = nfe_rt
                         analytical = loaded.nfe_info.get("nfe")
                         if analytical is not None and nfe_rt != analytical:
