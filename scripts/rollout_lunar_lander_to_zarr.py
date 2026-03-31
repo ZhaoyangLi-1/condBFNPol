@@ -807,3 +807,9 @@ def main():
 
 if __name__ == "__main__":
     main()
+'''
+python scripts/visualize_expert.py \
+    --model-path /path/to/best_model.pt \
+    --n-episodes 100 \
+    --n-traj 15
+'''
