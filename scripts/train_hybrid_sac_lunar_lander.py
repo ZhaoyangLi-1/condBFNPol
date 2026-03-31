@@ -1,19 +1,3 @@
-"""
-Hybrid SAC training for HybridLunarLander.
-
-This adapts the algorithm structure in `/scr2/zhaoyang/hybrid-sac` to the
-current `HybridLunarLander` environment:
-  - shared continuous action vector across all branches
-  - categorical discrete policy head
-  - twin Q networks outputting one Q-value per discrete branch
-  - branch-wise continuous log-prob aggregation based on per-action parameter
-    dimensions
-
-Usage:
-    python scripts/train_hybrid_sac_lunar_lander.py
-    python scripts/train_hybrid_sac_lunar_lander.py sac.total_timesteps=200000
-"""
-
 from __future__ import annotations
 
 import os
@@ -34,6 +18,7 @@ import hydra
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from gymnasium import spaces
 from omegaconf import DictConfig, OmegaConf
 from torch.distributions import Categorical, Normal
@@ -45,6 +30,9 @@ except ImportError:
     wandb = None
 
 from environments.lunar_lander import HybridLunarLander
+
+
+LOG_PROB_EPS = 1e-6
 
 
 def set_global_seeds(base_seed: int, torch_deterministic: bool = False) -> None:
@@ -166,28 +154,8 @@ class HybridActionLayout:
             flat[start:end] = x_k[: end - start]
         return flat
 
-    def branch_log_prob(self, all_log_prob_c: torch.Tensor) -> torch.Tensor:
-        pieces = []
-        batch_size = all_log_prob_c.shape[0]
-        for k in range(self.num_discrete):
-            start, end = self.branch_slices[k]
-            if end == start:
-                zeros = torch.zeros(
-                    (batch_size, 1),
-                    dtype=all_log_prob_c.dtype,
-                    device=all_log_prob_c.device,
-                )
-                pieces.append(zeros)
-            else:
-                pieces.append(all_log_prob_c[:, start:end].sum(dim=1, keepdim=True))
-        return torch.cat(pieces, dim=1)
-
 
 class HybridSACLunarLanderWrapper(gym.Env):
-    """
-    Thin wrapper around HybridLunarLander with reproducible reset-seed sampling.
-    """
-
     metadata = {"render_modes": ["rgb_array"]}
 
     def __init__(
@@ -323,47 +291,102 @@ class Policy(nn.Module):
             bias_init=bias_init,
         )
         last_dim = hidden_dims[-1] if hidden_dims else obs_dim
-
-        self.mean = nn.Linear(last_dim, action_layout.total_param_dim)
-        self.logstd = nn.Linear(last_dim, action_layout.total_param_dim)
         self.pi_d = nn.Linear(last_dim, action_layout.num_discrete)
-
-        init_linear_weights(self.mean, weights_init, bias_init)
-        init_linear_weights(self.logstd, weights_init, bias_init)
         init_linear_weights(self.pi_d, weights_init, bias_init)
 
-    def forward(self, obs: torch.Tensor):
-        h = self.backbone(obs)
-        mean = torch.tanh(self.mean(h))
-        log_std = torch.tanh(self.logstd(h))
+        self.branch_means = nn.ModuleList()
+        self.branch_logstds = nn.ModuleList()
+        for k in range(action_layout.num_discrete):
+            dim = action_layout.param_dims[k]
+            if dim > 0:
+                mean_head = nn.Linear(last_dim, dim)
+                logstd_head = nn.Linear(last_dim, dim)
+                init_linear_weights(mean_head, weights_init, bias_init)
+                init_linear_weights(logstd_head, weights_init, bias_init)
+            else:
+                mean_head = nn.Identity()
+                logstd_head = nn.Identity()
+            self.branch_means.append(mean_head)
+            self.branch_logstds.append(logstd_head)
+
+    def _branch_params(self, h: torch.Tensor, k: int) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        dim = self.action_layout.param_dims[k]
+        if dim == 0:
+            return None, None
+        mean = torch.tanh(self.branch_means[k](h))
+        log_std = torch.tanh(self.branch_logstds[k](h))
         log_std = self.log_std_min + 0.5 * (self.log_std_max - self.log_std_min) * (log_std + 1.0)
-        pi_d = self.pi_d(h)
-        return mean, log_std, pi_d
+        return mean, log_std
 
-    def get_action(self, obs: torch.Tensor, deterministic: bool = False):
-        mean, log_std, pi_d = self(obs)
-        std = log_std.exp()
+    def forward(self, obs: torch.Tensor) -> Dict[str, torch.Tensor]:
+        h = self.backbone(obs)
+        logits_d = self.pi_d(h)
+        return {"h": h, "logits_d": logits_d}
 
-        normal = Normal(mean, std)
+    def sample_all_branches(self, obs: torch.Tensor, deterministic: bool = False):
+        out = self.forward(obs)
+        h = out["h"]
+        logits_d = out["logits_d"]
+
+        dist_d = Categorical(logits=logits_d)
+        prob_d = dist_d.probs
+        log_prob_d = torch.log(prob_d + LOG_PROB_EPS)
+
+        batch_size = obs.shape[0]
+        total_dim = self.action_layout.total_param_dim
+        device = obs.device
+        dtype = obs.dtype
+
+        action_bank = torch.zeros(
+            batch_size,
+            self.action_layout.num_discrete,
+            total_dim,
+            device=device,
+            dtype=dtype,
+        )
+        log_prob_c = torch.zeros(
+            batch_size,
+            self.action_layout.num_discrete,
+            device=device,
+            dtype=dtype,
+        )
+        deterministic_bank = torch.zeros_like(action_bank)
+
+        for k in range(self.action_layout.num_discrete):
+            start, end = self.action_layout.branch_slices[k]
+            dim = end - start
+            if dim == 0:
+                continue
+            mean, log_std = self._branch_params(h, k)
+            std = log_std.exp()
+            normal = Normal(mean, std)
+
+            raw = mean if deterministic else normal.rsample()
+            squashed = torch.tanh(raw)
+            lp = normal.log_prob(raw) - torch.log(1.0 - squashed.pow(2) + LOG_PROB_EPS)
+
+            action_bank[:, k, start:end] = squashed
+            log_prob_c[:, k] = lp.sum(dim=-1)
+            deterministic_bank[:, k, start:end] = torch.tanh(mean)
+
+        return action_bank, log_prob_c, log_prob_d, prob_d, logits_d, deterministic_bank
+
+    def act(self, obs: torch.Tensor, deterministic: bool = False):
+        action_bank, _, _, prob_d, logits_d, deterministic_bank = self.sample_all_branches(
+            obs,
+            deterministic=deterministic,
+        )
         if deterministic:
-            x_t = mean
+            action_d = torch.argmax(logits_d, dim=-1)
+            source_bank = deterministic_bank
         else:
-            x_t = normal.rsample()
+            dist_d = Categorical(logits=logits_d)
+            action_d = dist_d.sample()
+            source_bank = action_bank
 
-        action_c = torch.tanh(x_t)
-        all_log_prob_c = normal.log_prob(x_t)
-        all_log_prob_c -= torch.log(1.0 - action_c.pow(2) + 1e-6)
-        log_prob_c = self.action_layout.branch_log_prob(all_log_prob_c)
-
-        dist = Categorical(logits=pi_d)
-        if deterministic:
-            action_d = torch.argmax(pi_d, dim=-1)
-        else:
-            action_d = dist.sample()
-        prob_d = dist.probs
-        log_prob_d = torch.log(prob_d + 1e-6)
-
-        return action_c, action_d, log_prob_c, log_prob_d, prob_d
+        batch_idx = torch.arange(obs.shape[0], device=obs.device)
+        chosen_action_c = source_bank[batch_idx, action_d]
+        return chosen_action_c, action_d
 
 
 class SoftQNetwork(nn.Module):
@@ -377,7 +400,8 @@ class SoftQNetwork(nn.Module):
         bias_init: str,
     ):
         super().__init__()
-        input_dim = obs_dim + action_layout.total_param_dim
+        self.action_layout = action_layout
+        input_dim = obs_dim + action_layout.total_param_dim + action_layout.num_discrete
         self.backbone = build_mlp(
             input_dim=input_dim,
             hidden_dims=hidden_dims,
@@ -386,13 +410,31 @@ class SoftQNetwork(nn.Module):
             bias_init=bias_init,
         )
         last_dim = hidden_dims[-1] if hidden_dims else input_dim
-        self.q_head = nn.Linear(last_dim, action_layout.num_discrete)
+        self.q_head = nn.Linear(last_dim, 1)
         init_linear_weights(self.q_head, weights_init, bias_init)
 
-    def forward(self, obs: torch.Tensor, action_c: torch.Tensor):
-        x = torch.cat([obs, action_c], dim=-1)
+    def forward(self, obs: torch.Tensor, action_c: torch.Tensor, action_d: torch.Tensor) -> torch.Tensor:
+        if action_d.dtype in (torch.int64, torch.int32, torch.int16, torch.int8, torch.uint8):
+            action_d_onehot = F.one_hot(action_d.long(), num_classes=self.action_layout.num_discrete).float()
+        else:
+            action_d_onehot = action_d.float()
+        x = torch.cat([obs, action_c, action_d_onehot], dim=-1)
         h = self.backbone(x)
-        return self.q_head(h)
+        return self.q_head(h).squeeze(-1)
+
+    def forward_all_actions(self, obs: torch.Tensor, action_bank: torch.Tensor) -> torch.Tensor:
+        batch_size = obs.shape[0]
+        num_discrete = self.action_layout.num_discrete
+        obs_rep = obs.unsqueeze(1).expand(-1, num_discrete, -1)
+        onehots = F.one_hot(
+            torch.arange(num_discrete, device=obs.device),
+            num_classes=num_discrete,
+        ).float().unsqueeze(0).expand(batch_size, -1, -1)
+        flat_obs = obs_rep.reshape(batch_size * num_discrete, -1)
+        flat_action = action_bank.reshape(batch_size * num_discrete, -1)
+        flat_d = onehots.reshape(batch_size * num_discrete, -1)
+        q = self.forward(flat_obs, flat_action, flat_d)
+        return q.view(batch_size, num_discrete)
 
 
 class ReplayBuffer:
@@ -404,7 +446,6 @@ class ReplayBuffer:
         self.action_d = np.zeros((capacity,), dtype=np.int64)
         self.reward = np.zeros((capacity,), dtype=np.float32)
         self.done = np.zeros((capacity,), dtype=np.float32)
-
         self.ptr = 0
         self.size = 0
 
@@ -423,7 +464,6 @@ class ReplayBuffer:
         self.action_d[self.ptr] = int(action_d)
         self.reward[self.ptr] = float(reward)
         self.done[self.ptr] = float(done)
-
         self.ptr = (self.ptr + 1) % self.capacity
         self.size = min(self.size + 1, self.capacity)
 
@@ -480,7 +520,6 @@ def save_checkpoint(
         "episode_count": int(episode_count),
         "best_eval_reward": float(best_eval_reward),
     }
-
     if log_alpha is not None:
         payload["log_alpha"] = log_alpha.detach().cpu()
     if log_alpha_d is not None:
@@ -489,7 +528,6 @@ def save_checkpoint(
         payload["alpha_optimizer"] = alpha_optimizer.state_dict()
     if alpha_d_optimizer is not None:
         payload["alpha_d_optimizer"] = alpha_d_optimizer.state_dict()
-
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(payload, path)
 
@@ -527,11 +565,10 @@ def evaluate_policy(
         while not done:
             obs_t = torch.as_tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
             with torch.no_grad():
-                action_c_t, action_d_t, _, _, _ = policy.get_action(obs_t, deterministic=True)
+                action_c_t, action_d_t = policy.act(obs_t, deterministic=True)
             discrete_action = int(action_d_t.item())
             flat_action = action_c_t.cpu().numpy()[0]
             env_action = action_layout.flat_to_env_action(discrete_action, flat_action)
-
             obs, reward, terminated, truncated, _ = env.step(env_action)
             ep_reward += reward
             ep_length += 1
@@ -541,12 +578,10 @@ def evaluate_policy(
         episode_rewards.append(ep_reward)
         episode_lengths.append(ep_length)
 
+    policy.train()
     rewards = np.asarray(episode_rewards, dtype=np.float32)
     lengths = np.asarray(episode_lengths, dtype=np.float32)
-    action_freq = np.bincount(
-        np.asarray(action_hist, dtype=np.int64),
-        minlength=action_layout.num_discrete,
-    ).astype(np.float32)
+    action_freq = np.bincount(np.asarray(action_hist, dtype=np.int64), minlength=action_layout.num_discrete).astype(np.float32)
     if action_freq.sum() > 0:
         action_freq /= action_freq.sum()
 
@@ -654,10 +689,7 @@ def train_hybrid_sac(cfg: DictConfig) -> None:
     qf1_target.load_state_dict(qf1.state_dict())
     qf2_target.load_state_dict(qf2.state_dict())
 
-    q_optimizer = torch.optim.Adam(
-        list(qf1.parameters()) + list(qf2.parameters()),
-        lr=cfg.sac.q_lr,
-    )
+    q_optimizer = torch.optim.Adam(list(qf1.parameters()) + list(qf2.parameters()), lr=cfg.sac.q_lr)
     policy_optimizer = torch.optim.Adam(policy.parameters(), lr=cfg.sac.policy_lr)
     loss_fn = nn.MSELoss()
 
@@ -672,11 +704,7 @@ def train_hybrid_sac(cfg: DictConfig) -> None:
         alpha_optimizer = None
         alpha_d_optimizer = None
 
-    replay_buffer = ReplayBuffer(
-        obs_dim=obs_dim,
-        action_dim=action_layout.total_param_dim,
-        capacity=cfg.sac.buffer_size,
-    )
+    replay_buffer = ReplayBuffer(obs_dim=obs_dim, action_dim=action_layout.total_param_dim, capacity=cfg.sac.buffer_size)
 
     run = maybe_init_wandb(cfg)
     if run is not None:
@@ -725,68 +753,45 @@ def train_hybrid_sac(cfg: DictConfig) -> None:
         if global_step < cfg.sac.learning_starts:
             sampled_action = env.action_space.sample()
             discrete_action = int(sampled_action["k"])
-            flat_action = action_layout.env_to_flat_action(
-                discrete_action=discrete_action,
-                x_k=sampled_action["x_k"],
-            )
-            env_action = {
-                "k": discrete_action,
-                "x_k": np.asarray(sampled_action["x_k"], dtype=np.float32),
-            }
+            flat_action = action_layout.env_to_flat_action(discrete_action=discrete_action, x_k=sampled_action["x_k"])
+            env_action = {"k": discrete_action, "x_k": np.asarray(sampled_action["x_k"], dtype=np.float32)}
         else:
             obs_t = torch.as_tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
             with torch.no_grad():
-                action_c_t, action_d_t, _, _, _ = policy.get_action(obs_t, deterministic=False)
+                action_c_t, action_d_t = policy.act(obs_t, deterministic=False)
             discrete_action = int(action_d_t.item())
             flat_action = action_c_t.detach().cpu().numpy()[0].astype(np.float32)
             env_action = action_layout.flat_to_env_action(discrete_action, flat_action)
 
         next_obs, reward, terminated, truncated, info = env.step(env_action)
         done = terminated or truncated
-        replay_buffer.add(
-            obs=obs,
-            action_c=flat_action,
-            action_d=discrete_action,
-            reward=reward,
-            next_obs=next_obs,
-            done=done,
-        )
+        replay_buffer.add(obs=obs, action_c=flat_action, action_d=discrete_action, reward=reward, next_obs=next_obs, done=done)
 
         recent_action_counts[discrete_action] += 1
         recent_flat_actions.append(flat_action.copy())
         episode_reward += reward
         episode_length += 1
-
         obs = next_obs
 
-        if replay_buffer.size >= cfg.sac.batch_size:
+        if global_step >= cfg.sac.learning_starts and replay_buffer.size >= cfg.sac.batch_size:
             batch = replay_buffer.sample(cfg.sac.batch_size, device=device)
 
             with torch.no_grad():
                 alpha = log_alpha.exp() if log_alpha is not None else torch.tensor(cfg.sac.alpha, device=device)
                 alpha_d = log_alpha_d.exp() if log_alpha_d is not None else torch.tensor(cfg.sac.alpha, device=device)
-
-                next_actions_c, _, next_log_pi_c, next_log_pi_d, next_prob_d = policy.get_action(
+                next_action_bank, next_log_pi_c, next_log_pi_d, next_prob_d, _, _ = policy.sample_all_branches(
                     batch["next_obs"],
                     deterministic=False,
                 )
-                qf1_next_target = qf1_target(batch["next_obs"], next_actions_c)
-                qf2_next_target = qf2_target(batch["next_obs"], next_actions_c)
-                min_qf_next_target = next_prob_d * (
-                    torch.min(qf1_next_target, qf2_next_target)
-                    - alpha * next_prob_d * next_log_pi_c
-                    - alpha_d * next_log_pi_d
-                )
-                next_q_value = batch["reward"] + (1.0 - batch["done"]) * cfg.sac.gamma * min_qf_next_target.sum(dim=1)
+                qf1_next_target = qf1_target.forward_all_actions(batch["next_obs"], next_action_bank)
+                qf2_next_target = qf2_target.forward_all_actions(batch["next_obs"], next_action_bank)
+                min_qf_next_target = torch.min(qf1_next_target, qf2_next_target)
+                next_v = (next_prob_d * (min_qf_next_target - alpha * next_log_pi_c - alpha_d * next_log_pi_d)).sum(dim=1)
+                next_q_value = batch["reward"] + (1.0 - batch["done"]) * cfg.sac.gamma * next_v
+                next_q_value = next_q_value.detach()
 
-            qf1_a_values = qf1(batch["obs"], batch["action_c"]).gather(
-                1,
-                batch["action_d"].view(-1, 1),
-            ).squeeze(-1)
-            qf2_a_values = qf2(batch["obs"], batch["action_c"]).gather(
-                1,
-                batch["action_d"].view(-1, 1),
-            ).squeeze(-1)
+            qf1_a_values = qf1(batch["obs"], batch["action_c"], batch["action_d"])
+            qf2_a_values = qf2(batch["obs"], batch["action_c"], batch["action_d"])
             qf1_loss = loss_fn(qf1_a_values, next_q_value)
             qf2_loss = loss_fn(qf2_a_values, next_q_value)
             qf_loss = 0.5 * (qf1_loss + qf2_loss)
@@ -794,10 +799,7 @@ def train_hybrid_sac(cfg: DictConfig) -> None:
             q_optimizer.zero_grad(set_to_none=True)
             qf_loss.backward()
             if cfg.sac.max_grad_norm is not None:
-                q_grad_norm = nn.utils.clip_grad_norm_(
-                    list(qf1.parameters()) + list(qf2.parameters()),
-                    float(cfg.sac.max_grad_norm),
-                )
+                q_grad_norm = nn.utils.clip_grad_norm_(list(qf1.parameters()) + list(qf2.parameters()), float(cfg.sac.max_grad_norm))
             else:
                 q_grad_norm = torch.nan
             q_optimizer.step()
@@ -812,83 +814,65 @@ def train_hybrid_sac(cfg: DictConfig) -> None:
             metric_buffer["loss/alpha_d"].append(float(alpha_d.item()))
 
             if global_step % cfg.sac.policy_frequency == 0:
-                for _ in range(cfg.sac.policy_frequency):
-                    alpha = log_alpha.exp() if log_alpha is not None else torch.tensor(cfg.sac.alpha, device=device)
-                    alpha_d = log_alpha_d.exp() if log_alpha_d is not None else torch.tensor(cfg.sac.alpha, device=device)
+                alpha = log_alpha.exp() if log_alpha is not None else torch.tensor(cfg.sac.alpha, device=device)
+                alpha_d = log_alpha_d.exp() if log_alpha_d is not None else torch.tensor(cfg.sac.alpha, device=device)
 
-                    actions_c, _, log_pi_c, log_pi_d, prob_d = policy.get_action(
-                        batch["obs"],
-                        deterministic=False,
-                    )
-                    qf1_pi = qf1(batch["obs"], actions_c)
-                    qf2_pi = qf2(batch["obs"], actions_c)
-                    min_qf_pi = torch.min(qf1_pi, qf2_pi)
+                action_bank, log_pi_c, log_pi_d, prob_d, _, _ = policy.sample_all_branches(batch["obs"], deterministic=False)
+                qf1_pi = qf1.forward_all_actions(batch["obs"], action_bank)
+                qf2_pi = qf2.forward_all_actions(batch["obs"], action_bank)
+                min_qf_pi = torch.min(qf1_pi, qf2_pi)
 
-                    policy_loss_d = (prob_d * (alpha_d * log_pi_d - min_qf_pi)).sum(dim=1).mean()
-                    policy_loss_c = (prob_d * (alpha * prob_d * log_pi_c - min_qf_pi)).sum(dim=1).mean()
-                    policy_loss = policy_loss_d + policy_loss_c
+                policy_loss = (prob_d * (alpha * log_pi_c + alpha_d * log_pi_d - min_qf_pi)).sum(dim=1).mean()
+                policy_loss_d = (prob_d * (alpha_d * log_pi_d - min_qf_pi)).sum(dim=1).mean()
+                policy_loss_c = (prob_d * (alpha * log_pi_c - min_qf_pi)).sum(dim=1).mean()
 
-                    policy_optimizer.zero_grad(set_to_none=True)
-                    policy_loss.backward()
-                    if cfg.sac.max_grad_norm is not None:
-                        policy_grad_norm = nn.utils.clip_grad_norm_(
-                            policy.parameters(),
-                            float(cfg.sac.max_grad_norm),
+                policy_optimizer.zero_grad(set_to_none=True)
+                policy_loss.backward()
+                if cfg.sac.max_grad_norm is not None:
+                    policy_grad_norm = nn.utils.clip_grad_norm_(policy.parameters(), float(cfg.sac.max_grad_norm))
+                else:
+                    policy_grad_norm = torch.nan
+                policy_optimizer.step()
+
+                metric_buffer["loss/policy_loss"].append(float(policy_loss.item()))
+                metric_buffer["debug/policy_loss_d"].append(float(policy_loss_d.item()))
+                metric_buffer["debug/policy_loss_c"].append(float(policy_loss_c.item()))
+                metric_buffer["debug/mean_q"].append(float(min_qf_pi.mean().item()))
+                metric_buffer["debug/policy_ent_d"].append(float((-(prob_d * log_pi_d).sum(dim=1).mean()).item()))
+                metric_buffer["debug/policy_ent_c"].append(float((-(prob_d * log_pi_c).sum(dim=1).mean()).item()))
+                metric_buffer["debug/policy_grad_norm"].append(float(policy_grad_norm))
+
+                if log_alpha is not None and alpha_optimizer is not None and log_alpha_d is not None and alpha_d_optimizer is not None:
+                    with torch.no_grad():
+                        _, alpha_log_pi_c, alpha_log_pi_d, alpha_prob_d, _, _ = policy.sample_all_branches(
+                            batch["obs"], deterministic=False
                         )
-                    else:
-                        policy_grad_norm = torch.nan
-                    policy_optimizer.step()
 
-                    metric_buffer["loss/policy_loss"].append(float(policy_loss.item()))
-                    metric_buffer["debug/policy_loss_d"].append(float(policy_loss_d.item()))
-                    metric_buffer["debug/policy_loss_c"].append(float(policy_loss_c.item()))
-                    metric_buffer["debug/mean_q"].append(float(min_qf_pi.mean().item()))
-                    metric_buffer["debug/policy_ent_d"].append(
-                        float((-(prob_d * log_pi_d).sum(dim=1).mean()).item())
-                    )
-                    metric_buffer["debug/policy_grad_norm"].append(float(policy_grad_norm))
+                    alpha_loss = (-log_alpha * (alpha_prob_d * (alpha_log_pi_c + cfg.sac.ent_c)).sum(dim=1)).mean()
+                    alpha_d_loss = (-log_alpha_d * (alpha_prob_d * (alpha_log_pi_d + cfg.sac.ent_d)).sum(dim=1)).mean()
 
-                    if log_alpha is not None and alpha_optimizer is not None:
-                        with torch.no_grad():
-                            _, _, alpha_log_pi_c, alpha_log_pi_d, alpha_prob_d = policy.get_action(
-                                batch["obs"],
-                                deterministic=False,
-                            )
+                    alpha_optimizer.zero_grad(set_to_none=True)
+                    alpha_loss.backward()
+                    alpha_optimizer.step()
 
-                        alpha_loss = (
-                            -log_alpha * alpha_prob_d * (alpha_prob_d * alpha_log_pi_c + cfg.sac.ent_c)
-                        ).sum(dim=1).mean()
-                        alpha_d_loss = (
-                            -log_alpha_d * alpha_prob_d * (alpha_log_pi_d + cfg.sac.ent_d)
-                        ).sum(dim=1).mean()
+                    alpha_d_optimizer.zero_grad(set_to_none=True)
+                    alpha_d_loss.backward()
+                    alpha_d_optimizer.step()
 
-                        alpha_optimizer.zero_grad(set_to_none=True)
-                        alpha_loss.backward()
-                        alpha_optimizer.step()
-
-                        alpha_d_optimizer.zero_grad(set_to_none=True)
-                        alpha_d_loss.backward()
-                        alpha_d_optimizer.step()
-
-                        metric_buffer["loss/alpha_loss"].append(float(alpha_loss.item()))
-                        metric_buffer["loss/alpha_d_loss"].append(float(alpha_d_loss.item()))
+                    metric_buffer["loss/alpha_loss"].append(float(alpha_loss.item()))
+                    metric_buffer["loss/alpha_d_loss"].append(float(alpha_d_loss.item()))
 
             if global_step % cfg.sac.target_network_frequency == 0:
                 with torch.no_grad():
                     for param, target_param in zip(qf1.parameters(), qf1_target.parameters()):
-                        target_param.data.copy_(
-                            cfg.sac.tau * param.data + (1.0 - cfg.sac.tau) * target_param.data
-                        )
+                        target_param.data.copy_(cfg.sac.tau * param.data + (1.0 - cfg.sac.tau) * target_param.data)
                     for param, target_param in zip(qf2.parameters(), qf2_target.parameters()):
-                        target_param.data.copy_(
-                            cfg.sac.tau * param.data + (1.0 - cfg.sac.tau) * target_param.data
-                        )
+                        target_param.data.copy_(cfg.sac.tau * param.data + (1.0 - cfg.sac.tau) * target_param.data)
 
         if done:
             recent_episode_rewards.append(float(episode_reward))
             recent_episode_lengths.append(float(episode_length))
             episode_count += 1
-
             episode_metrics = {
                 "episode/reward": float(episode_reward),
                 "episode/length": float(episode_length),
@@ -908,11 +892,7 @@ def train_hybrid_sac(cfg: DictConfig) -> None:
             if action_freq.sum() > 0:
                 action_freq /= action_freq.sum()
 
-            action_array = (
-                np.stack(recent_flat_actions, axis=0)
-                if recent_flat_actions
-                else np.zeros((0, action_layout.total_param_dim), dtype=np.float32)
-            )
+            action_array = np.stack(recent_flat_actions, axis=0) if recent_flat_actions else np.zeros((0, action_layout.total_param_dim), dtype=np.float32)
             aggregated = aggregate_metric_buffer(metric_buffer)
 
             train_metrics = {
@@ -943,7 +923,6 @@ def train_hybrid_sac(cfg: DictConfig) -> None:
                         train_metrics[f"train/action_{k}_param_std"] = float(branch_vals.std())
 
             wandb_log(train_metrics, step=global_step)
-
             progress.set_postfix(
                 step=global_step,
                 ep_rew=f"{train_metrics['train/recent_episode_reward_100']:.1f}",
@@ -952,7 +931,6 @@ def train_hybrid_sac(cfg: DictConfig) -> None:
                 alpha=f"{train_metrics.get('loss/alpha', cfg.sac.alpha):.3f}",
                 fps=f"{fps:.0f}",
             )
-
             print(
                 f"[step {global_step:>8d}] "
                 f"episodes={episode_count:>5d} | "
@@ -965,24 +943,14 @@ def train_hybrid_sac(cfg: DictConfig) -> None:
                 f"replay={replay_buffer.size:>7d} | "
                 f"fps={fps:.0f}"
             )
-
             metric_buffer.clear()
             recent_action_counts.fill(0)
             recent_flat_actions.clear()
 
         if global_step % cfg.training.eval_interval == 0 or global_step == cfg.sac.total_timesteps:
-            eval_metrics = evaluate_policy(
-                policy=policy,
-                env=eval_env,
-                action_layout=action_layout,
-                eval_seeds=eval_seeds,
-                device=device,
-            )
-            eval_metrics["eval/best_mean_reward"] = float(
-                max(best_eval_reward, eval_metrics["eval/mean_reward"])
-            )
+            eval_metrics = evaluate_policy(policy=policy, env=eval_env, action_layout=action_layout, eval_seeds=eval_seeds, device=device)
+            eval_metrics["eval/best_mean_reward"] = float(max(best_eval_reward, eval_metrics["eval/mean_reward"]))
             wandb_log(eval_metrics, step=global_step)
-
             print(
                 f"  [eval step {global_step}] "
                 f"mean_reward={eval_metrics['eval/mean_reward']:.2f} +/- {eval_metrics['eval/std_reward']:.2f} | "
@@ -1047,7 +1015,6 @@ def train_hybrid_sac(cfg: DictConfig) -> None:
 
     env.close()
     eval_env.close()
-
     if run is not None:
         run.finish()
 
@@ -1055,11 +1022,7 @@ def train_hybrid_sac(cfg: DictConfig) -> None:
 OmegaConf.register_new_resolver("eval", eval, replace=True)
 
 
-@hydra.main(
-    version_base=None,
-    config_path="../config",
-    config_name="train_hybrid_sac_lunar_lander",
-)
+@hydra.main(version_base=None, config_path="../config", config_name="train_hybrid_sac_lunar_lander")
 def main(cfg: DictConfig):
     train_hybrid_sac(cfg)
 

@@ -23,6 +23,23 @@ Usage (after rollout, from saved zarr):
 
 from __future__ import annotations
 
+# ── MuJoCo / gymnasium_robotics patch ────────────────────────────────────────
+# Must run before ANY `import gymnasium` to prevent mujoco_py crash.
+import importlib.metadata as _im
+_orig_ep = _im.entry_points
+def _filtered_ep(*a, **kw):
+    eps = _orig_ep(*a, **kw)
+    if kw.get("group") != "gymnasium.envs":
+        return eps
+    filtered = [e for e in eps if "gymnasium_robotics" not in getattr(e, "value", "")]
+    try:
+        return type(eps)(filtered)
+    except Exception:
+        return filtered
+_im.entry_points = _filtered_ep
+# ─────────────────────────────────────────────────────────────────────────────
+
+
 import argparse
 import os
 import sys
@@ -106,7 +123,13 @@ def collect_from_checkpoint(
 ) -> dict:
     """Roll out the policy and collect all data needed for visualization."""
     import torch
-    from environments.lunar_lander import HybridLunarLander
+    import importlib.util as _ilu
+    _project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    _ll_path = os.path.join(_project_root, 'environments', 'lunar_lander.py')
+    _spec = _ilu.spec_from_file_location('environments.lunar_lander', _ll_path)
+    _ll_mod = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(_ll_mod)
+    HybridLunarLander = _ll_mod.HybridLunarLander
     from scripts.train_hybrid_sac_lunar_lander import HybridActionLayout, Policy
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -160,7 +183,7 @@ def collect_from_checkpoint(
         while not done:
             obs_t = torch.as_tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
             with torch.no_grad():
-                flat_action_t, discrete_action_t, _, _, _ = policy.get_action(
+                flat_action_t, discrete_action_t = policy.act(
                     obs_t, deterministic=deterministic
                 )
             discrete_action = int(discrete_action_t.item())
