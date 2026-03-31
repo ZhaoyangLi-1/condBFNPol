@@ -193,15 +193,14 @@ def _filter_episodes(arrays, episode_ends, episode_rewards, min_reward):
     return keep, keep_ends, keep_rewards
 
 
-def rollout_to_zarr(args):
-    """Roll out policy and save trajectories as zarr dataset."""
+def rollout_to_zarr(args) -> dict:
+    """Roll out policy, save zarr, AND return viz data — single pass, same seeds."""
     import torch
     import zarr
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
     sub_steps = args.sub_steps if args.sub_steps is not None else 1
-    env, policy, action_layout, ckpt = _load_env_and_policy(
+    env, policy, action_layout, _ = _load_env_and_policy(
         model_path=args.model_path,
         use_image_obs=True,
         img_size=tuple(args.img_size),
@@ -215,44 +214,70 @@ def rollout_to_zarr(args):
                "hybrid_action_discrete", "hybrid_action_params", "hybrid_action_flat"]}
     episode_ends: list[int] = []
     episode_rewards: list[float] = []
+    episode_seeds: list[int] = []
     total_steps = 0
+
+    # Viz accumulators — built during the SAME rollout loop
+    trajectories: list = []          # (x, y) arrays for first n_traj episodes
+    all_discrete: list = []
+    all_params_k1: list = []
+    all_params_k2: list = []
+    all_params_k3: list = []
+    ep_action_seqs: list = []
 
     print(f"Collecting {args.n_episodes} episodes → {args.output_path}")
 
     for ep in range(args.n_episodes):
         seed = abs(int(rng.normal(args.seed_mean, args.seed_std)))
+        episode_seeds.append(seed)
         obs, _ = env.reset(seed=seed)
         terminated = truncated = False
         ep_reward = 0.0
         ep_steps = 0
+        ep_traj_x: list = []
+        ep_traj_y: list = []
+        ep_actions: list = []
 
         while not (terminated or truncated):
-            # Support dict obs (use_image_obs=True)
             if isinstance(obs, dict):
                 state = obs["state"].astype(np.float32)
                 image = obs["image"].astype(np.float32) / 255.0
             else:
                 state = obs.astype(np.float32)
-                image = np.zeros((args.img_size[0], args.img_size[1], 3), dtype=np.float32)
+                image = np.zeros((*args.img_size, 3), dtype=np.float32)
 
             with torch.no_grad():
                 state_t = torch.as_tensor(state, dtype=torch.float32,
                                           device=device).unsqueeze(0)
                 flat_action_t, discrete_action_t = policy.act(
-                    state_t, deterministic=args.deterministic
-                )
+                    state_t, deterministic=args.deterministic)
 
             discrete_action = int(discrete_action_t.item())
             flat_action = flat_action_t.cpu().numpy()[0].astype(np.float32)
             hybrid_action = action_layout.flat_to_env_action(discrete_action, flat_action)
-            low_level = env._convert_action(discrete_action, hybrid_action["x_k"]).astype(np.float32)
+            low_level = env._convert_action(
+                discrete_action, hybrid_action["x_k"]).astype(np.float32)
 
+            # zarr arrays
             arrays["state"].append(state)
             arrays["img"].append(image)
             arrays["action"].append(low_level)
             arrays["hybrid_action_discrete"].append(discrete_action)
             arrays["hybrid_action_params"].append(hybrid_action["x_k"].astype(np.float32))
             arrays["hybrid_action_flat"].append(flat_action)
+
+            # viz accumulators
+            ep_traj_x.append(float(state[0]))
+            ep_traj_y.append(float(state[1]))
+            ep_actions.append(discrete_action)
+            all_discrete.append(discrete_action)
+            xk = hybrid_action["x_k"]
+            if discrete_action == 1:
+                all_params_k1.append(float(xk[0]))
+            elif discrete_action == 2:
+                all_params_k2.append([float(xk[0]), float(xk[1])])
+            elif discrete_action == 3:
+                all_params_k3.append([float(xk[0]), float(xk[1])])
 
             obs, reward, terminated, truncated, _ = env.step(hybrid_action)
             ep_reward += reward
@@ -261,14 +286,17 @@ def rollout_to_zarr(args):
         total_steps += ep_steps
         episode_ends.append(total_steps)
         episode_rewards.append(ep_reward)
+        ep_action_seqs.append(ep_actions)
+        if ep < args.n_traj:
+            trajectories.append((np.array(ep_traj_x), np.array(ep_traj_y)))
 
         if (ep + 1) % 10 == 0 or ep == 0:
-            print(f"  ep {ep+1:>4d}/{args.n_episodes} | "
-                  f"steps={ep_steps:>4d} | reward={ep_reward:>8.1f} | "
-                  f"total={total_steps}")
+            print(f"  ep {ep+1:>4d}/{args.n_episodes} | seed={seed:>10d} | "
+                  f"steps={ep_steps:>4d} | reward={ep_reward:>8.1f} | total={total_steps}")
 
     env.close()
 
+    # ── Optional reward filter ────────────────────────────────────────────────
     if args.min_reward is not None:
         print(f"\nFiltering episodes with reward >= {args.min_reward} ...")
         arrays, episode_ends, episode_rewards = _filter_episodes(
@@ -279,6 +307,7 @@ def rollout_to_zarr(args):
     if not episode_ends:
         raise RuntimeError("No episodes collected.")
 
+    # ── Save zarr ─────────────────────────────────────────────────────────────
     np_arrays = {
         "action":                 np.stack(arrays["action"]).astype(np.float32),
         "img":                    np.stack(arrays["img"]).astype(np.float32),
@@ -288,41 +317,44 @@ def rollout_to_zarr(args):
         "hybrid_action_flat":     np.stack(arrays["hybrid_action_flat"]).astype(np.float32),
     }
     episode_ends_np = np.asarray(episode_ends, dtype=np.int64)
-    ep_lens = np.diff(np.concatenate([[0], episode_ends_np]))
-    chunk_len = max(int(np.median(ep_lens)), 1)
+    chunk_len = max(int(np.median(np.diff(np.concatenate([[0], episode_ends_np])))), 1)
 
     output_path = Path(args.output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-
     root = zarr.open(str(output_path), mode="w")
-    root.attrs["policy_type"]  = "hybrid_sac"
-    root.attrs["action_names"] = [action_layout.action_names[k]
-                                   for k in range(action_layout.num_discrete)]
-    root.attrs["flat_action_dim"] = int(action_layout.total_param_dim)
-    root.attrs["img_size"]        = list(args.img_size)
-
-    data_grp = root.create_group("data")
-    data_grp.create_dataset("action",
+    root.attrs.update({
+        "policy_type":    "hybrid_sac",
+        "action_names":   [action_layout.action_names[k]
+                           for k in range(action_layout.num_discrete)],
+        "flat_action_dim": int(action_layout.total_param_dim),
+        "img_size":        list(args.img_size),
+        "episode_seeds":   episode_seeds,       # store seeds for reproducibility
+    })
+    dg = root.create_group("data")
+    dg.create_dataset("action",
         data=np_arrays["action"],
         chunks=(chunk_len, np_arrays["action"].shape[1]), dtype="float32")
-    data_grp.create_dataset("img",
+    dg.create_dataset("img",
         data=np_arrays["img"],
         chunks=(chunk_len, *args.img_size, 3), dtype="float32")
-    data_grp.create_dataset("state",
+    dg.create_dataset("state",
         data=np_arrays["state"],
         chunks=(chunk_len, np_arrays["state"].shape[1]), dtype="float32")
-    data_grp.create_dataset("hybrid_action_discrete",
+    dg.create_dataset("hybrid_action_discrete",
         data=np_arrays["hybrid_action_discrete"],
         chunks=(chunk_len,), dtype="int64")
-    data_grp.create_dataset("hybrid_action_params",
+    dg.create_dataset("hybrid_action_params",
         data=np_arrays["hybrid_action_params"],
         chunks=(chunk_len, np_arrays["hybrid_action_params"].shape[1]), dtype="float32")
-    data_grp.create_dataset("hybrid_action_flat",
+    dg.create_dataset("hybrid_action_flat",
         data=np_arrays["hybrid_action_flat"],
         chunks=(chunk_len, np_arrays["hybrid_action_flat"].shape[1]), dtype="float32")
-
-    meta_grp = root.create_group("meta")
-    meta_grp.create_dataset("episode_ends", data=episode_ends_np, dtype="int64")
+    mg = root.create_group("meta")
+    mg.create_dataset("episode_ends",  data=episode_ends_np, dtype="int64")
+    mg.create_dataset("episode_seeds",
+        data=np.asarray(episode_seeds[:len(episode_ends)], dtype=np.int64))
+    mg.create_dataset("episode_rewards",
+        data=np.asarray(episode_rewards, dtype=np.float32))
 
     rewards_np = np.asarray(episode_rewards, dtype=np.float32)
     print(f"\nSaved zarr → {output_path}")
@@ -330,10 +362,21 @@ def rollout_to_zarr(args):
         print(f"  data/{k:30s}: {v.shape}")
     print(f"  meta/episode_ends               : {episode_ends_np.shape}")
     print(f"  chunk_len={chunk_len}  episodes={len(episode_ends_np)}  "
-          f"steps={total_steps}  "
-          f"reward={rewards_np.mean():.1f}±{rewards_np.std():.1f}")
+          f"steps={total_steps}  reward={rewards_np.mean():.1f}±{rewards_np.std():.1f}")
 
-    return episode_rewards  # pass to visualize
+    # ── Return viz data built during the same rollout ─────────────────────────
+    episode_lengths = np.diff(np.concatenate([[0], episode_ends_np]))
+    return {
+        "episode_rewards": rewards_np,
+        "episode_lengths": episode_lengths.astype(float),
+        "trajectories":    trajectories,
+        "all_discrete":    np.array(all_discrete),
+        "all_params_k1":   np.array(all_params_k1) if all_params_k1 else np.array([]),
+        "all_params_k2":   np.array(all_params_k2) if all_params_k2 else np.zeros((0, 2)),
+        "all_params_k3":   np.array(all_params_k3) if all_params_k3 else np.zeros((0, 2)),
+        "ep_action_seqs":  ep_action_seqs,
+        "episode_seeds":   episode_seeds,
+    }
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -880,7 +923,7 @@ def main():
 
     # figures
     parser.add_argument("--output-dir",    type=str,   default="./expert_figures")
-    parser.add_argument("--n-episodes",    type=int,   default=200)
+    parser.add_argument("--n-episodes",    type=int,   default=300)
     parser.add_argument("--n-traj",        type=int,   default=15)
     parser.add_argument("--max-steps",     type=int,   default=300)
     parser.add_argument("--deterministic", action="store_true",  default=True)
@@ -899,11 +942,8 @@ def main():
     set_style()
 
     if args.model_path:
-        # Step 1: rollout → zarr
-        rollout_to_zarr(args)
-        # Step 2: visualization rollout (no image obs, faster)
-        print("\nCollecting visualization data...")
-        data = collect_from_checkpoint(args)
+        # Single rollout → zarr + viz data simultaneously (same seeds)
+        data = rollout_to_zarr(args)
     else:
         print(f"Loading zarr: {args.zarr_path}")
         data = collect_from_zarr(args.zarr_path, n_traj=args.n_traj)
