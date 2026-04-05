@@ -383,6 +383,90 @@ def rollout_to_zarr(args) -> dict:
 # Data collection for visualization
 # ══════════════════════════════════════════════════════════════════════════════
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Video recording
+# ══════════════════════════════════════════════════════════════════════════════
+
+def save_episode_videos(args, n_videos: int = 3):
+    """Roll out n_videos episodes with rendering and save as MP4 (or GIF fallback)."""
+    import torch
+    try:
+        import imageio
+    except ImportError:
+        print("imageio not installed — skipping video.  Run: pip install imageio[ffmpeg]")
+        return
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    sub_steps = args.sub_steps if args.sub_steps is not None else 1
+    env, policy, action_layout, _ = _load_env_and_policy(
+        model_path=args.model_path,
+        use_image_obs=True,          # need render frames
+        img_size=tuple(args.img_size),
+        sub_steps=sub_steps,
+        device=device,
+    )
+
+    video_dir = Path(args.output_dir) / "videos"
+    video_dir.mkdir(parents=True, exist_ok=True)
+
+    # Fixed seeds so videos are always reproducible
+    video_seeds = [42, 1337, 2024][:n_videos]
+    print(f"\nRecording {n_videos} episode videos → {video_dir}/")
+
+    for i, seed in enumerate(video_seeds):
+        obs, _ = env.reset(seed=seed)
+        frames = []
+        done = False
+        ep_reward = 0.0
+        ep_steps = 0
+
+        while not done:
+            frame = env.render()          # (H, W, 3) uint8
+            if frame is not None:
+                frames.append(frame)
+
+            state = obs["state"].astype(np.float32) if isinstance(obs, dict)                     else obs.astype(np.float32)
+
+            with torch.no_grad():
+                state_t = torch.as_tensor(state, dtype=torch.float32,
+                                          device=device).unsqueeze(0)
+                flat_action_t, discrete_action_t = policy.act(
+                    state_t, deterministic=args.deterministic)
+
+            discrete_action = int(discrete_action_t.item())
+            flat_action = flat_action_t.cpu().numpy()[0].astype(np.float32)
+            hybrid_action = action_layout.flat_to_env_action(discrete_action, flat_action)
+            obs, reward, terminated, truncated, _ = env.step(hybrid_action)
+            ep_reward += reward
+            ep_steps += 1
+            done = terminated or truncated
+
+        if not frames:
+            print(f"  ep {i+1}: no frames captured (env.render() returned None)")
+            continue
+
+        out_mp4 = video_dir / f"ep{i+1:02d}_seed{seed}_r{ep_reward:.0f}.mp4"
+        try:
+            writer = imageio.get_writer(str(out_mp4), fps=50, codec="libx264",
+                                        quality=7, pixelformat="yuv420p")
+            for frame in frames:
+                writer.append_data(frame)
+            writer.close()
+            print(f"  ep {i+1} | seed={seed:>6d} | steps={ep_steps:>4d} | "
+                  f"reward={ep_reward:>7.1f}  →  {out_mp4.name}")
+        except Exception as e:
+            out_gif = out_mp4.with_suffix(".gif")
+            try:
+                imageio.mimsave(str(out_gif), frames, fps=30)
+                print(f"  ep {i+1} | seed={seed:>6d} | reward={ep_reward:>7.1f} "
+                      f"→ {out_gif.name}  (gif fallback, mp4 err: {e})")
+            except Exception as e2:
+                print(f"  ep {i+1}: failed — mp4: {e}  gif: {e2}")
+
+    env.close()
+
+
 def collect_from_checkpoint(args) -> dict:
     import torch
 
@@ -923,7 +1007,7 @@ def main():
 
     # figures
     parser.add_argument("--output-dir",    type=str,   default="./expert_figures")
-    parser.add_argument("--n-episodes",    type=int,   default=300)
+    parser.add_argument("--n-episodes",    type=int,   default=200)
     parser.add_argument("--n-traj",        type=int,   default=15)
     parser.add_argument("--max-steps",     type=int,   default=300)
     parser.add_argument("--deterministic", action="store_true",  default=True)
@@ -935,6 +1019,8 @@ def main():
     parser.add_argument("--sub-steps",     type=int,   default=None)
     parser.add_argument("--min-reward",    type=float, default=None,
                         help="Filter zarr: keep episodes with reward >= this.")
+    parser.add_argument("--n-videos",      type=int,   default=3,
+                        help="Episode videos to record (0 = skip).")
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
@@ -957,6 +1043,9 @@ def main():
     plot_param_scatter(data, output_dir)
 
     print(f"\nAll figures → {output_dir}/")
+
+    if args.model_path and args.n_videos > 0:
+        save_episode_videos(args, n_videos=args.n_videos)
 
 
 if __name__ == "__main__":

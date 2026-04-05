@@ -16,23 +16,30 @@ env:
 
 sac:
   total_timesteps: 5_000_000
-  buffer_size: 200_000
+  buffer_size: 300_000
   batch_size: 256
+
   gamma: 0.99
   tau: 0.005
-  learning_starts: 10_000
-  policy_lr: 3.0e-4
-  q_lr: 3.0e-4
-  alpha_lr: 1.0e-4
-  policy_frequency: 1
-  target_network_frequency: 1
+
+  learning_starts: 30_000
+
+  policy_lr: 1.0e-4
+  q_lr: 1.0e-4
+  alpha_lr: 5.0e-5
+
+  policy_frequency: 2
+  target_network_frequency: 2
+
   autotune: true
   alpha: 0.2
+
   ent_c: -0.5
-  ent_d: 0.25
-  max_grad_norm: 10.0
+  ent_d: 0.2
+
+  max_grad_norm: 5.0
   log_std_min: -5.0
-  log_std_max: 0.0
+  log_std_max: -1.0
 
 network:
   hidden_dims: [256, 256]
@@ -46,7 +53,7 @@ training:
   eval_episodes: 10
   save_best: true
   save_final: true
-  output_dir: ${oc.env:LUNAR_LANDER_OUTPUT_ROOT,/scr2/zhaoyang/lunar_lander_outputs}/hybrid_sac_lunar_lander
+  output_dir: ${oc.env:LUNAR_LANDER_OUTPUT_ROOT,/ariesdv0/zhaoyang/lunar_lander_outputs}/hybrid_sac_lunar_lander_new_2
 
 tqdm:
   enable: true
@@ -63,6 +70,7 @@ logging:
     - lunar_lander
     - hybrid-action
     - discrete-continuous
+    - stable-config
   notes: null
   log_model: true
   watch_model: false
